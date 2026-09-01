@@ -1,4 +1,0 @@
-streamlit>=1.51,<2
-PyMuPDF>=1.26,<2
-openai>=1.0,<3
-
