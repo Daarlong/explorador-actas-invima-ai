@@ -8,12 +8,14 @@ import streamlit as st
 from config import (
     ALLOWED_DOCUMENT_HOSTS,
     DATABASE_PATH,
+    INTEGRITY_REPORT_PATH,
     MANIFEST_PATH,
     PDF_CACHE_DIR,
     ensure_directories,
 )
 from services.database import database_stats
 from services.indexing import rebuild_index
+from services.integrity import build_integrity_report, write_integrity_report
 from services.manifest import load_manifest
 
 
@@ -55,7 +57,7 @@ with st.expander("Ver manifiesto"):
 st.warning(
     "Reconstruir reemplaza el índice actual. En Streamlit Community Cloud, los "
     "archivos generados durante la ejecución pueden perderse al reiniciar la app; "
-    "para un piloto estable conviene generar `data/actas.db` antes del despliegue."
+    "para este corpus utiliza el workflow de GitHub incluido en el proyecto."
 )
 
 if len(manifest) > 50:
@@ -90,6 +92,12 @@ if st.button("Reconstruir índice", type="primary", disabled=not confirmed):
             f"Se indexaron {report.documents_indexed} documentos, "
             f"{report.pages_indexed} páginas y {report.chunks_indexed} fragmentos."
         )
+        integrity = build_integrity_report(
+            DATABASE_PATH,
+            MANIFEST_PATH,
+            ALLOWED_DOCUMENT_HOSTS,
+        )
+        write_integrity_report(integrity, INTEGRITY_REPORT_PATH)
     if report.documents_failed:
         st.error(f"Fallaron {report.documents_failed} documentos.")
         for error in report.errors or []:

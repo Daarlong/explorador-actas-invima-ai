@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import fitz
+import pymupdf
 
 from services.pdf_reader import extract_pdf_pages
 
@@ -11,7 +11,7 @@ class PdfReaderTests(unittest.TestCase):
     def test_extracts_text_and_reports_empty_page(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "sample.pdf"
-            document = fitz.open()
+            document = pymupdf.open()
             text_page = document.new_page()
             text_page.insert_text((72, 72), "Texto verificable de un acta")
             document.new_page()
@@ -27,4 +27,3 @@ class PdfReaderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

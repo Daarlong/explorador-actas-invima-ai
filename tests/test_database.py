@@ -4,11 +4,14 @@ import sqlite3
 from pathlib import Path
 
 from services.database import (
+    DATABASE_SCHEMA_VERSION,
     connect,
+    database_schema_version,
     database_stats,
     get_filter_options,
     initialize_database,
     insert_document,
+    optimize_database,
     search_chunks,
 )
 from services.models import DocumentMetadata
@@ -47,6 +50,27 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].page, 7)
         self.assertEqual(results[0].acta_number, "01")
+
+    def test_compact_schema_and_optimization_keep_search_working(self) -> None:
+        with connect(self.database_path) as connection:
+            page_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(pages)")
+            }
+            chunk_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(chunks)")
+            }
+            fts_sql = str(
+                connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE name = 'chunks_fts'"
+                ).fetchone()[0]
+            ).lower()
+        self.assertNotIn("text", page_columns)
+        self.assertNotIn("normalized_text", chunk_columns)
+        self.assertIn("content=''", fts_sql)
+        self.assertEqual(database_schema_version(self.database_path), DATABASE_SCHEMA_VERSION)
+
+        optimize_database(self.database_path)
+        self.assertEqual(len(search_chunks(self.database_path, "semaglutida")), 1)
 
     def test_filters_are_applied(self) -> None:
         self.assertEqual(

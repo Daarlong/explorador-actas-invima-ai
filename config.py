@@ -14,14 +14,29 @@ PDF_CACHE_DIR = CACHE_DIR / "documents"
 MANIFEST_PATH = Path(
     os.getenv("ACTAS_MANIFEST_PATH", ROOT_DIR / "documents_manifest.csv")
 )
+CATALOG_SOURCE_URL = os.getenv(
+    "ACTAS_CATALOG_SOURCE_URL",
+    "https://www.invima.gov.co/productos-vigilados/medicamentos-y-productos-"
+    "biologicos/sala-especializada-medicamentos-sintesis",
+)
+ACTAS_CATALOG_PATH = Path(
+    os.getenv("ACTAS_CATALOG_PATH", ROOT_DIR / "actas_catalog.csv")
+)
 RAW_DATABASE_PATH = Path(os.getenv("ACTAS_DATABASE_PATH", DATA_DIR / "actas.db"))
 DATABASE_PATH = resolve_database_path(RAW_DATABASE_PATH)
+INTEGRITY_REPORT_PATH = Path(
+    os.getenv("ACTAS_INTEGRITY_REPORT_PATH", DATA_DIR / "integrity-report.json")
+)
+CATALOG_REPORT_PATH = Path(
+    os.getenv("ACTAS_CATALOG_REPORT_PATH", DATA_DIR / "catalog-report.json")
+)
 
 CHUNK_SIZE = int(os.getenv("ACTAS_CHUNK_SIZE", "1200"))
 CHUNK_OVERLAP = int(os.getenv("ACTAS_CHUNK_OVERLAP", "180"))
 DEFAULT_TOP_K = int(os.getenv("ACTAS_TOP_K", "8"))
 MAX_CONTEXT_CHARS = int(os.getenv("ACTAS_MAX_CONTEXT_CHARS", "14000"))
 MAX_PDF_BYTES = int(os.getenv("ACTAS_MAX_PDF_BYTES", str(120 * 1024 * 1024)))
+INDEX_START_YEAR = int(os.getenv("ACTAS_INDEX_START_YEAR", "2013"))
 
 ALLOWED_DOCUMENT_HOSTS = tuple(
     host.strip().lower()

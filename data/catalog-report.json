@@ -1,0 +1,29 @@
+{
+  "catalog_records": 179,
+  "currently_listed": 0,
+  "discovered_records": 0,
+  "duplicate_page_occurrences": 0,
+  "generated_at": "2026-09-01T20:09:51.894843+00:00",
+  "manifest_documents": 179,
+  "possible_number_gaps": [],
+  "records_without_url": 0,
+  "sections": {
+    "SEMNNIMB": 133,
+    "SEMPB": 46
+  },
+  "shared_url_conflicts": [],
+  "source_checked": false,
+  "source_page_url": "https://www.invima.gov.co/productos-vigilados/medicamentos-y-productos-biologicos/sala-especializada-medicamentos-sintesis",
+  "status": "ok",
+  "unlisted_records": 0,
+  "unverified_records": 179,
+  "years": {
+    "2020": 25,
+    "2021": 39,
+    "2022": 24,
+    "2023": 18,
+    "2024": 27,
+    "2025": 29,
+    "2026": 17
+  }
+}

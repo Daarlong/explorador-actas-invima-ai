@@ -9,20 +9,32 @@ from services.models import DocumentMetadata, SearchResult
 from services.text_utils import normalize_text, tokenize_query
 
 
+DATABASE_SCHEMA_VERSION = 2
+
 SCHEMA = """
 PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS app_metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS documents (
     id INTEGER PRIMARY KEY,
     title TEXT NOT NULL,
     normalized_title TEXT NOT NULL,
-    url TEXT NOT NULL UNIQUE,
+    url TEXT NOT NULL,
+    manifest_url TEXT NOT NULL UNIQUE,
     year INTEGER,
     acta_number TEXT,
     section TEXT,
     part TEXT,
     source_type TEXT NOT NULL DEFAULT 'official',
     document_hash TEXT NOT NULL,
+    pdf_page_count INTEGER NOT NULL,
+    indexed_page_count INTEGER NOT NULL,
+    ocr_candidate_pages TEXT NOT NULL DEFAULT '',
+    page_inventory_complete INTEGER NOT NULL DEFAULT 1,
     indexed_at TEXT NOT NULL
 );
 
@@ -30,7 +42,6 @@ CREATE TABLE IF NOT EXISTS pages (
     id INTEGER PRIMARY KEY,
     document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
     page_number INTEGER NOT NULL,
-    text TEXT NOT NULL,
     UNIQUE(document_id, page_number)
 );
 
@@ -39,13 +50,14 @@ CREATE TABLE IF NOT EXISTS chunks (
     page_id INTEGER NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
     chunk_index INTEGER NOT NULL,
     text TEXT NOT NULL,
-    normalized_text TEXT NOT NULL,
     UNIQUE(page_id, chunk_index)
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
     title,
     text,
+    content='',
+    detail=column,
     tokenize = 'unicode61 remove_diacritics 2'
 );
 
@@ -58,7 +70,7 @@ CREATE INDEX IF NOT EXISTS idx_chunks_page ON chunks(page_id);
 
 
 def _ensure_legacy_columns(connection: sqlite3.Connection) -> None:
-    """Mantiene utilizable el índice anterior mientras se publica el nuevo."""
+    """Mantiene consultable el índice anterior durante una actualización."""
     table_exists = connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'documents'"
     ).fetchone()
@@ -88,6 +100,10 @@ def initialize_database(database_path: Path) -> None:
     with connect(database_path) as connection:
         try:
             connection.executescript(SCHEMA)
+            connection.execute(
+                "INSERT OR REPLACE INTO app_metadata (key, value) VALUES (?, ?)",
+                ("schema_version", str(DATABASE_SCHEMA_VERSION)),
+            )
         except sqlite3.OperationalError as exc:
             if "fts5" in str(exc).lower():
                 raise RuntimeError(
@@ -96,9 +112,40 @@ def initialize_database(database_path: Path) -> None:
             raise
 
 
+def database_schema_version(database_path: Path) -> int:
+    if not database_path.exists():
+        return 0
+    try:
+        with sqlite3.connect(database_path) as connection:
+            row = connection.execute(
+                "SELECT value FROM app_metadata WHERE key = 'schema_version'"
+            ).fetchone()
+    except sqlite3.Error:
+        return 0
+    if not row:
+        return 0
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):
+        return 0
+
+
+def is_current_schema(database_path: Path) -> bool:
+    return database_schema_version(database_path) == DATABASE_SCHEMA_VERSION
+
+
 def clear_database(database_path: Path) -> None:
     with connect(database_path) as connection:
-        connection.execute("DELETE FROM chunks_fts")
+        fts_sql_row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'chunks_fts'"
+        ).fetchone()
+        fts_sql = str(fts_sql_row[0]).lower() if fts_sql_row else ""
+        if "content=''" in fts_sql or 'content=""' in fts_sql:
+            connection.execute(
+                "INSERT INTO chunks_fts(chunks_fts) VALUES('delete-all')"
+            )
+        else:
+            connection.execute("DELETE FROM chunks_fts")
         connection.execute("DELETE FROM documents")
 
 
@@ -107,44 +154,65 @@ def insert_document(
     metadata: DocumentMetadata,
     document_hash: str,
     pages: Iterable[dict],
+    *,
+    manifest_url: str | None = None,
+    pdf_page_count: int | None = None,
+    possible_scans: Iterable[int] = (),
+    page_inventory_complete: bool = True,
 ) -> int:
     indexed_at = datetime.now(timezone.utc).isoformat()
+    indexed_pages = list(pages)
+    scan_pages = [int(page) for page in possible_scans]
+    manifest_url = manifest_url or metadata.url
+    pdf_page_count = (
+        int(pdf_page_count)
+        if pdf_page_count is not None
+        else len(indexed_pages) + len(scan_pages)
+    )
+
     with connect(database_path) as connection:
         cursor = connection.execute(
             """
             INSERT INTO documents (
-                title, normalized_title, url, year, acta_number,
-                section, part, source_type, document_hash, indexed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                title, normalized_title, url, manifest_url, year, acta_number,
+                section, part, source_type, document_hash, pdf_page_count,
+                indexed_page_count, ocr_candidate_pages, page_inventory_complete,
+                indexed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 metadata.title,
                 normalize_text(metadata.title),
                 metadata.url,
+                manifest_url,
                 metadata.year,
                 metadata.acta_number,
                 metadata.section,
                 metadata.part,
                 metadata.source_type,
                 document_hash,
+                pdf_page_count,
+                len(indexed_pages),
+                ",".join(str(page) for page in scan_pages),
+                int(page_inventory_complete),
                 indexed_at,
             ),
         )
         document_id = int(cursor.lastrowid)
 
-        for page in pages:
+        for page in indexed_pages:
             page_cursor = connection.execute(
-                "INSERT INTO pages (document_id, page_number, text) VALUES (?, ?, ?)",
-                (document_id, int(page["page"]), page["text"]),
+                "INSERT INTO pages (document_id, page_number) VALUES (?, ?)",
+                (document_id, int(page["page"])),
             )
             page_id = int(page_cursor.lastrowid)
             for chunk_index, chunk in enumerate(page.get("chunks", [])):
                 chunk_cursor = connection.execute(
                     """
-                    INSERT INTO chunks (page_id, chunk_index, text, normalized_text)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO chunks (page_id, chunk_index, text)
+                    VALUES (?, ?, ?)
                     """,
-                    (page_id, chunk_index, chunk, normalize_text(chunk)),
+                    (page_id, chunk_index, chunk),
                 )
                 chunk_id = int(chunk_cursor.lastrowid)
                 connection.execute(
@@ -152,6 +220,16 @@ def insert_document(
                     (chunk_id, metadata.title, chunk),
                 )
     return document_id
+
+
+def optimize_database(database_path: Path) -> None:
+    if not database_path.exists():
+        return
+    with connect(database_path) as connection:
+        connection.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('optimize')")
+        connection.execute("PRAGMA optimize")
+        connection.commit()
+        connection.execute("VACUUM")
 
 
 def database_stats(database_path: Path) -> dict[str, int]:
@@ -162,6 +240,29 @@ def database_stats(database_path: Path) -> dict[str, int]:
             table: int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
             for table in ("documents", "pages", "chunks")
         }
+
+
+def indexed_document_catalog(database_path: Path) -> dict[str, dict]:
+    if not database_path.exists() or not is_current_schema(database_path):
+        return {}
+    with connect(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT manifest_url, title, year, acta_number, section, part, source_type
+            FROM documents
+            """
+        ).fetchall()
+    return {
+        row["manifest_url"]: {
+            "title": row["title"],
+            "year": row["year"],
+            "acta_number": row["acta_number"],
+            "section": row["section"],
+            "part": row["part"],
+            "source_type": row["source_type"],
+        }
+        for row in rows
+    }
 
 
 def get_filter_options(database_path: Path) -> dict[str, list]:
@@ -210,7 +311,9 @@ def _rows_to_results(rows: list[sqlite3.Row], query: str) -> list[SearchResult]:
     row_count = max(len(rows), 1)
     for position, row in enumerate(rows):
         base_score = 1.0 - (position / row_count)
-        exact_bonus = 2.0 if normalized_query in row["normalized_text"] else 0.0
+        exact_bonus = (
+            2.0 if normalized_query in normalize_text(row["text"]) else 0.0
+        )
         title_bonus = 0.75 if normalized_query in row["normalized_title"] else 0.0
         ranked.append(
             SearchResult(
@@ -246,13 +349,12 @@ def search_chunks(
         terms = [normalize_text(query)]
     fts_query = " OR ".join(f'"{term.replace(chr(34), "")}"' for term in terms)
     filter_clause, filter_parameters = _filter_sql(filters)
-    candidate_limit = max(top_k * 4, 20)
+    candidate_limit = max(top_k * 6, 30)
 
     sql = f"""
         SELECT
             c.id AS chunk_id,
             c.text,
-            c.normalized_text,
             p.page_number,
             d.title,
             d.normalized_title,
@@ -278,35 +380,4 @@ def search_chunks(
             [fts_query, *filter_parameters, candidate_limit],
         ).fetchall()
 
-        normalized_query = normalize_text(query)
-        exact_sql = f"""
-            SELECT
-                c.id AS chunk_id,
-                c.text,
-                c.normalized_text,
-                p.page_number,
-                d.title,
-                d.normalized_title,
-                d.url,
-                d.year,
-                d.acta_number,
-                d.section,
-                d.part,
-                d.source_type,
-                -1000.0 AS lexical_rank
-            FROM chunks c
-            JOIN pages p ON p.id = c.page_id
-            JOIN documents d ON d.id = p.document_id
-            WHERE c.normalized_text LIKE ? {filter_clause}
-            LIMIT ?
-        """
-        exact_rows = connection.execute(
-            exact_sql,
-            [f"%{normalized_query}%", *filter_parameters, candidate_limit],
-        ).fetchall()
-
-    deduplicated: dict[int, sqlite3.Row] = {}
-    for row in [*exact_rows, *rows]:
-        deduplicated.setdefault(int(row["chunk_id"]), row)
-    results = _rows_to_results(list(deduplicated.values()), query)
-    return results[:top_k]
+    return _rows_to_results(rows, query)[:top_k]
