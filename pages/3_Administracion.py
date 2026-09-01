@@ -19,7 +19,7 @@ from services.manifest import load_manifest
 
 st.set_page_config(page_title="Administración", page_icon="⚙️", layout="wide")
 st.title("⚙️ Administración documental")
-st.caption("Carga controlada del manifiesto e indexación de PDFs oficiales")
+st.caption("Carga controlada del manifiesto e indexación de PDFs documentales")
 
 try:
     configured_password = str(st.secrets.get("ADMIN_PASSWORD", "")).strip()
@@ -57,6 +57,15 @@ st.warning(
     "archivos generados durante la ejecución pueden perderse al reiniciar la app; "
     "para un piloto estable conviene generar `data/actas.db` antes del despliegue."
 )
+
+if len(manifest) > 50:
+    st.info(
+        "Este catálogo histórico es demasiado grande para reconstruirlo de forma "
+        "confiable desde la sesión web. Ejecuta Actions → Construir índice → "
+        "Run workflow en GitHub; el flujo guarda automáticamente el índice "
+        "comprimido en el repositorio privado."
+    )
+    st.stop()
 
 confirmed = st.checkbox("Entiendo y deseo reconstruir el índice")
 if st.button("Reconstruir índice", type="primary", disabled=not confirmed):

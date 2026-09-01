@@ -12,7 +12,9 @@ st.caption("Búsqueda textual con filtros y referencia exacta de página")
 
 stats = database_stats(DATABASE_PATH)
 if stats["documents"] == 0:
-    st.warning("No existe un índice. Constrúyelo primero desde Administración.")
+    st.warning(
+        "No existe un índice. Ejecuta primero Construir índice desde GitHub Actions."
+    )
     st.stop()
 
 options = get_filter_options(DATABASE_PATH)
@@ -50,10 +52,17 @@ if query:
                     metadata.append(result.section)
                 if result.part:
                     metadata.append(result.part)
+                if result.source_type == "historical_mirror":
+                    metadata.append("Copia histórica")
                 st.caption(" · ".join(metadata))
                 st.write(result.text)
+                link_label = (
+                    "Abrir copia histórica en la página"
+                    if result.source_type == "historical_mirror"
+                    else "Abrir documento oficial en la página"
+                )
                 st.markdown(
-                    f"[Abrir documento oficial en la página {result.page}]"
+                    f"[{link_label} {result.page}]"
                     f"({result.url}#page={result.page})"
                 )
 else:

@@ -16,6 +16,7 @@ class RetrievalTests(unittest.TestCase):
             acta_number="01",
             section="SEMPB",
             part="Primera Parte",
+            source_type="official",
             score=1.0,
         )
 

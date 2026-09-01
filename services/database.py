@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS documents (
     acta_number TEXT,
     section TEXT,
     part TEXT,
+    source_type TEXT NOT NULL DEFAULT 'official',
     document_hash TEXT NOT NULL,
     indexed_at TEXT NOT NULL
 );
@@ -56,11 +57,30 @@ CREATE INDEX IF NOT EXISTS idx_chunks_page ON chunks(page_id);
 """
 
 
+def _ensure_legacy_columns(connection: sqlite3.Connection) -> None:
+    """Mantiene utilizable el índice anterior mientras se publica el nuevo."""
+    table_exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'documents'"
+    ).fetchone()
+    if not table_exists:
+        return
+    columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(documents)").fetchall()
+    }
+    if "source_type" not in columns:
+        connection.execute(
+            "ALTER TABLE documents ADD COLUMN source_type TEXT NOT NULL "
+            "DEFAULT 'official'"
+        )
+        connection.commit()
+
+
 def connect(database_path: Path) -> sqlite3.Connection:
     database_path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(database_path)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
+    _ensure_legacy_columns(connection)
     return connection
 
 
@@ -94,8 +114,8 @@ def insert_document(
             """
             INSERT INTO documents (
                 title, normalized_title, url, year, acta_number,
-                section, part, document_hash, indexed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                section, part, source_type, document_hash, indexed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 metadata.title,
@@ -105,6 +125,7 @@ def insert_document(
                 metadata.acta_number,
                 metadata.section,
                 metadata.part,
+                metadata.source_type,
                 document_hash,
                 indexed_at,
             ),
@@ -202,6 +223,7 @@ def _rows_to_results(rows: list[sqlite3.Row], query: str) -> list[SearchResult]:
                 acta_number=row["acta_number"],
                 section=row["section"],
                 part=row["part"],
+                source_type=row["source_type"],
                 score=round(base_score + exact_bonus + title_bonus, 3),
             )
         )
@@ -239,6 +261,7 @@ def search_chunks(
             d.acta_number,
             d.section,
             d.part,
+            d.source_type,
             bm25(chunks_fts, 3.0, 1.0) AS lexical_rank
         FROM chunks_fts
         JOIN chunks c ON c.id = chunks_fts.rowid
@@ -269,6 +292,7 @@ def search_chunks(
                 d.acta_number,
                 d.section,
                 d.part,
+                d.source_type,
                 -1000.0 AS lexical_rank
             FROM chunks c
             JOIN pages p ON p.id = c.page_id
@@ -286,4 +310,3 @@ def search_chunks(
         deduplicated.setdefault(int(row["chunk_id"]), row)
     results = _rows_to_results(list(deduplicated.values()), query)
     return results[:top_k]
-

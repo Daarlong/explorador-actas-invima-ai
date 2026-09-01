@@ -22,7 +22,22 @@ class MetadataTests(unittest.TestCase):
         self.assertEqual(result.title, "Documento extraordinario")
         self.assertIsNone(result.year)
 
+    def test_parses_historical_high_ordinal_part(self) -> None:
+        result = parse_document_metadata(
+            "Acta No 01 de 2021 SEMNNIMB Decimoctava Parte",
+            "https://www.invima.gov.co/biblioteca/download/123",
+        )
+        self.assertEqual(result.year, 2021)
+        self.assertEqual(result.section, "SEMNNIMB")
+        self.assertEqual(result.part, "Decimoctava Parte")
+
+    def test_parses_lettered_part(self) -> None:
+        result = parse_document_metadata(
+            "Acta No 01 de 2022 SEMNNIMB Séptima Parte B",
+            "https://www.invima.gov.co/biblioteca/download/123",
+        )
+        self.assertEqual(result.part, "Séptima Parte B")
+
 
 if __name__ == "__main__":
     unittest.main()
-

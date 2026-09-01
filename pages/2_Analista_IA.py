@@ -17,7 +17,9 @@ st.title("💬 Analista IA")
 st.caption("Respuestas fundamentadas en las actas recuperadas")
 
 if database_stats(DATABASE_PATH)["documents"] == 0:
-    st.warning("No existe un índice. Constrúyelo primero desde Administración.")
+    st.warning(
+        "No existe un índice. Ejecuta primero Construir índice desde GitHub Actions."
+    )
     st.stop()
 
 try:
@@ -51,12 +53,23 @@ def render_sources(sources: list[dict]) -> None:
         return
     with st.expander("Fuentes recuperadas", expanded=False):
         for source_index, source in enumerate(sources, start=1):
+            source_note = (
+                " · copia histórica"
+                if source.get("source_type") == "historical_mirror"
+                else ""
+            )
             st.markdown(
-                f"**[F{source_index}] {source['title']} — página {source['page']}**"
+                f"**[F{source_index}] {source['title']} — página "
+                f"{source['page']}{source_note}**"
             )
             st.write(source["text"])
+            link_label = (
+                "Abrir copia histórica en la página"
+                if source.get("source_type") == "historical_mirror"
+                else "Abrir documento oficial en la página"
+            )
             st.markdown(
-                f"[Abrir documento oficial en la página {source['page']}]"
+                f"[{link_label} {source['page']}]"
                 f"({source['url']}#page={source['page']})"
             )
 
@@ -159,5 +172,5 @@ if question:
                 )
 
 st.caption(
-    "Verifica siempre la respuesta contra las páginas citadas del documento oficial."
+    "Verifica siempre la respuesta contra las páginas citadas de la fuente enlazada."
 )

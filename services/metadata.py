@@ -5,8 +5,29 @@ import re
 from services.models import DocumentMetadata
 
 
+PART_NAMES = (
+    "Decimonovena",
+    "Decimoctava",
+    "Decimoséptima",
+    "Decimosexta",
+    "Decimoquinta",
+    "Decimocuarta",
+    "Decimotercera",
+    "Duodécima",
+    "Undécima",
+    "Décima",
+    "Novena",
+    "Octava",
+    "Séptima",
+    "Sexta",
+    "Quinta",
+    "Cuarta",
+    "Tercera",
+    "Segunda",
+    "Primera",
+)
 PART_PATTERN = re.compile(
-    r"\b(Primera|Segunda|Tercera|Cuarta|Quinta|Sexta)\s+Parte\b",
+    rf"\b({'|'.join(PART_NAMES)})\s+Parte(?:\s+[AB])?\b",
     flags=re.IGNORECASE,
 )
 ACT_PATTERN = re.compile(
@@ -39,4 +60,3 @@ def parse_document_metadata(title: str, url: str) -> DocumentMetadata:
         section=section.strip().upper() if section else None,
         part=part,
     )
-

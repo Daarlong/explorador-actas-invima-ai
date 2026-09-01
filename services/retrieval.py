@@ -23,8 +23,13 @@ def build_context(
     blocks: list[str] = []
     total_chars = 0
     for index, result in enumerate(results, start=1):
+        provenance = (
+            " — copia histórica"
+            if result.source_type == "historical_mirror"
+            else ""
+        )
         block = (
-            f"[F{index}] {result.title} — página {result.page}\n"
+            f"[F{index}] {result.title} — página {result.page}{provenance}\n"
             f"URL: {result.url}\n"
             f"{result.text}\n"
         )

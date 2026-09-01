@@ -12,6 +12,7 @@ class DocumentMetadata:
     acta_number: str | None = None
     section: str | None = None
     part: str | None = None
+    source_type: str = "official"
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -28,6 +29,7 @@ class SearchResult:
     acta_number: str | None
     section: str | None
     part: str | None
+    source_type: str
     score: float
 
     @property
@@ -36,4 +38,3 @@ class SearchResult:
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
-

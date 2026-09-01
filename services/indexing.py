@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Callable
 
@@ -11,7 +11,7 @@ from config import (
     MAX_PDF_BYTES,
 )
 from services.database import initialize_database, insert_document
-from services.downloader import download_pdf, file_sha256
+from services.downloader import download_pdf_resource, file_sha256
 from services.manifest import load_manifest
 from services.pdf_reader import extract_pdf_pages
 from services.text_utils import chunk_text
@@ -54,14 +54,14 @@ def rebuild_index(
         if progress_callback:
             progress_callback(position, len(documents), metadata.title)
         try:
-            pdf_path = download_pdf(
+            downloaded = download_pdf_resource(
                 metadata.title,
                 metadata.url,
                 pdf_cache_dir,
                 ALLOWED_DOCUMENT_HOSTS,
                 MAX_PDF_BYTES,
             )
-            pages, possible_scans = extract_pdf_pages(pdf_path)
+            pages, possible_scans = extract_pdf_pages(downloaded.path)
             if not pages:
                 raise ValueError("No se extrajo texto; el documento podría requerir OCR")
 
@@ -79,8 +79,8 @@ def rebuild_index(
 
             insert_document(
                 temporary_database,
-                metadata,
-                file_sha256(pdf_path),
+                replace(metadata, url=downloaded.resolved_url),
+                file_sha256(downloaded.path),
                 indexed_pages,
             )
             report.documents_indexed += 1
@@ -97,4 +97,3 @@ def rebuild_index(
     database_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_database.replace(database_path)
     return report
-

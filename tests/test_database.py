@@ -1,8 +1,10 @@
 import tempfile
 import unittest
+import sqlite3
 from pathlib import Path
 
 from services.database import (
+    connect,
     database_stats,
     get_filter_options,
     initialize_database,
@@ -63,7 +65,21 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(options["years"], [2026])
         self.assertEqual(options["sections"], ["SEMPB"])
 
+    def test_adds_source_type_to_legacy_database(self) -> None:
+        legacy_path = Path(self.temp_dir.name) / "legacy.db"
+        with sqlite3.connect(legacy_path) as legacy_connection:
+            legacy_connection.execute(
+                "CREATE TABLE documents (id INTEGER PRIMARY KEY, title TEXT NOT NULL)"
+            )
+        with connect(legacy_path) as migrated_connection:
+            columns = {
+                row[1]
+                for row in migrated_connection.execute(
+                    "PRAGMA table_info(documents)"
+                ).fetchall()
+            }
+        self.assertIn("source_type", columns)
+
 
 if __name__ == "__main__":
     unittest.main()
-

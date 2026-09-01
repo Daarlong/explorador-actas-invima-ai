@@ -17,4 +17,7 @@ if __name__ == "__main__":
         progress_callback=print_progress,
     )
     print(report.as_dict())
-
+    if report.documents_failed:
+        raise SystemExit(
+            f"La construcción terminó con {report.documents_failed} documento(s) fallido(s)"
+        )

@@ -11,15 +11,35 @@ aprobado.
 
 ## Alcance
 
+- Corpus configurado desde 2020 hasta 2025 y 2026 hasta el Acta 08.
+- 179 documentos, contando por separado cada parte publicada.
 - Explorador de actas con búsqueda textual y frases exactas.
 - Filtros por año, número de acta, sala/sección y parte.
-- Evidencia con título, página, fragmento y URL oficial.
+- Evidencia con título, página, fragmento y URL de origen claramente identificada.
 - Analista IA con citas `[F#]` y negativa cuando no hay evidencia.
 - Modo `prompt_only` para trabajar sin enviar consultas a servicios externos.
 - Compatibilidad opcional con OpenAI o Azure OpenAI.
 - Administración del manifiesto e indexación desde la interfaz o por CLI.
 
 No contiene funcionalidades relacionadas con un monitor de transparencia.
+
+### Cobertura documental
+
+| Año | Sala publicada | PDF/partes |
+|---:|---|---:|
+| 2020 | SEMNNIMB | 25 |
+| 2021 | SEMNNIMB | 39 |
+| 2022 | SEMNNIMB | 24 |
+| 2023 | SEMNNIMB | 18 |
+| 2024 | SEMNNIMB | 27 |
+| 2025 | SEMPB | 29 |
+| 2026 hasta Acta 08 | SEMPB | 17 |
+| **Total** |  | **179** |
+
+La denominación de la sala se conserva tal como fue publicada en cada año.
+Una copia histórica de la segunda parte del Acta 01 de 2022 usa un espejo
+documental porque esa pieza no aparece enlazada actualmente en la Biblioteca
+de INVIMA; el manifiesto la marca como `historical_mirror`.
 
 ## Estructura
 
@@ -65,9 +85,14 @@ python build_index.py
 ```
 
 Si no puedes instalar dependencias localmente, abre **Actions → Construir
-índice → Run workflow** en GitHub. El flujo manual construye `actas.db` en un
-servidor temporal y lo deja como artefacto privado durante siete días. Después
-puedes descargarlo y subirlo a `data/actas.db` mediante el navegador.
+índice → Run workflow** en GitHub. El flujo:
+
+1. valida el catálogo y ejecuta las pruebas;
+2. descarga e indexa los 179 documentos;
+3. comprime y divide la base en fragmentos menores de 100 MB;
+4. guarda esos fragmentos automáticamente en el repositorio privado.
+
+No es necesario descargar un artefacto ni subir manualmente `actas.db`.
 
 ## Configuración segura de IA
 
@@ -98,12 +123,14 @@ los usuarios podrían contener contexto corporativo.
 2. Subir el contenido de este proyecto.
 3. Crear una aplicación en Streamlit Community Cloud usando `home.py`.
 4. Configurar los secretos desde el panel de Streamlit, nunca en GitHub.
-5. Construir `data/actas.db` antes del despliegue o usar almacenamiento externo.
+5. Ejecutar una vez **Actions → Construir índice → Run workflow**.
+6. Esperar el nuevo despliegue automático de Streamlit.
 
 El sistema de archivos de una aplicación alojada no debe considerarse una base
-de datos permanente. Para el piloto se puede versionar `data/actas.db` en el
-repositorio privado. Para una etapa corporativa se recomienda PostgreSQL,
-Azure Database o un servicio de búsqueda aprobado.
+de datos permanente. Para el piloto, la acción versiona el índice comprimido y
+la aplicación lo reconstruye en su directorio temporal al iniciar. Para una
+etapa corporativa se recomienda PostgreSQL, Azure Database o un servicio de
+búsqueda aprobado.
 
 ## Actualización del corpus
 
@@ -114,8 +141,9 @@ title,url
 Acta No 01 de 2026 SEMPB Primera Parte,https://www.invima.gov.co/...
 ```
 
-También admite las columnas opcionales `year`, `acta_number`, `section` y
-`part`. Si no existen, la aplicación intenta obtenerlas del título.
+También admite las columnas opcionales `year`, `acta_number`, `section`, `part`
+y `source_type`. Si no existen los metadatos documentales, la aplicación
+intenta obtenerlos del título.
 
 ## Verificación
 

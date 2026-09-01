@@ -38,6 +38,12 @@ def load_manifest(
                 )
 
             parsed = parse_document_metadata(title, url)
+            source_type = (row.get("source_type") or "official").strip().lower()
+            if source_type not in {"official", "historical_mirror"}:
+                raise ValueError(
+                    f"Tipo de fuente no reconocido en la línea {line_number}: "
+                    f"{source_type}"
+                )
             documents.append(
                 DocumentMetadata(
                     title=parsed.title,
@@ -46,6 +52,7 @@ def load_manifest(
                     acta_number=(row.get("acta_number") or parsed.acta_number),
                     section=(row.get("section") or parsed.section),
                     part=(row.get("part") or parsed.part),
+                    source_type=source_type,
                 )
             )
 
@@ -53,4 +60,3 @@ def load_manifest(
     for document in documents:
         unique[document.url] = document
     return list(unique.values())
-
