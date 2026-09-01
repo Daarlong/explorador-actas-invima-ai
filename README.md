@@ -30,6 +30,13 @@ aprobado.
 - Índice SQLite compacto, empaquetado en partes verificadas con SHA-256.
 - Informe de integridad visible desde la aplicación.
 - Actualización incremental para descargar e indexar únicamente actas nuevas.
+- Automatización completa: el catálogo lanza el índice cuando detecta cambios o
+  documentos pendientes, sin intervención manual.
+- Reintentos programados para descargas que fallen temporalmente y uso de URLs
+  alternativas verificadas del catálogo cuando el enlace principal no responde.
+- OCR de respaldo en español para páginas que no contienen texto extraíble.
+- Cobertura del índice desglosada por año y por serie/sala, con informe de los
+  errores de la última ejecución.
 - Página de Catálogo con estado indexado, pendiente, sin enlace o ya no listado.
 
 No contiene funcionalidades relacionadas con un monitor de transparencia.
@@ -87,7 +94,9 @@ todo el histórico visible desde 2013; el año inicial se configura con
 ├── actas_catalog.csv
 ├── documents_manifest.csv
 ├── build_index.py
+├── check_index_pending.py
 ├── package_index.py
+├── packages.txt
 ├── sync_catalog.py
 └── requirements.txt
 ```
@@ -115,24 +124,34 @@ hacerse desde GitHub Actions:
 
 1. Abre **Actions → Actualizar catálogo desde INVIMA → Run workflow**. Este
    flujo consulta la página oficial, conserva las entradas históricas, agrega
-   publicaciones nuevas y evita duplicar los enlaces repetidos en la página.
-2. Revisa la página **Catálogo** de la aplicación.
-3. Abre **Actions → Construir índice → Run workflow** para incorporar al
-   explorador los registros que figuren como pendientes.
+   publicaciones nuevas, evita duplicados y, cuando corresponde, inicia
+   automáticamente **Construir índice**.
+2. Espera a que ambos workflows queden en verde y revisa las páginas
+   **Catálogo** e **Integridad** de la aplicación.
+
+El workflow **Construir índice** sigue disponible para una ejecución manual,
+pero ya no es necesario lanzarlo cada vez que aparece un acta nueva.
 
 El flujo de construcción del índice:
 
 1. valida el catálogo y ejecuta las pruebas;
 2. restaura el índice anterior cuando existe;
-3. descarga e indexa únicamente documentos nuevos;
-4. genera un informe de integridad;
-5. comprime la base, calcula hashes y la divide en fragmentos de 90 MiB;
-6. guarda el índice y el informe automáticamente en el repositorio privado.
+3. descarga e indexa únicamente documentos nuevos y prueba los enlaces
+   alternativos conocidos si falla el principal;
+4. aplica OCR en español a las páginas sin texto y deja registradas las que no
+   puedan recuperarse;
+5. genera informes de ejecución, integridad y cobertura por año;
+6. comprime la base, calcula hashes y la divide en fragmentos de 90 MiB;
+7. guarda el índice y los informes automáticamente en el repositorio privado.
 
 No es necesario descargar un artefacto ni subir manualmente `actas.db`.
 
-El workflow de catálogo se ejecuta además automáticamente de lunes a viernes a
-las 18:30, hora de Colombia. Solo realiza un commit cuando detecta un cambio.
+El workflow de catálogo se ejecuta automáticamente de lunes a viernes a las
+18:30, hora de Colombia. Solo realiza un commit cuando detecta un cambio. Si
+encuentra una publicación nueva, dispara la actualización del índice. Si el
+informe de integridad conserva documentos pendientes por una caída temporal o
+un enlace problemático, vuelve a intentar incorporarlos en la siguiente
+revisión programada.
 
 La primera construcción después de ampliar el índice a 2013 puede tardar varias
 horas y aumentar considerablemente el tamaño de la base. El workflow dispone de
@@ -142,8 +161,9 @@ documentos fallidos pendientes para reintentarlos sin perder los correctos.
 La primera ejecución de la versión 0.2.1 o posterior detecta el índice anterior y migra sus
 fragmentos al esquema compacto sin volver a descargar los 179 PDF. Después, las
 ejecuciones normales son incrementales. Selecciona `full_rebuild` únicamente
-cuando necesites volver a procesar todos los documentos y obtener un inventario
-exacto de todas las páginas sin texto.
+cuando necesites volver a procesar todos los documentos, por ejemplo para
+aplicar OCR retroactivamente a páginas de un índice migrado. No lo selecciones
+para incorporar publicaciones nuevas.
 
 ## Configuración segura de IA
 
@@ -196,8 +216,11 @@ frecuentes. Las actas conjuntas publicadas dentro de la misma sección sí se
 registran. La actualización es acumulativa: una entrada que desaparezca de la
 página queda marcada como histórica/no listada, en lugar de eliminarse.
 
-Para actualizar automáticamente, usa `python sync_catalog.py` o el workflow
-**Actualizar catálogo desde INVIMA**.
+Para actualizar automáticamente, usa el workflow **Actualizar catálogo desde
+INVIMA**. Al terminar, este inicia **Construir índice** únicamente si detectó un
+cambio o si quedan documentos pendientes. Desde línea de comandos también se
+puede usar `python sync_catalog.py` seguido de `python build_index.py
+--allow-partial`.
 
 ### Edición manual excepcional
 
@@ -226,6 +249,10 @@ La página **Integridad** muestra:
 - consistencia interna de SQLite y del índice FTS5;
 - documentos faltantes o inesperados;
 - páginas sin texto que podrían necesitar OCR;
+- páginas recuperadas mediante OCR en la última ejecución;
+- errores de descarga o procesamiento que se reintentarán;
+- enlaces alternativos utilizados;
+- cobertura documental por año y por serie/sala;
 - tamaño de la base compactada.
 
 El esquema compacto evita guardar el texto completo en páginas, fragmentos,
@@ -247,13 +274,14 @@ Antes de publicar una versión se debe comprobar:
 - que el número de página coincide con el PDF;
 - que la IA utiliza únicamente etiquetas `[F#]` disponibles;
 - que no se registran preguntas, secretos ni información corporativa;
-- que los documentos sin texto se identifican para un futuro proceso de OCR.
+- que las páginas recuperadas con OCR sean legibles y que las restantes queden
+  identificadas como candidatas para revisión.
 
 El flujo `.github/workflows/tests.yml` repite automáticamente la compilación y
 las pruebas con Python 3.12 después de cada cambio enviado a GitHub. La versión
-0.3.1 usa directamente la API `pymupdf`, sin depender del nombre heredado
-`fitz`. No requiere instalar herramientas de desarrollo en el computador
-corporativo.
+0.4.0 usa directamente la API `pymupdf`, sin depender del nombre heredado
+`fitz`, y Tesseract se instala dentro del runner de GitHub. No requiere instalar
+herramientas de desarrollo en el computador corporativo.
 
 ## Propiedad y distribución
 

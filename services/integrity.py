@@ -18,6 +18,52 @@ def _page_numbers(value: str | None) -> list[int]:
     return [int(item) for item in value.split(",") if item.strip().isdigit()]
 
 
+def _coverage_groups(
+    manifest: list,
+    indexed_urls: set[str],
+    attribute: str,
+) -> list[dict]:
+    grouped: dict[object, dict[str, int | float | str]] = {}
+    for document in manifest:
+        raw_value = getattr(document, attribute, None)
+        value = raw_value if raw_value not in (None, "") else "Sin dato"
+        row = grouped.setdefault(
+            value,
+            {
+                attribute: value,
+                "manifest_documents": 0,
+                "indexed_documents": 0,
+            },
+        )
+        row["manifest_documents"] += 1
+        if document.url in indexed_urls:
+            row["indexed_documents"] += 1
+
+    rows: list[dict] = []
+    for row in grouped.values():
+        expected = int(row["manifest_documents"])
+        indexed = int(row["indexed_documents"])
+        rows.append(
+            {
+                **row,
+                "missing_documents": expected - indexed,
+                "coverage_percent": round((indexed / expected) * 100, 2)
+                if expected
+                else 0.0,
+            }
+        )
+    if attribute == "year":
+        return sorted(
+            rows,
+            key=lambda item: (
+                isinstance(item[attribute], int),
+                item[attribute] if isinstance(item[attribute], int) else -1,
+            ),
+            reverse=True,
+        )
+    return sorted(rows, key=lambda item: str(item[attribute]))
+
+
 def build_integrity_report(
     database_path: Path,
     manifest_path: Path,
@@ -26,6 +72,7 @@ def build_integrity_report(
     manifest = load_manifest(manifest_path, allowed_hosts)
     generated_at = datetime.now(timezone.utc).isoformat()
     if not database_path.exists():
+        indexed_urls: set[str] = set()
         return {
             "status": "error",
             "generated_at": generated_at,
@@ -46,6 +93,17 @@ def build_integrity_report(
             "pdf_pages": 0,
             "chunks": 0,
             "fts_rows": 0,
+            "text_page_coverage_percent": 0.0,
+            "coverage_by_year": _coverage_groups(
+                manifest,
+                indexed_urls,
+                "year",
+            ),
+            "coverage_by_section": _coverage_groups(
+                manifest,
+                indexed_urls,
+                "section",
+            ),
         }
 
     with connect(database_path) as connection:
@@ -58,8 +116,9 @@ def build_integrity_report(
         }
         document_rows = connection.execute(
             """
-            SELECT manifest_url, title, pdf_page_count, indexed_page_count,
-                   ocr_candidate_pages, page_inventory_complete
+            SELECT manifest_url, title, year, section, pdf_page_count,
+                   indexed_page_count, ocr_candidate_pages,
+                   page_inventory_complete
             FROM documents
             ORDER BY year, acta_number, part, title
             """
@@ -92,6 +151,7 @@ def build_integrity_report(
 
     manifest_by_url = {document.url: document.title for document in manifest}
     indexed_by_url = {row["manifest_url"]: row["title"] for row in document_rows}
+    indexed_urls = set(indexed_by_url)
     missing = [
         manifest_by_url[url]
         for url in manifest_by_url.keys() - indexed_by_url.keys()
@@ -153,6 +213,12 @@ def build_integrity_report(
         "fts_rows": counts["chunks_fts"],
         "text_page_coverage_percent": (
             round((indexed_pages / pdf_pages) * 100, 2) if pdf_pages else 0.0
+        ),
+        "coverage_by_year": _coverage_groups(manifest, indexed_urls, "year"),
+        "coverage_by_section": _coverage_groups(
+            manifest,
+            indexed_urls,
+            "section",
         ),
     }
 

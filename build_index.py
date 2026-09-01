@@ -6,12 +6,13 @@ import json
 from config import (
     ALLOWED_DOCUMENT_HOSTS,
     DATABASE_PATH,
+    INDEXING_REPORT_PATH,
     INTEGRITY_REPORT_PATH,
     MANIFEST_PATH,
     PDF_CACHE_DIR,
     ensure_directories,
 )
-from services.indexing import rebuild_index, update_index
+from services.indexing import rebuild_index, update_index, write_indexing_report
 from services.integrity import build_integrity_report, write_integrity_report
 
 
@@ -48,6 +49,7 @@ if __name__ == "__main__":
         progress_callback=print_progress,
         allow_partial=arguments.allow_partial,
     )
+    write_indexing_report(report, INDEXING_REPORT_PATH)
     print(json.dumps(report.as_dict(), ensure_ascii=False, indent=2))
     if report.documents_failed and not arguments.allow_partial:
         raise SystemExit(

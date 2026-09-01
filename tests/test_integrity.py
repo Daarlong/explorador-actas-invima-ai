@@ -48,3 +48,40 @@ class IntegrityTests(unittest.TestCase):
         self.assertEqual(report["indexed_documents"], 1)
         self.assertEqual(report["ocr_candidates"][0]["pages"], [2])
         self.assertEqual(report["chunks"], report["fts_rows"])
+        self.assertEqual(report["coverage_by_year"][0]["year"], 2026)
+        self.assertEqual(report["coverage_by_year"][0]["coverage_percent"], 100.0)
+        self.assertEqual(
+            report["coverage_by_section"][0]["section"],
+            "SEMPB",
+        )
+
+    def test_reports_missing_database_coverage_by_year(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database_path = root / "missing.db"
+            manifest_path = root / "manifest.csv"
+            manifest_path.write_text(
+                "title,url,year,acta_number,section\n"
+                "Acta No 01 de 2013 SEMPB,"
+                "https://www.invima.gov.co/biblioteca/download/1,2013,01,SEMPB\n"
+                "Acta No 01 de 2026 SEMPB,"
+                "https://www.invima.gov.co/biblioteca/download/2,2026,01,SEMPB\n",
+                encoding="utf-8",
+            )
+
+            report = build_integrity_report(
+                database_path,
+                manifest_path,
+                ("www.invima.gov.co",),
+            )
+
+        self.assertEqual(
+            [item["year"] for item in report["coverage_by_year"]],
+            [2026, 2013],
+        )
+        self.assertTrue(
+            all(
+                item["coverage_percent"] == 0.0
+                for item in report["coverage_by_year"]
+            )
+        )

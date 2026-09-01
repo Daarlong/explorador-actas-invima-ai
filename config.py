@@ -27,6 +27,9 @@ DATABASE_PATH = resolve_database_path(RAW_DATABASE_PATH)
 INTEGRITY_REPORT_PATH = Path(
     os.getenv("ACTAS_INTEGRITY_REPORT_PATH", DATA_DIR / "integrity-report.json")
 )
+INDEXING_REPORT_PATH = Path(
+    os.getenv("ACTAS_INDEXING_REPORT_PATH", DATA_DIR / "indexing-report.json")
+)
 CATALOG_REPORT_PATH = Path(
     os.getenv("ACTAS_CATALOG_REPORT_PATH", DATA_DIR / "catalog-report.json")
 )
@@ -37,6 +40,16 @@ DEFAULT_TOP_K = int(os.getenv("ACTAS_TOP_K", "8"))
 MAX_CONTEXT_CHARS = int(os.getenv("ACTAS_MAX_CONTEXT_CHARS", "14000"))
 MAX_PDF_BYTES = int(os.getenv("ACTAS_MAX_PDF_BYTES", str(120 * 1024 * 1024)))
 INDEX_START_YEAR = int(os.getenv("ACTAS_INDEX_START_YEAR", "2013"))
+OCR_ENABLED = os.getenv("ACTAS_OCR_ENABLED", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+OCR_LANGUAGES = os.getenv("ACTAS_OCR_LANGUAGES", "spa+eng").strip() or "spa+eng"
+OCR_DPI = int(os.getenv("ACTAS_OCR_DPI", "180"))
+OCR_TIMEOUT_SECONDS = int(os.getenv("ACTAS_OCR_TIMEOUT_SECONDS", "120"))
+OCR_MIN_CHARS = int(os.getenv("ACTAS_OCR_MIN_CHARS", "20"))
 
 ALLOWED_DOCUMENT_HOSTS = tuple(
     host.strip().lower()

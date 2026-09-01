@@ -6,9 +6,16 @@ import sqlite3
 from pathlib import Path
 from unittest.mock import patch
 
+from services.catalog import CatalogRecord, catalog_id_for, write_catalog
 from services.database import database_stats, is_current_schema, search_chunks
 from services.downloader import DownloadedPdf
-from services.indexing import rebuild_index, update_index
+from services.indexing import (
+    IndexingReport,
+    load_indexing_report,
+    rebuild_index,
+    update_index,
+    write_indexing_report,
+)
 
 
 class IndexingTests(unittest.TestCase):
@@ -186,3 +193,84 @@ class IndexingTests(unittest.TestCase):
             self.assertEqual(retried.documents_failed, 0)
             self.assertEqual(downloader.call_count, 1)
             self.assertEqual(database_stats(database_path)["documents"], 3)
+
+    def test_uses_catalog_alternate_url_and_counts_ocr_pages(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = root / "manifest.csv"
+            catalog_path = root / "catalog.csv"
+            database_path = root / "actas.db"
+            cache_path = root / "cache"
+            pdf_path = root / "sample.pdf"
+            pdf_path.write_bytes(b"%PDF-test")
+            primary_url = "https://www.invima.gov.co/biblioteca/download/broken"
+            alternate_url = "https://www.invima.gov.co/biblioteca/download/working"
+            title = "Acta No 01 de 2013 SEMPB"
+            manifest_path.write_text(
+                f"title,url\n{title},{primary_url}\n",
+                encoding="utf-8",
+            )
+            write_catalog(
+                [
+                    CatalogRecord(
+                        catalog_id=catalog_id_for(2013, "01", "SEMPB", None),
+                        title=title,
+                        published_title=title,
+                        url=primary_url,
+                        year=2013,
+                        acta_number="01",
+                        section="SEMPB",
+                        alternate_urls=(alternate_url,),
+                    )
+                ],
+                catalog_path,
+            )
+
+            def fake_download(title, url, *args, **kwargs):
+                if url == primary_url:
+                    raise ValueError("enlace primario roto")
+                return DownloadedPdf(pdf_path, url)
+
+            extracted = (
+                [
+                    {
+                        "page": 1,
+                        "text": "Texto reconocido de un acta histórica.",
+                        "ocr_used": True,
+                    }
+                ],
+                [],
+            )
+            with patch(
+                "services.indexing.ACTAS_CATALOG_PATH",
+                catalog_path,
+            ), patch(
+                "services.indexing.download_pdf_resource",
+                side_effect=fake_download,
+            ) as downloader, patch(
+                "services.indexing.extract_pdf_pages",
+                return_value=extracted,
+            ):
+                report = rebuild_index(
+                    manifest_path,
+                    database_path,
+                    cache_path,
+                )
+
+        self.assertEqual(downloader.call_count, 2)
+        self.assertEqual(report.documents_indexed, 1)
+        self.assertEqual(report.ocr_pages_indexed, 1)
+        self.assertEqual(report.alternate_links_used[0]["used_url"], alternate_url)
+
+    def test_indexing_report_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "indexing-report.json"
+            write_indexing_report(
+                IndexingReport(documents_indexed=2, ocr_pages_indexed=3),
+                path,
+            )
+            loaded = load_indexing_report(path)
+
+        self.assertEqual(loaded["documents_indexed"], 2)
+        self.assertEqual(loaded["ocr_pages_indexed"], 3)
+        self.assertIn("generated_at", loaded)

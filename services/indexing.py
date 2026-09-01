@@ -1,16 +1,25 @@
 from __future__ import annotations
 
+import json
 import shutil
 from dataclasses import asdict, dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable
 
 from config import (
+    ACTAS_CATALOG_PATH,
     ALLOWED_DOCUMENT_HOSTS,
     CHUNK_OVERLAP,
     CHUNK_SIZE,
     MAX_PDF_BYTES,
+    OCR_DPI,
+    OCR_ENABLED,
+    OCR_LANGUAGES,
+    OCR_MIN_CHARS,
+    OCR_TIMEOUT_SECONDS,
 )
+from services.catalog import load_catalog
 from services.database import (
     connect,
     indexed_document_catalog,
@@ -38,14 +47,88 @@ class IndexingReport:
     pages_indexed: int = 0
     chunks_indexed: int = 0
     possible_scanned_pages: int = 0
+    ocr_pages_indexed: int = 0
     database_size_bytes: int = 0
     errors: list[str] | None = None
+    alternate_links_used: list[dict[str, str]] | None = None
 
     def as_dict(self) -> dict:
         return asdict(self)
 
 
 ProgressCallback = Callable[[int, int, str], None]
+
+
+def _alternate_urls_by_primary() -> dict[str, tuple[str, ...]]:
+    try:
+        records = load_catalog(ACTAS_CATALOG_PATH)
+    except (OSError, ValueError):
+        return {}
+    alternatives: dict[str, list[str]] = {}
+    for record in records:
+        if not record.url:
+            continue
+        values = alternatives.setdefault(record.url, [])
+        for url in record.alternate_urls:
+            if url and url != record.url and url not in values:
+                values.append(url)
+    return {url: tuple(values) for url, values in alternatives.items() if values}
+
+
+def _download_with_fallback(
+    metadata: DocumentMetadata,
+    pdf_cache_dir: Path,
+    alternate_urls: tuple[str, ...],
+):
+    errors: list[str] = []
+    candidates = tuple(dict.fromkeys((metadata.url, *alternate_urls)))
+    for candidate in candidates:
+        try:
+            downloaded = download_pdf_resource(
+                metadata.title,
+                candidate,
+                pdf_cache_dir,
+                ALLOWED_DOCUMENT_HOSTS,
+                MAX_PDF_BYTES,
+            )
+            return downloaded, candidate
+        except Exception as exc:  # cada URL se intenta de forma independiente
+            errors.append(f"{candidate}: {str(exc)[:240]}")
+    raise ValueError("Ningún enlace candidato produjo un PDF. " + " | ".join(errors))
+
+
+def write_indexing_report(report: IndexingReport, target_path: Path) -> None:
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        **report.as_dict(),
+    }
+    existing = load_indexing_report(target_path)
+    if existing:
+        comparable_existing = {
+            key: value for key, value in existing.items() if key != "generated_at"
+        }
+        comparable_new = {
+            key: value for key, value in payload.items() if key != "generated_at"
+        }
+        if comparable_existing == comparable_new:
+            return
+    temporary_path = target_path.with_suffix(f"{target_path.suffix}.tmp")
+    temporary_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary_path.replace(target_path)
+
+
+def load_indexing_report(report_path: Path) -> dict | None:
+    if not report_path.exists():
+        return None
+    try:
+        value = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
 
 
 def _remove_database_files(database_path: Path) -> None:
@@ -73,18 +156,24 @@ def _index_documents(
     progress_callback: ProgressCallback | None,
 ) -> None:
     pending_documents = list(documents)
+    alternate_urls_lookup = _alternate_urls_by_primary()
     for position, metadata in enumerate(pending_documents, start=1):
         if progress_callback:
             progress_callback(position, len(pending_documents), metadata.title)
         try:
-            downloaded = download_pdf_resource(
-                metadata.title,
-                metadata.url,
+            downloaded, candidate_url = _download_with_fallback(
+                metadata,
                 pdf_cache_dir,
-                ALLOWED_DOCUMENT_HOSTS,
-                MAX_PDF_BYTES,
+                alternate_urls_lookup.get(metadata.url, ()),
             )
-            pages, possible_scans = extract_pdf_pages(downloaded.path)
+            pages, possible_scans = extract_pdf_pages(
+                downloaded.path,
+                ocr_enabled=OCR_ENABLED,
+                ocr_languages=OCR_LANGUAGES,
+                ocr_dpi=OCR_DPI,
+                ocr_timeout_seconds=OCR_TIMEOUT_SECONDS,
+                ocr_min_chars=OCR_MIN_CHARS,
+            )
             if not pages:
                 raise ValueError("No se extrajo texto; el documento podría requerir OCR")
 
@@ -114,7 +203,20 @@ def _index_documents(
             )
             report.documents_indexed += 1
             report.pages_indexed += len(indexed_pages)
+            report.ocr_pages_indexed += sum(
+                bool(page.get("ocr_used")) for page in indexed_pages
+            )
             report.possible_scanned_pages += len(possible_scans)
+            if candidate_url != metadata.url:
+                if report.alternate_links_used is None:
+                    report.alternate_links_used = []
+                report.alternate_links_used.append(
+                    {
+                        "title": metadata.title,
+                        "manifest_url": metadata.url,
+                        "used_url": candidate_url,
+                    }
+                )
         except Exception as exc:  # el informe conserva errores por documento
             report.documents_failed += 1
             if report.errors is None:
