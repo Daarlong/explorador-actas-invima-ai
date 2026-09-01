@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build-index:
@@ -14,6 +14,8 @@ jobs:
     steps:
       - name: Descargar código
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.ref_name }}
 
       - name: Configurar Python
         uses: actions/setup-python@v7
@@ -27,7 +29,31 @@ jobs:
       - name: Construir base de búsqueda
         run: python build_index.py
 
-      - name: Publicar índice
+      - name: Verificar tamaño del índice
+        shell: bash
+        run: |
+          bytes=$(stat -c%s data/actas.db)
+          echo "Tamaño de actas.db: $((bytes / 1024 / 1024)) MiB"
+          if [ "$bytes" -ge 104857600 ]; then
+            echo "::error::actas.db supera el límite de 100 MiB de GitHub."
+            exit 1
+          fi
+
+      - name: Guardar índice en el repositorio
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/actas.db
+
+          if git diff --cached --quiet; then
+            echo "El índice no cambió."
+          else
+            git commit -m "Actualizar índice de actas"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+
+      - name: Publicar respaldo
         uses: actions/upload-artifact@v7
         with:
           name: actas-db
