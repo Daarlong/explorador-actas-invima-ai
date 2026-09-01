@@ -1,29 +1,84 @@
 {
-  "catalog_records": 179,
-  "currently_listed": 0,
-  "discovered_records": 0,
-  "duplicate_page_occurrences": 0,
-  "generated_at": "2026-09-01T20:09:51.894843+00:00",
-  "manifest_documents": 179,
-  "possible_number_gaps": [],
-  "records_without_url": 0,
+  "catalog_records": 645,
+  "currently_listed": 642,
+  "discovered_records": 642,
+  "duplicate_page_occurrences": 105,
+  "generated_at": "2026-09-01T21:04:26.496931+00:00",
+  "manifest_documents": 638,
+  "possible_number_gaps": [
+    {
+      "acta_numbers": [
+        2
+      ],
+      "section": "SEM",
+      "year": 2019
+    },
+    {
+      "acta_numbers": [
+        8
+      ],
+      "section": "SEM",
+      "year": 2024
+    }
+  ],
+  "records_without_url": 3,
   "sections": {
-    "SEMNNIMB": 133,
-    "SEMPB": 46
+    "CONJUNTA": 4,
+    "CONJUNTA SEMNNIMB-SEDMRDI": 2,
+    "CONJUNTA SEMNNIMB-SEM": 1,
+    "SEM": 207,
+    "SEMNNIMB": 181,
+    "SEMPB": 250
   },
-  "shared_url_conflicts": [],
-  "source_checked": false,
+  "shared_url_conflicts": [
+    {
+      "catalog_ids": [
+        "2016-sempb-20-primera-parte",
+        "2016-sempb-20-segunda-parte"
+      ],
+      "url": "https://www.invima.gov.co/invima_website/static/attachments/medicamentos_sala_especializada_medicamentos_sintesis/Acta-No-20-de-2016-Segunda-parte-SEMPB.pdf"
+    },
+    {
+      "catalog_ids": [
+        "2017-sempb-03-primera-parte",
+        "2017-sempb-03-segunda-parte"
+      ],
+      "url": "https://www.invima.gov.co/invima_website/static/attachments/medicamentos_sala_especializada_medicamentos_sintesis/Acta-No-03-de-2017-SEMPB-Segunda-Parte.pdf"
+    },
+    {
+      "catalog_ids": [
+        "2017-sempb-15-primera-parte",
+        "2017-sempb-15-segunda-parte"
+      ],
+      "url": "https://www.invima.gov.co/invima_website/static/attachments/medicamentos_sala_especializada_medicamentos_sintesis/Acta-No-15-de-2017-SEMPB-Primera-Parte.pdf"
+    },
+    {
+      "catalog_ids": [
+        "2018-conjunta-semnnimb-sedmrdi-02-completa",
+        "2023-sem-21-completa"
+      ],
+      "url": "https://www.invima.gov.co/invima_website/static/attachments/medicamentos_sala_especializada_medicamentos_sintesis/ACTA_20No._2021_20DE_202023_20SEM.pdf"
+    }
+  ],
+  "source_checked": true,
   "source_page_url": "https://www.invima.gov.co/productos-vigilados/medicamentos-y-productos-biologicos/sala-especializada-medicamentos-sintesis",
-  "status": "ok",
-  "unlisted_records": 0,
-  "unverified_records": 179,
+  "status": "warning",
+  "unlisted_records": 3,
+  "unverified_records": 0,
   "years": {
-    "2020": 25,
-    "2021": 39,
-    "2022": 24,
-    "2023": 18,
-    "2024": 27,
-    "2025": 29,
-    "2026": 17
+    "2013": 54,
+    "2014": 30,
+    "2015": 41,
+    "2016": 41,
+    "2017": 43,
+    "2018": 63,
+    "2019": 43,
+    "2020": 49,
+    "2021": 64,
+    "2022": 43,
+    "2023": 57,
+    "2024": 58,
+    "2025": 40,
+    "2026": 19
   }
 }
