@@ -1,0 +1,923 @@
+"""Recuperación local aproximada sin modelos ni servicios externos.
+
+Este módulo implementa dos señales complementarias:
+
+* TF-IDF con *feature hashing*, útil para coincidencia léxica aproximada.
+* *Random indexing* distribucional: cada término acumula una proyección
+  determinística de los términos que aparecen a su alrededor. Dos términos
+  usados en contextos parecidos pueden acabar próximos aunque no sean iguales.
+
+La segunda señal es una forma ligera de semántica distribucional, pero no es un
+modelo de lenguaje ni un embedding neuronal. Solo aprende coocurrencias del
+corpus indexado, no entiende conceptos externos y puede producir asociaciones
+espurias en corpus pequeños. En producción se recomienda usarla para reordenar
+un conjunto de candidatos de FTS5 mediante ``candidate_ids``; el barrido de
+todo el índice se conserva para corpus pequeños y pruebas.
+
+El formato persistente es SQLite con vectores unitarios cuantizados a int8. La
+cuantización reduce aproximadamente cuatro veces el tamaño frente a float32 y
+es adecuada para reranking, aunque introduce una pequeña pérdida de precisión.
+No se usa ``pickle`` y, por tanto, abrir un índice no ejecuta código serializado.
+La implementación depende únicamente de la biblioteca estándar de Python.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+import re
+import sqlite3
+import struct
+import tempfile
+from collections import Counter
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable, Iterator, Mapping, Sequence
+
+from services.text_utils import SPANISH_STOPWORDS, normalize_text
+
+
+SEMANTIC_INDEX_FORMAT_VERSION = 1
+SEMANTIC_METHOD = "hashed_tfidf+distributional_random_indexing"
+SEMANTIC_BUILD_SIGNATURE = "tokenizer-v1-random-indexing-v1-int8"
+_TOKEN_PATTERN = re.compile(r"\b[\w-]+\b", flags=re.UNICODE)
+_ITEM_BATCH_SIZE = 800
+
+
+class SemanticIndexError(RuntimeError):
+    """Indica que el índice no existe, está dañado o es incompatible."""
+
+
+@dataclass(frozen=True)
+class SemanticDocument:
+    """Unidad mínima que se incorporará al índice local."""
+
+    item_id: int
+    text: str
+
+
+@dataclass(frozen=True)
+class SemanticBuildSummary:
+    documents_indexed: int
+    documents_skipped_empty: int
+    vocabulary_size: int
+    semantic_vocabulary_size: int
+    lexical_dimension: int
+    semantic_dimension: int
+    index_size_bytes: int
+    source_fingerprint: str | None = None
+
+    def as_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class SemanticHit:
+    item_id: int
+    score: float
+    lexical_score: float
+    distributional_score: float
+
+    def as_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class HybridScore:
+    item_id: int
+    score: float
+    lexical_score: float
+    semantic_score: float
+
+    def as_dict(self) -> dict:
+        return asdict(self)
+
+
+def _tokenize(text: str) -> list[str]:
+    tokens = _TOKEN_PATTERN.findall(normalize_text(text))
+    return [
+        token
+        for token in tokens
+        if token not in SPANISH_STOPWORDS and (len(token) > 2 or token.isdigit())
+    ]
+
+
+def _validate_dimensions(
+    *,
+    lexical_dimension: int,
+    semantic_dimension: int,
+    context_window: int,
+    min_df: int,
+    max_vocabulary: int,
+    max_context_occurrences: int,
+) -> None:
+    if lexical_dimension < 32:
+        raise ValueError("lexical_dimension debe ser al menos 32")
+    if semantic_dimension < 16:
+        raise ValueError("semantic_dimension debe ser al menos 16")
+    if context_window < 1:
+        raise ValueError("context_window debe ser mayor que cero")
+    if min_df < 1:
+        raise ValueError("min_df debe ser mayor que cero")
+    if max_vocabulary < 1:
+        raise ValueError("max_vocabulary debe ser mayor que cero")
+    if max_context_occurrences < 1:
+        raise ValueError("max_context_occurrences debe ser mayor que cero")
+
+
+def _hash_bytes(value: str, *, person: bytes) -> bytes:
+    return hashlib.blake2b(
+        value.encode("utf-8"), digest_size=32, person=person
+    ).digest()
+
+
+def _hashed_position(term: str, dimension: int) -> tuple[int, float]:
+    digest = _hash_bytes(term, person=b"invima-tfidf")
+    position = int.from_bytes(digest[:8], "little") % dimension
+    sign = 1.0 if digest[8] & 1 else -1.0
+    return position, sign
+
+
+def _random_projection(
+    term: str,
+    dimension: int,
+    non_zero: int = 4,
+) -> tuple[tuple[int, float], ...]:
+    """Crea un vector índice disperso y determinístico para ``term``."""
+    target = min(non_zero, dimension)
+    features: list[tuple[int, float]] = []
+    used: set[int] = set()
+    counter = 0
+    while len(features) < target:
+        digest = _hash_bytes(f"{term}\x1f{counter}", person=b"invima-rindex")
+        for offset in range(0, len(digest) - 2, 3):
+            position = int.from_bytes(digest[offset : offset + 2], "little") % dimension
+            if position in used:
+                continue
+            used.add(position)
+            sign = 1.0 if digest[offset + 2] & 1 else -1.0
+            features.append((position, sign))
+            if len(features) == target:
+                break
+        counter += 1
+    return tuple(features)
+
+
+def _normalize(vector: list[float]) -> list[float]:
+    norm = math.sqrt(sum(value * value for value in vector))
+    if norm <= 0.0:
+        return vector
+    return [value / norm for value in vector]
+
+
+def _pack_vector(vector: Sequence[float]) -> bytes:
+    if not vector:
+        return b""
+    quantized = [
+        max(-127, min(127, int(round(value * 127.0)))) for value in vector
+    ]
+    return struct.pack(f"<{len(vector)}b", *quantized)
+
+
+def _unpack_vector(blob: bytes, expected_dimension: int) -> tuple[float, ...]:
+    expected_bytes = expected_dimension
+    if len(blob) != expected_bytes:
+        raise SemanticIndexError(
+            "El índice contiene un vector con una dimensión incompatible"
+        )
+    return tuple(
+        value / 127.0
+        for value in struct.unpack(f"<{expected_dimension}b", blob)
+    )
+
+
+def _dot(left: Sequence[float], right: Sequence[float]) -> float:
+    return sum(first * second for first, second in zip(left, right))
+
+
+def _idf(document_count: int, document_frequency: int) -> float:
+    return math.log((document_count + 1) / (document_frequency + 1)) + 1.0
+
+
+def _lexical_vector(
+    counts: Mapping[str, int],
+    idf_by_term: Mapping[str, float],
+    dimension: int,
+    default_idf: float,
+) -> list[float]:
+    vector = [0.0] * dimension
+    for term, frequency in counts.items():
+        position, sign = _hashed_position(term, dimension)
+        weight = (1.0 + math.log(frequency)) * idf_by_term.get(term, default_idf)
+        vector[position] += sign * weight
+    return _normalize(vector)
+
+
+def _distributional_vector(
+    counts: Mapping[str, int],
+    idf_by_term: Mapping[str, float],
+    context_vectors: Mapping[str, Sequence[float]],
+    dimension: int,
+) -> list[float]:
+    vector = [0.0] * dimension
+    for term, frequency in counts.items():
+        term_vector = context_vectors.get(term)
+        if term_vector is None:
+            continue
+        weight = (1.0 + math.log(frequency)) * idf_by_term[term]
+        for index, value in enumerate(term_vector):
+            vector[index] += value * weight
+    return _normalize(vector)
+
+
+def _create_schema(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        PRAGMA journal_mode = DELETE;
+        PRAGMA synchronous = NORMAL;
+
+        CREATE TABLE metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        CREATE TABLE terms (
+            term TEXT PRIMARY KEY,
+            document_frequency INTEGER NOT NULL,
+            inverse_document_frequency REAL NOT NULL,
+            distributional_vector BLOB
+        );
+
+        CREATE TABLE items (
+            item_id INTEGER PRIMARY KEY,
+            lexical_vector BLOB NOT NULL,
+            distributional_vector BLOB NOT NULL
+        );
+        """
+    )
+
+
+def _write_metadata(connection: sqlite3.Connection, values: Mapping[str, object]) -> None:
+    connection.executemany(
+        "INSERT INTO metadata (key, value) VALUES (?, ?)",
+        ((key, json.dumps(value, ensure_ascii=False)) for key, value in values.items()),
+    )
+
+
+def _read_metadata(connection: sqlite3.Connection) -> dict[str, object]:
+    try:
+        rows = connection.execute("SELECT key, value FROM metadata").fetchall()
+    except sqlite3.Error as exc:
+        raise SemanticIndexError("El archivo no es un índice semántico válido") from exc
+    result: dict[str, object] = {}
+    for key, value in rows:
+        try:
+            result[str(key)] = json.loads(value)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise SemanticIndexError("Los metadatos del índice están dañados") from exc
+    if result.get("format_version") != SEMANTIC_INDEX_FORMAT_VERSION:
+        raise SemanticIndexError("La versión del índice semántico no es compatible")
+    required = {
+        "documents",
+        "lexical_dimension",
+        "semantic_dimension",
+        "method",
+        "build_signature",
+    }
+    if not required.issubset(result):
+        raise SemanticIndexError("Los metadatos del índice están incompletos")
+    return result
+
+
+def _spooled_documents(path: Path) -> Iterator[tuple[int, list[str]]]:
+    with path.open("r", encoding="utf-8") as spool:
+        for line in spool:
+            item_id, tokens = json.loads(line)
+            yield int(item_id), list(tokens)
+
+
+def build_semantic_documents_index(
+    documents: Iterable[SemanticDocument],
+    index_path: Path,
+    *,
+    lexical_dimension: int = 256,
+    semantic_dimension: int = 64,
+    context_window: int = 3,
+    min_df: int = 2,
+    max_vocabulary: int = 15_000,
+    max_context_occurrences: int = 128,
+    source_fingerprint: str | None = None,
+) -> SemanticBuildSummary:
+    """Construye atómicamente un índice local persistente.
+
+    ``item_id`` debe corresponder al identificador estable del fragmento en la
+    base principal. Los textos se escriben temporalmente junto al destino para
+    poder recorrer corpus grandes sin retenerlos completos en memoria.
+    """
+    _validate_dimensions(
+        lexical_dimension=lexical_dimension,
+        semantic_dimension=semantic_dimension,
+        context_window=context_window,
+        min_df=min_df,
+        max_vocabulary=max_vocabulary,
+        max_context_occurrences=max_context_occurrences,
+    )
+    index_path = Path(index_path)
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+
+    spool_handle = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        prefix=f".{index_path.name}.documents-",
+        suffix=".jsonl",
+        dir=index_path.parent,
+        delete=False,
+    )
+    spool_path = Path(spool_handle.name)
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{index_path.name}.building-",
+        suffix=".sqlite",
+        dir=index_path.parent,
+    )
+    os.close(file_descriptor)
+    temporary_path = Path(temporary_name)
+    temporary_path.unlink(missing_ok=True)
+
+    frequencies: Counter[str] = Counter()
+    seen_ids: set[int] = set()
+    documents_indexed = 0
+    documents_skipped_empty = 0
+
+    try:
+        with spool_handle:
+            for document in documents:
+                item_id = int(document.item_id)
+                if item_id in seen_ids:
+                    raise ValueError(f"item_id duplicado: {item_id}")
+                seen_ids.add(item_id)
+                tokens = _tokenize(document.text)
+                if not tokens:
+                    documents_skipped_empty += 1
+                    continue
+                frequencies.update(set(tokens))
+                spool_handle.write(
+                    json.dumps([item_id, tokens], ensure_ascii=False, separators=(",", ":"))
+                    + "\n"
+                )
+                documents_indexed += 1
+
+        selected_terms = [
+            term
+            for term, frequency in sorted(
+                frequencies.items(), key=lambda item: (-item[1], item[0])
+            )
+            if frequency >= min_df
+        ][:max_vocabulary]
+        selected = set(selected_terms)
+        idf_by_term = {
+            term: _idf(documents_indexed, frequency)
+            for term, frequency in frequencies.items()
+        }
+
+        context_vectors: dict[str, list[float]] = {
+            term: [0.0] * semantic_dimension for term in selected_terms
+        }
+        projection_cache: dict[str, tuple[tuple[int, float], ...]] = {}
+        trained_occurrences: Counter[str] = Counter()
+        for _, tokens in _spooled_documents(spool_path):
+            for target_index, target in enumerate(tokens):
+                if target not in selected:
+                    continue
+                if trained_occurrences[target] >= max_context_occurrences:
+                    continue
+                trained_occurrences[target] += 1
+                target_vector = context_vectors[target]
+                start = max(0, target_index - context_window)
+                end = min(len(tokens), target_index + context_window + 1)
+                for neighbor_index in range(start, end):
+                    if neighbor_index == target_index:
+                        continue
+                    neighbor = tokens[neighbor_index]
+                    projection = projection_cache.get(neighbor)
+                    if projection is None:
+                        projection = _random_projection(neighbor, semantic_dimension)
+                        if neighbor in selected or len(projection_cache) < 50_000:
+                            projection_cache[neighbor] = projection
+                    distance_weight = 1.0 / abs(target_index - neighbor_index)
+                    for position, sign in projection:
+                        target_vector[position] += sign * distance_weight
+
+        for term in selected_terms:
+            context_vectors[term] = _normalize(context_vectors[term])
+
+        with sqlite3.connect(temporary_path) as connection:
+            _create_schema(connection)
+            _write_metadata(
+                connection,
+                {
+                    "format_version": SEMANTIC_INDEX_FORMAT_VERSION,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "documents": documents_indexed,
+                    "vocabulary_size": len(frequencies),
+                    "semantic_vocabulary_size": len(selected_terms),
+                    "lexical_dimension": lexical_dimension,
+                    "semantic_dimension": semantic_dimension,
+                    "context_window": context_window,
+                    "min_df": min_df,
+                    "max_vocabulary": max_vocabulary,
+                    "max_context_occurrences": max_context_occurrences,
+                    "vector_encoding": "signed_int8_unit_vector",
+                    "method": SEMANTIC_METHOD,
+                    "build_signature": SEMANTIC_BUILD_SIGNATURE,
+                    "source_fingerprint": source_fingerprint,
+                },
+            )
+            connection.executemany(
+                """
+                INSERT INTO terms (
+                    term, document_frequency, inverse_document_frequency,
+                    distributional_vector
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (
+                    (
+                        term,
+                        frequency,
+                        idf_by_term[term],
+                        _pack_vector(context_vectors[term])
+                        if term in selected
+                        else None,
+                    )
+                    for term, frequency in frequencies.items()
+                ),
+            )
+            default_idf = _idf(documents_indexed, 0)
+            for item_id, tokens in _spooled_documents(spool_path):
+                counts = Counter(tokens)
+                lexical = _lexical_vector(
+                    counts, idf_by_term, lexical_dimension, default_idf
+                )
+                distributional = _distributional_vector(
+                    counts,
+                    idf_by_term,
+                    context_vectors,
+                    semantic_dimension,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO items (
+                        item_id, lexical_vector, distributional_vector
+                    ) VALUES (?, ?, ?)
+                    """,
+                    (
+                        item_id,
+                        _pack_vector(lexical),
+                        _pack_vector(distributional),
+                    ),
+                )
+            connection.commit()
+            connection.execute("PRAGMA optimize")
+
+        os.replace(temporary_path, index_path)
+        return SemanticBuildSummary(
+            documents_indexed=documents_indexed,
+            documents_skipped_empty=documents_skipped_empty,
+            vocabulary_size=len(frequencies),
+            semantic_vocabulary_size=len(selected_terms),
+            lexical_dimension=lexical_dimension,
+            semantic_dimension=semantic_dimension,
+            index_size_bytes=index_path.stat().st_size,
+            source_fingerprint=source_fingerprint,
+        )
+    finally:
+        spool_path.unlink(missing_ok=True)
+        temporary_path.unlink(missing_ok=True)
+
+
+def build_semantic_index(
+    database_path: Path,
+    index_path: Path,
+    *,
+    lexical_dimension: int = 256,
+    semantic_dimension: int = 64,
+    context_window: int = 3,
+    min_df: int = 2,
+    max_vocabulary: int = 15_000,
+    max_context_occurrences: int = 128,
+) -> SemanticBuildSummary:
+    """Construye el índice a partir de ``chunks(id, text)`` de ``actas.db``.
+
+    Esta es la entrada destinada al workflow de GitHub Actions. La lectura se
+    hace en modo estricto (solo lectura) para no modificar accidentalmente la
+    base principal mientras se genera el artefacto semántico.
+    """
+    database_path = Path(database_path)
+    if not database_path.exists():
+        raise SemanticIndexError("No existe la base de fragmentos")
+    if database_path.resolve() == Path(index_path).resolve():
+        raise ValueError("index_path debe ser distinto de database_path")
+    source_fingerprint = semantic_source_fingerprint(database_path)
+    try:
+        with sqlite3.connect(
+            f"file:{database_path}?mode=ro", uri=True
+        ) as connection:
+            table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chunks'"
+            ).fetchone()
+            if table is None:
+                raise SemanticIndexError(
+                    "La base principal no contiene la tabla chunks"
+                )
+            documents = (
+                SemanticDocument(item_id=int(item_id), text=str(text))
+                for item_id, text in connection.execute(
+                    "SELECT id, text FROM chunks ORDER BY id"
+                )
+            )
+            return build_semantic_documents_index(
+                documents,
+                index_path,
+                lexical_dimension=lexical_dimension,
+                semantic_dimension=semantic_dimension,
+                context_window=context_window,
+                min_df=min_df,
+                max_vocabulary=max_vocabulary,
+                max_context_occurrences=max_context_occurrences,
+                source_fingerprint=source_fingerprint,
+            )
+    except SemanticIndexError:
+        raise
+    except sqlite3.Error as exc:
+        raise SemanticIndexError(
+            "No fue posible leer los fragmentos de la base principal"
+        ) from exc
+
+
+def semantic_source_fingerprint(database_path: Path) -> str:
+    """Identifica el corpus con metadatos baratos y hashes documentales."""
+    database_path = Path(database_path)
+    if not database_path.exists():
+        raise SemanticIndexError("No existe la base de fragmentos")
+    digest = hashlib.sha256()
+    try:
+        with sqlite3.connect(
+            f"file:{database_path}?mode=ro",
+            uri=True,
+        ) as connection:
+            chunk_state = connection.execute(
+                "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM chunks"
+            ).fetchone()
+            digest.update(f"chunks:{chunk_state[0]}:{chunk_state[1]}\n".encode())
+            has_documents = connection.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='documents'"
+            ).fetchone()
+            if has_documents:
+                for manifest_url, document_hash in connection.execute(
+                    "SELECT manifest_url, document_hash FROM documents "
+                    "ORDER BY manifest_url"
+                ):
+                    digest.update(
+                        f"{manifest_url}\x1f{document_hash}\n".encode("utf-8")
+                    )
+    except sqlite3.Error as exc:
+        raise SemanticIndexError(
+            "No fue posible calcular la identidad del corpus"
+        ) from exc
+    return digest.hexdigest()
+
+
+def semantic_index_info(index_path: Path) -> dict[str, object]:
+    """Devuelve metadatos verificando antes la versión del formato."""
+    index_path = Path(index_path)
+    if not index_path.exists():
+        raise SemanticIndexError("No existe el índice semántico")
+    try:
+        with sqlite3.connect(f"file:{index_path}?mode=ro", uri=True) as connection:
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            if not {"metadata", "terms", "items"}.issubset(tables):
+                raise SemanticIndexError(
+                    "El índice semántico no contiene todas sus tablas"
+                )
+            info = _read_metadata(connection)
+            try:
+                declared_documents = int(info["documents"])
+                lexical_dimension = int(info["lexical_dimension"])
+                semantic_dimension = int(info["semantic_dimension"])
+            except (TypeError, ValueError) as exc:
+                raise SemanticIndexError(
+                    "Los metadatos dimensionales del índice son inválidos"
+                ) from exc
+            item_count = int(
+                connection.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+            )
+            if item_count != declared_documents:
+                raise SemanticIndexError(
+                    "La cobertura declarada del índice semántico no coincide"
+                )
+            sample = connection.execute(
+                "SELECT length(lexical_vector), length(distributional_vector) "
+                "FROM items LIMIT 1"
+            ).fetchone()
+            if sample and (
+                sample[0] is None
+                or sample[1] is None
+                or int(sample[0]) != lexical_dimension
+                or int(sample[1]) != semantic_dimension
+            ):
+                raise SemanticIndexError(
+                    "El índice contiene vectores con dimensión incompatible"
+                )
+            return info
+    except sqlite3.Error as exc:
+        raise SemanticIndexError("No fue posible abrir el índice semántico") from exc
+
+
+def semantic_index_status(index_path: Path) -> dict[str, object]:
+    """Estado tolerante a fallos para la interfaz de Streamlit."""
+    index_path = Path(index_path)
+    if not index_path.exists():
+        return {
+            "available": False,
+            "reason": "missing",
+            "message": "El índice semántico aún no ha sido construido.",
+        }
+    try:
+        info = semantic_index_info(index_path)
+    except SemanticIndexError as exc:
+        return {
+            "available": False,
+            "reason": "invalid",
+            "message": str(exc),
+        }
+    return {
+        "available": True,
+        "reason": "ready",
+        "message": "Índice semántico local disponible.",
+        "size_bytes": index_path.stat().st_size,
+        **info,
+    }
+
+
+def _term_rows(
+    connection: sqlite3.Connection,
+    tokens: Sequence[str],
+) -> dict[str, tuple[float, bytes | None]]:
+    unique_tokens = list(dict.fromkeys(tokens))
+    if not unique_tokens:
+        return {}
+    result: dict[str, tuple[float, bytes | None]] = {}
+    for start in range(0, len(unique_tokens), _ITEM_BATCH_SIZE):
+        batch = unique_tokens[start : start + _ITEM_BATCH_SIZE]
+        placeholders = ",".join("?" for _ in batch)
+        rows = connection.execute(
+            f"""
+            SELECT term, inverse_document_frequency, distributional_vector
+            FROM terms WHERE term IN ({placeholders})
+            """,
+            batch,
+        ).fetchall()
+        result.update(
+            {
+                str(term): (float(inverse_document_frequency), vector)
+                for term, inverse_document_frequency, vector in rows
+            }
+        )
+    return result
+
+
+def _item_rows(
+    connection: sqlite3.Connection,
+    candidate_ids: Sequence[int] | None,
+) -> Iterator[tuple[int, bytes, bytes]]:
+    if candidate_ids is None:
+        yield from connection.execute(
+            "SELECT item_id, lexical_vector, distributional_vector FROM items"
+        )
+        return
+    unique_ids = list(dict.fromkeys(int(item_id) for item_id in candidate_ids))
+    for start in range(0, len(unique_ids), _ITEM_BATCH_SIZE):
+        batch = unique_ids[start : start + _ITEM_BATCH_SIZE]
+        placeholders = ",".join("?" for _ in batch)
+        yield from connection.execute(
+            f"""
+            SELECT item_id, lexical_vector, distributional_vector
+            FROM items WHERE item_id IN ({placeholders})
+            """,
+            batch,
+        )
+
+
+def query_semantic_index(
+    index_path: Path,
+    query: str,
+    *,
+    top_k: int = 20,
+    candidate_ids: Sequence[int] | None = None,
+    lexical_weight: float = 0.35,
+    distributional_weight: float = 0.65,
+    min_score: float = 0.01,
+) -> list[SemanticHit]:
+    """Consulta el índice o reordena ``candidate_ids``.
+
+    La ponderación predeterminada favorece la señal distribucional porque FTS5
+    puede aportar la señal léxica principal fuera de este módulo. Si la consulta
+    no contiene términos presentes en el corpus, no devuelve coincidencias.
+    """
+    if top_k < 1:
+        raise ValueError("top_k debe ser mayor que cero")
+    if lexical_weight < 0 or distributional_weight < 0:
+        raise ValueError("Los pesos no pueden ser negativos")
+    if lexical_weight + distributional_weight <= 0:
+        raise ValueError("Al menos un peso debe ser mayor que cero")
+    if min_score < 0:
+        raise ValueError("min_score no puede ser negativo")
+    if candidate_ids is not None and not candidate_ids:
+        return []
+
+    tokens = _tokenize(query)
+    if not tokens:
+        return []
+    index_path = Path(index_path)
+    if not index_path.exists():
+        return []
+
+    try:
+        with sqlite3.connect(f"file:{index_path}?mode=ro", uri=True) as connection:
+            metadata = _read_metadata(connection)
+            lexical_dimension = int(metadata["lexical_dimension"])
+            semantic_dimension = int(metadata["semantic_dimension"])
+            document_count = int(metadata["documents"])
+            terms = _term_rows(connection, tokens)
+            if not terms:
+                return []
+            idf_by_term = {term: values[0] for term, values in terms.items()}
+            context_vectors = {
+                term: _unpack_vector(values[1], semantic_dimension)
+                for term, values in terms.items()
+                if values[1] is not None
+            }
+            counts = Counter(token for token in tokens if token in terms)
+            query_lexical = _lexical_vector(
+                counts,
+                idf_by_term,
+                lexical_dimension,
+                _idf(document_count, 0),
+            )
+            query_distributional = _distributional_vector(
+                counts,
+                idf_by_term,
+                context_vectors,
+                semantic_dimension,
+            )
+            has_distributional_signal = any(query_distributional)
+            effective_distributional_weight = (
+                distributional_weight if has_distributional_signal else 0.0
+            )
+            effective_total = lexical_weight + effective_distributional_weight
+            if effective_total <= 0.0:
+                return []
+            effective_lexical_weight = lexical_weight / effective_total
+            effective_distributional_weight /= effective_total
+
+            hits: list[SemanticHit] = []
+            for item_id, lexical_blob, distributional_blob in _item_rows(
+                connection, candidate_ids
+            ):
+                lexical = max(
+                    0.0,
+                    min(
+                        1.0,
+                        _dot(
+                            query_lexical,
+                            _unpack_vector(lexical_blob, lexical_dimension),
+                        ),
+                    ),
+                )
+                distributional = 0.0
+                if has_distributional_signal:
+                    distributional = max(
+                        0.0,
+                        min(
+                            1.0,
+                            _dot(
+                                query_distributional,
+                                _unpack_vector(
+                                    distributional_blob, semantic_dimension
+                                ),
+                            ),
+                        ),
+                    )
+                score = (
+                    effective_lexical_weight * lexical
+                    + effective_distributional_weight * distributional
+                )
+                if score >= min_score:
+                    hits.append(
+                        SemanticHit(
+                            item_id=int(item_id),
+                            score=round(score, 6),
+                            lexical_score=round(lexical, 6),
+                            distributional_score=round(distributional, 6),
+                        )
+                    )
+    except sqlite3.Error as exc:
+        raise SemanticIndexError("No fue posible consultar el índice semántico") from exc
+
+    hits.sort(key=lambda hit: (-hit.score, hit.item_id))
+    return hits[:top_k]
+
+
+def semantic_search(
+    index_path: Path,
+    query: str,
+    top_k: int = 20,
+    allowed_ids: Sequence[int] | None = None,
+) -> list[tuple[int, float]]:
+    """API compacta para la capa de recuperación de la aplicación.
+
+    Devuelve ``(chunk_id, score)``. ``allowed_ids`` permite reordenar los
+    candidatos producidos por FTS5 y evita un barrido completo del índice.
+    Para auditoría de cada señal, use :func:`query_semantic_index`.
+    """
+    return [
+        (hit.item_id, hit.score)
+        for hit in query_semantic_index(
+            index_path,
+            query,
+            top_k=top_k,
+            candidate_ids=allowed_ids,
+        )
+    ]
+
+
+def _normalized_scores(scores: Mapping[int, float]) -> dict[int, float]:
+    positive = {int(item_id): max(0.0, float(score)) for item_id, score in scores.items()}
+    maximum = max(positive.values(), default=0.0)
+    if maximum <= 0.0:
+        return {item_id: 0.0 for item_id in positive}
+    return {item_id: score / maximum for item_id, score in positive.items()}
+
+
+def combine_rankings(
+    lexical_scores: Mapping[int, float],
+    semantic_scores: Mapping[int, float] | Iterable[SemanticHit],
+    *,
+    lexical_weight: float = 0.65,
+    semantic_weight: float = 0.35,
+    top_k: int = 20,
+    include_semantic_only: bool = True,
+) -> list[HybridScore]:
+    """Fusiona puntuaciones externas de FTS5 con la recuperación local.
+
+    Cada fuente se normaliza por su máximo antes de ponderarla, evitando mezclar
+    directamente escalas BM25, bonificaciones de interfaz y cosenos. Use
+    ``include_semantic_only=False`` para un reranking estricto de candidatos
+    léxicos.
+    """
+    if lexical_weight < 0 or semantic_weight < 0:
+        raise ValueError("Los pesos no pueden ser negativos")
+    if lexical_weight + semantic_weight <= 0:
+        raise ValueError("Al menos un peso debe ser mayor que cero")
+    if top_k < 1:
+        raise ValueError("top_k debe ser mayor que cero")
+
+    if isinstance(semantic_scores, Mapping):
+        semantic_mapping = {
+            int(item_id): float(score) for item_id, score in semantic_scores.items()
+        }
+    else:
+        semantic_mapping = {hit.item_id: hit.score for hit in semantic_scores}
+
+    lexical = _normalized_scores(lexical_scores)
+    semantic = _normalized_scores(semantic_mapping)
+    item_ids = set(lexical)
+    if include_semantic_only:
+        item_ids.update(semantic)
+    total_weight = lexical_weight + semantic_weight
+    lexical_factor = lexical_weight / total_weight
+    semantic_factor = semantic_weight / total_weight
+
+    combined = [
+        HybridScore(
+            item_id=item_id,
+            score=round(
+                lexical_factor * lexical.get(item_id, 0.0)
+                + semantic_factor * semantic.get(item_id, 0.0),
+                6,
+            ),
+            lexical_score=round(lexical.get(item_id, 0.0), 6),
+            semantic_score=round(semantic.get(item_id, 0.0), 6),
+        )
+        for item_id in item_ids
+    ]
+    combined.sort(key=lambda hit: (-hit.score, hit.item_id))
+    return combined[:top_k]

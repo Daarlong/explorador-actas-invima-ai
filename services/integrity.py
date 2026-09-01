@@ -104,6 +104,10 @@ def build_integrity_report(
                 indexed_urls,
                 "section",
             ),
+            "regulatory_records": 0,
+            "regulatory_documents": 0,
+            "regulatory_extraction_pending": [],
+            "regulatory_extraction_errors": [],
         }
 
     with connect(database_path) as connection:
@@ -148,6 +152,50 @@ def build_integrity_report(
                 """
             ).fetchall()
         ]
+        feature_tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        regulatory_records = 0
+        regulatory_documents = 0
+        regulatory_pending: list[str] = []
+        regulatory_errors: list[dict] = []
+        if {"regulatory_records", "document_extractions"}.issubset(feature_tables):
+            regulatory_records = int(
+                connection.execute("SELECT COUNT(*) FROM regulatory_records").fetchone()[0]
+            )
+            regulatory_documents = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM document_extractions "
+                    "WHERE status = 'complete'"
+                ).fetchone()[0]
+            )
+            regulatory_pending = [
+                row["title"]
+                for row in connection.execute(
+                    """
+                    SELECT d.title
+                    FROM documents d
+                    LEFT JOIN document_extractions e ON e.document_id = d.id
+                    WHERE e.document_id IS NULL
+                    ORDER BY d.year, d.acta_number, d.part
+                    """
+                ).fetchall()
+            ]
+            regulatory_errors = [
+                {"title": row["title"], "error": row["error_message"]}
+                for row in connection.execute(
+                    """
+                    SELECT d.title, e.error_message
+                    FROM document_extractions e
+                    JOIN documents d ON d.id = e.document_id
+                    WHERE e.status = 'error'
+                    ORDER BY d.year, d.acta_number, d.part
+                    """
+                ).fetchall()
+            ]
 
     manifest_by_url = {document.url: document.title for document in manifest}
     indexed_by_url = {row["manifest_url"]: row["title"] for row in document_rows}
@@ -188,7 +236,16 @@ def build_integrity_report(
     status = (
         "error"
         if has_error
-        else ("warning" if ocr_candidates or page_inventory_pending else "ok")
+        else (
+            "warning"
+            if (
+                ocr_candidates
+                or page_inventory_pending
+                or regulatory_pending
+                or regulatory_errors
+            )
+            else "ok"
+        )
     )
     database_bytes = database_path.stat().st_size
     return {
@@ -220,6 +277,10 @@ def build_integrity_report(
             indexed_urls,
             "section",
         ),
+        "regulatory_records": regulatory_records,
+        "regulatory_documents": regulatory_documents,
+        "regulatory_extraction_pending": regulatory_pending,
+        "regulatory_extraction_errors": regulatory_errors,
     }
 
 

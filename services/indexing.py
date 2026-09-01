@@ -26,6 +26,7 @@ from services.database import (
     initialize_database,
     insert_document,
     is_current_schema,
+    migrate_database_schema,
     optimize_database,
 )
 from services.downloader import download_pdf_resource, file_sha256
@@ -48,6 +49,10 @@ class IndexingReport:
     chunks_indexed: int = 0
     possible_scanned_pages: int = 0
     ocr_pages_indexed: int = 0
+    regulatory_documents_processed: int = 0
+    regulatory_records_extracted: int = 0
+    semantic_index_status: str = "not_run"
+    semantic_documents_indexed: int = 0
     database_size_bytes: int = 0
     errors: list[str] | None = None
     alternate_links_used: list[dict[str, str]] | None = None
@@ -392,6 +397,7 @@ def update_index(
             mode="full_initial",
             allow_partial=allow_partial,
         )
+    schema_migrated = migrate_database_schema(database_path)
     migration: tuple[int, int, int, int] | None = None
     if not is_current_schema(database_path):
         migration = _migrate_legacy_index(
@@ -430,7 +436,11 @@ def update_index(
         document for document in documents if document.url not in existing_urls
     ]
     report = IndexingReport(
-        mode="legacy_migration" if migration else "incremental",
+        mode=(
+            "legacy_migration"
+            if migration
+            else ("schema_migration" if schema_migrated else "incremental")
+        ),
         documents_total=len(documents),
         documents_existing=len(existing),
         documents_migrated=migration[0] if migration else 0,
@@ -446,6 +456,8 @@ def update_index(
 
     if migration:
         report.mode = "legacy_migration_incremental"
+    elif schema_migrated:
+        report.mode = "schema_migration_incremental"
 
     temporary_database = database_path.with_suffix(".updating.db")
     _remove_database_files(temporary_database)

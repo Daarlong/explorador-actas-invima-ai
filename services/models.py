@@ -31,6 +31,9 @@ class SearchResult:
     part: str | None
     source_type: str
     score: float
+    lexical_score: float | None = None
+    semantic_score: float | None = None
+    match_type: str = "textual"
 
     @property
     def source_label(self) -> str:
@@ -38,3 +41,8 @@ class SearchResult:
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "SearchResult":
+        allowed = {field.name for field in cls.__dataclass_fields__.values()}
+        return cls(**{key: item for key, item in value.items() if key in allowed})

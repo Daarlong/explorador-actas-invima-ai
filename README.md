@@ -20,14 +20,28 @@ aprobado.
 - Corpus heredado inicial desde 2020 hasta 2025 y 2026 hasta el Acta 08: 179
   documentos; el primer workflow añade incrementalmente los años 2013–2019 y
   las series adicionales que encuentre en la página.
-- Explorador de actas con búsqueda textual y frases exactas.
-- Filtros por año, número de acta, sala/sección y parte.
+- Explorador de actas con búsqueda textual, híbrida, semántica local y frases
+  exactas, sin enviar las consultas a servicios externos.
+- Filtros por año, número de acta, sala/sección, parte, resultado, producto,
+  principio activo, interesado, expediente y radicado.
+- Resultados agrupados por acta, paginados, ordenables y con términos
+  resaltados de forma segura.
+- Visor integrado de la página exacta del PDF, con navegación entre páginas.
+- Selección de evidencias en el Explorador para analizarlas directamente en el
+  Analista IA.
+- Tablero inicial con cobertura real, rango de años, documentos recientes y
+  estado de las capacidades.
+- Extracción determinística de producto, principio activo, interesado,
+  expediente, radicado, solicitud, concepto y resultado normalizado. Estos
+  campos se presentan como ayuda pendiente de verificación humana.
 - Evidencia con título, página, fragmento y URL de origen claramente identificada.
 - Analista IA con citas `[F#]` y negativa cuando no hay evidencia.
 - Modo `prompt_only` para trabajar sin enviar consultas a servicios externos.
 - Compatibilidad opcional con OpenAI o Azure OpenAI.
 - Administración del manifiesto e indexación desde la interfaz o por CLI.
 - Índice SQLite compacto, empaquetado en partes verificadas con SHA-256.
+- Índice semántico SQLite independiente, local y cuantizado para limitar su
+  tamaño; si no está disponible, la aplicación vuelve automáticamente a FTS5.
 - Informe de integridad visible desde la aplicación.
 - Actualización incremental para descargar e indexar únicamente actas nuevas.
 - Automatización completa: el catálogo lanza el índice cuando detecta cambios o
@@ -40,6 +54,20 @@ aprobado.
 - Página de Catálogo con estado indexado, pendiente, sin enlace o ya no listado.
 
 No contiene funcionalidades relacionadas con un monitor de transparencia.
+
+## Cambios visibles en la versión 0.5.0
+
+| Módulo | Mejora |
+|---|---|
+| Inicio | Panel de cobertura, rango real, actividad reciente y estado del índice semántico |
+| Explorador | Tres modos de búsqueda, filtros regulatorios, agrupación por acta, orden y paginación |
+| Evidencia | Visor integrado de la página citada y selección de fragmentos |
+| Analista IA | Puede trabajar exclusivamente con las evidencias seleccionadas en el Explorador |
+| Índice | Migración aditiva al esquema 4, fichas regulatorias e índice semántico local |
+
+`LLM_PROVIDER = "prompt_only"` puede mantenerse sin cambios. Ese ajuste solo
+controla la generación de respuestas; la búsqueda semántica de esta versión se
+ejecuta localmente y no necesita una clave de IA.
 
 ### Cobertura heredada antes de la primera actualización
 
@@ -88,7 +116,11 @@ todo el histórico visible desde 2013; el año inicial se configura con
 │   ├── manifest.py
 │   ├── metadata.py
 │   ├── pdf_reader.py
+│   ├── pdf_viewer.py
+│   ├── regulatory.py
 │   ├── retrieval.py
+│   ├── search.py
+│   ├── semantic.py
 │   └── text_utils.py
 ├── tests/
 ├── actas_catalog.csv
@@ -140,9 +172,12 @@ El flujo de construcción del índice:
    alternativos conocidos si falla el principal;
 4. aplica OCR en español a las páginas sin texto y deja registradas las que no
    puedan recuperarse;
-5. genera informes de ejecución, integridad y cobertura por año;
-6. comprime la base, calcula hashes y la divide en fragmentos de 90 MiB;
-7. guarda el índice y los informes automáticamente en el repositorio privado.
+5. migra de forma aditiva el esquema anterior y extrae los campos regulatorios
+   desde los fragmentos ya almacenados;
+6. construye o actualiza el índice semántico local;
+7. genera informes de ejecución, integridad y cobertura por año;
+8. comprime ambas bases, calcula hashes y las divide en fragmentos de 90 MiB;
+9. guarda los índices y los informes automáticamente en el repositorio privado.
 
 No es necesario descargar un artefacto ni subir manualmente `actas.db`.
 
@@ -158,12 +193,13 @@ horas y aumentar considerablemente el tamaño de la base. El workflow dispone de
 un máximo de seis horas, conserva los PDF descargados en caché y deja los
 documentos fallidos pendientes para reintentarlos sin perder los correctos.
 
-La primera ejecución de la versión 0.2.1 o posterior detecta el índice anterior y migra sus
-fragmentos al esquema compacto sin volver a descargar los 179 PDF. Después, las
-ejecuciones normales son incrementales. Selecciona `full_rebuild` únicamente
-cuando necesites volver a procesar todos los documentos, por ejemplo para
-aplicar OCR retroactivamente a páginas de un índice migrado. No lo selecciones
-para incorporar publicaciones nuevas.
+La primera ejecución de la versión 0.5.0 migra los esquemas anteriores al
+esquema 4 sobre una copia verificada de la base, extrae los campos regulatorios
+y crea el índice semántico. No vuelve a descargar los PDF ya indexados. Después, las ejecuciones
+normales son incrementales. Selecciona `full_rebuild` únicamente cuando necesites
+volver a procesar todos los documentos, por ejemplo para aplicar OCR
+retroactivamente. No lo selecciones para instalar esta actualización ni para
+incorporar publicaciones nuevas.
 
 ## Configuración segura de IA
 
@@ -253,12 +289,21 @@ La página **Integridad** muestra:
 - errores de descarga o procesamiento que se reintentarán;
 - enlaces alternativos utilizados;
 - cobertura documental por año y por serie/sala;
+- avance y errores de la extracción de fichas regulatorias;
+- estado de construcción del índice semántico local;
 - tamaño de la base compactada.
 
 El esquema compacto evita guardar el texto completo en páginas, fragmentos,
 texto normalizado y contenido FTS al mismo tiempo. El paquete
 `data/actas.db.package.json` registra tamaño y SHA-256 de la base y de cada
-fragmento, y la aplicación los valida antes de usar el índice.
+fragmento, y la aplicación los valida antes de usar el índice. El índice
+semántico se distribuye del mismo modo mediante
+`data/semantic.db.package.json`.
+
+La extracción regulatoria es deliberadamente conservadora. Una ficha puede
+estar incompleta o mal clasificada por diferencias históricas de formato; por
+eso se marca como automática y siempre debe comprobarse contra la página del
+PDF mostrada en el visor.
 
 ## Verificación
 
@@ -279,9 +324,10 @@ Antes de publicar una versión se debe comprobar:
 
 El flujo `.github/workflows/tests.yml` repite automáticamente la compilación y
 las pruebas con Python 3.12 después de cada cambio enviado a GitHub. La versión
-0.4.0 usa directamente la API `pymupdf`, sin depender del nombre heredado
-`fitz`, y Tesseract se instala dentro del runner de GitHub. No requiere instalar
-herramientas de desarrollo en el computador corporativo.
+0.5.0 usa directamente la API `pymupdf`, sin depender del nombre heredado
+`fitz`, y Tesseract se instala dentro del runner de GitHub. La búsqueda
+semántica también es local y usa únicamente la biblioteca estándar de Python.
+No requiere instalar herramientas de desarrollo en el computador corporativo.
 
 ## Propiedad y distribución
 

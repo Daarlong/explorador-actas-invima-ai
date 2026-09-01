@@ -3,8 +3,9 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from services.database import search_chunks
+from config import SEMANTIC_INDEX_PATH
 from services.models import SearchResult
+from services.search import search_corpus
 
 
 def retrieve_evidence(
@@ -12,15 +13,45 @@ def retrieve_evidence(
     question: str,
     top_k: int,
     filters: dict[str, list] | None = None,
+    mode: str = "hybrid",
 ) -> list[SearchResult]:
-    return search_chunks(database_path, question, top_k=top_k, filters=filters)
+    return search_corpus(
+        database_path,
+        SEMANTIC_INDEX_PATH,
+        question,
+        top_k=top_k,
+        filters=filters,
+        mode=mode,
+    ).results
 
 
 def build_context(
     results: list[SearchResult],
     max_chars: int = 14000,
 ) -> str:
+    selected = select_context_results(results, max_chars=max_chars)
     blocks: list[str] = []
+    for index, result in enumerate(selected, start=1):
+        provenance = (
+            " — copia histórica"
+            if result.source_type == "historical_mirror"
+            else ""
+        )
+        block = (
+            f"[F{index}] {result.title} — página {result.page}{provenance}\n"
+            f"URL: {result.url}\n"
+            f"{result.text}\n"
+        )
+        blocks.append(block)
+    return "\n---\n".join(blocks)
+
+
+def select_context_results(
+    results: list[SearchResult],
+    max_chars: int = 14000,
+) -> list[SearchResult]:
+    """Devuelve exactamente las fuentes que caben y recibirán etiquetas F#."""
+    selected: list[SearchResult] = []
     total_chars = 0
     for index, result in enumerate(results, start=1):
         provenance = (
@@ -33,11 +64,12 @@ def build_context(
             f"URL: {result.url}\n"
             f"{result.text}\n"
         )
-        if total_chars + len(block) > max_chars:
+        separator_size = 5 if selected else 0
+        if total_chars + separator_size + len(block) > max_chars:
             break
-        blocks.append(block)
-        total_chars += len(block)
-    return "\n---\n".join(blocks)
+        selected.append(result)
+        total_chars += separator_size + len(block)
+    return selected
 
 
 def build_grounded_prompt(

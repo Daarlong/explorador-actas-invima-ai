@@ -147,6 +147,20 @@ if indexing_report:
     alternate_links = indexing_report.get("alternate_links_used") or []
     run_col4.metric("Enlaces alternativos usados", len(alternate_links))
 
+    feature_col1, feature_col2, feature_col3 = st.columns(3)
+    feature_col1.metric(
+        "Documentos estructurados en esta ejecución",
+        indexing_report.get("regulatory_documents_processed", 0),
+    )
+    feature_col2.metric(
+        "Registros extraídos en esta ejecución",
+        indexing_report.get("regulatory_records_extracted", 0),
+    )
+    feature_col3.metric(
+        "Índice semántico",
+        indexing_report.get("semantic_index_status", "sin ejecutar"),
+    )
+
     indexing_errors = indexing_report.get("errors") or []
     if indexing_errors:
         with st.expander(
@@ -191,6 +205,23 @@ if indexing_report:
         "Última ejecución del índice: "
         f"{indexing_report.get('generated_at', 'sin fecha')}"
     )
+
+regulatory_pending = report.get("regulatory_extraction_pending", []) or []
+regulatory_errors = report.get("regulatory_extraction_errors", []) or []
+if regulatory_pending or regulatory_errors:
+    with st.expander(
+        "Extracción de campos regulatorios",
+        expanded=bool(regulatory_errors),
+    ):
+        if regulatory_pending:
+            st.write(
+                f"Documentos pendientes de extracción: {len(regulatory_pending)}"
+            )
+            for title in regulatory_pending:
+                st.write(f"- {title}")
+        if regulatory_errors:
+            st.write("Errores detectados:")
+            st.dataframe(regulatory_errors, hide_index=True, use_container_width=True)
 
 st.caption(
     f"Generado: {report.get('generated_at', 'sin fecha')} · "

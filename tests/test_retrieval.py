@@ -1,7 +1,12 @@
 import unittest
 
 from services.models import SearchResult
-from services.retrieval import build_context, build_grounded_prompt, validate_citations
+from services.retrieval import (
+    build_context,
+    build_grounded_prompt,
+    select_context_results,
+    validate_citations,
+)
 
 
 class RetrievalTests(unittest.TestCase):
@@ -36,6 +41,17 @@ class RetrievalTests(unittest.TestCase):
         self.assertEqual(validate_citations("Decisión [F1].", 1), (True, []))
         self.assertEqual(validate_citations("Decisión sin fuente.", 1), (False, []))
         self.assertEqual(validate_citations("Decisión [F2].", 1), (False, [2]))
+
+    def test_selects_only_sources_that_fit_in_context(self) -> None:
+        second = SearchResult.from_dict(
+            {**self.result.as_dict(), "chunk_id": 2, "text": "Otra evidencia."}
+        )
+        first_block = build_context([self.result])
+        selected = select_context_results(
+            [self.result, second],
+            max_chars=len(first_block),
+        )
+        self.assertEqual([item.chunk_id for item in selected], [1])
 
 
 if __name__ == "__main__":

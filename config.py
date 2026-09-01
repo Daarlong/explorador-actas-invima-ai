@@ -24,11 +24,18 @@ ACTAS_CATALOG_PATH = Path(
 )
 RAW_DATABASE_PATH = Path(os.getenv("ACTAS_DATABASE_PATH", DATA_DIR / "actas.db"))
 DATABASE_PATH = resolve_database_path(RAW_DATABASE_PATH)
+RAW_SEMANTIC_INDEX_PATH = Path(
+    os.getenv("ACTAS_SEMANTIC_INDEX_PATH", DATA_DIR / "semantic.db")
+)
+SEMANTIC_INDEX_PATH = resolve_database_path(RAW_SEMANTIC_INDEX_PATH)
 INTEGRITY_REPORT_PATH = Path(
     os.getenv("ACTAS_INTEGRITY_REPORT_PATH", DATA_DIR / "integrity-report.json")
 )
 INDEXING_REPORT_PATH = Path(
     os.getenv("ACTAS_INDEXING_REPORT_PATH", DATA_DIR / "indexing-report.json")
+)
+SEMANTIC_REPORT_PATH = Path(
+    os.getenv("ACTAS_SEMANTIC_REPORT_PATH", DATA_DIR / "semantic-report.json")
 )
 CATALOG_REPORT_PATH = Path(
     os.getenv("ACTAS_CATALOG_REPORT_PATH", DATA_DIR / "catalog-report.json")
@@ -50,6 +57,18 @@ OCR_LANGUAGES = os.getenv("ACTAS_OCR_LANGUAGES", "spa+eng").strip() or "spa+eng"
 OCR_DPI = int(os.getenv("ACTAS_OCR_DPI", "180"))
 OCR_TIMEOUT_SECONDS = int(os.getenv("ACTAS_OCR_TIMEOUT_SECONDS", "120"))
 OCR_MIN_CHARS = int(os.getenv("ACTAS_OCR_MIN_CHARS", "20"))
+SEMANTIC_ENABLED = os.getenv("ACTAS_SEMANTIC_ENABLED", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+SEMANTIC_LEXICAL_DIMENSION = int(
+    os.getenv("ACTAS_SEMANTIC_LEXICAL_DIMENSION", "128")
+)
+SEMANTIC_DISTRIBUTIONAL_DIMENSION = int(
+    os.getenv("ACTAS_SEMANTIC_DISTRIBUTIONAL_DIMENSION", "48")
+)
 
 ALLOWED_DOCUMENT_HOSTS = tuple(
     host.strip().lower()
