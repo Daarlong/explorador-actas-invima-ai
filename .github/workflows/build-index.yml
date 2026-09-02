@@ -2,6 +2,12 @@ name: Construir índice
 
 on:
   workflow_dispatch:
+    inputs:
+      full_rebuild:
+        description: "Reconstruir todos los PDF (normalmente no es necesario)"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -13,10 +19,16 @@ concurrency:
 jobs:
   build-index:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 360
     env:
       ACTAS_DISABLE_DATABASE_PACKAGE: "1"
       ACTAS_DATABASE_PATH: data/actas.db
+      ACTAS_SEMANTIC_INDEX_PATH: data/semantic.db
+      ACTAS_INDEX_START_YEAR: "2013"
+      ACTAS_OCR_ENABLED: "1"
+      ACTAS_OCR_LANGUAGES: "spa+eng"
+      ACTAS_OCR_DPI: "180"
+
     steps:
       - name: Descargar código
         uses: actions/checkout@v7
@@ -27,33 +39,62 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      - name: Restaurar caché de PDF
+        uses: actions/cache@v6
+        with:
+          path: local_cache/documents
+          key: actas-pdf-${{ runner.os }}-${{ hashFiles('documents_manifest.csv') }}
+          restore-keys: |
+            actas-pdf-${{ runner.os }}-
+
       - name: Instalar dependencias
         run: python -m pip install --requirement requirements.txt
+
+      - name: Instalar reconocimiento óptico en español
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes tesseract-ocr tesseract-ocr-spa
 
       - name: Verificar catálogo y código
         run: python -m unittest discover -v
 
-      - name: Construir base de búsqueda
-        run: python build_index.py
+      - name: Restaurar índice anterior
+        run: |
+          python package_index.py restore --database data/actas.db
+          python package_index.py restore --database data/semantic.db
 
-      - name: Comprimir y dividir el índice
+      - name: Construir o actualizar base de búsqueda
         shell: bash
         run: |
-          rm -f data/actas.db.gz data/actas.db.gz.part-*
-          gzip -9 -c data/actas.db > data/actas.db.gz
-          split -b 90m -d -a 3 data/actas.db.gz data/actas.db.gz.part-
-          rm data/actas.db.gz data/actas.db
+          if [ "${{ inputs.full_rebuild }}" = "true" ]; then
+            python build_index.py --full
+          else
+            python build_index.py --allow-partial
+          fi
 
-      - name: Guardar índice en el repositorio privado
+      - name: Comprimir, verificar y dividir los índices
+        shell: bash
+        run: |
+          python package_index.py create --database data/actas.db --part-size-mib 90 --delete-source
+          if [ -f data/semantic.db ]; then
+            python package_index.py create --database data/semantic.db --part-size-mib 90 --delete-source
+          fi
+
+      - name: Guardar índice e informe en el repositorio privado
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -u data
+          git add data/actas.db.package.json data/integrity-report.json data/indexing-report.json data/semantic-report.json
           git add -f data/actas.db.gz.part-*
+          if [ -f data/semantic.db.package.json ]; then
+            git add data/semantic.db.package.json
+            git add -f data/semantic.db.gz.part-*
+          fi
           if git diff --cached --quiet; then
-            echo "El índice no cambió."
+            echo "El índice ya estaba actualizado."
           else
-            git commit -m "Actualizar índice de actas 2020-2026"
+            git commit -m "Actualizar índice e integridad de actas"
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
