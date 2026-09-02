@@ -1,0 +1,170 @@
+{
+  "chunks": 321246,
+  "coverage_by_section": [
+    {
+      "coverage_percent": 100.0,
+      "indexed_documents": 4,
+      "manifest_documents": 4,
+      "missing_documents": 0,
+      "section": "CONJUNTA"
+    },
+    {
+      "coverage_percent": 100.0,
+      "indexed_documents": 1,
+      "manifest_documents": 1,
+      "missing_documents": 0,
+      "section": "CONJUNTA SEMNNIMB-SEDMRDI"
+    },
+    {
+      "coverage_percent": 100.0,
+      "indexed_documents": 1,
+      "manifest_documents": 1,
+      "missing_documents": 0,
+      "section": "CONJUNTA SEMNNIMB-SEM"
+    },
+    {
+      "coverage_percent": 100.0,
+      "indexed_documents": 204,
+      "manifest_documents": 204,
+      "missing_documents": 0,
+      "section": "SEM"
+    },
+    {
+      "coverage_percent": 100.0,
+      "indexed_documents": 181,
+      "manifest_documents": 181,
+      "missing_documents": 0,
+      "section": "SEMNNIMB"
+    },
+    {
+      "coverage_percent": 100.0,
+      "indexed_documents": 247,
+      "manifest_documents": 247,
+      "missing_documents": 0,
+      "section": "SEMPB"
+    }
+  ],
+  "coverage_by_year": [
+    {
+      "coverage_percent": 100.0,
+      "indexed_documents": 19,
+      "manifest_documents": 19,
+      "missing_documents": 0,
+      "year": 2026
+    },
+    {
+      "coverage_percent": 100.0,
+      "indexed_documents": 40,
+      "manifest_documents": 40,
+      "missing_documents": 0,
+      "year": 2025
+    },
+    {
+      "coverage_percent": 100.0,
+      "indexed_documents": 56,
+      "manifest_documents": 56,
+      "missing_documents": 0,
+      "year": 2024
+    },
+    {
+      "coverage_percent": 100.0,
+      "indexed_documents": 56,
+      "manifest_documents": 56,
+      "missing_documents": 0,
+      "year": 2023
+    },
+    {
+      "coverage_percent": 100.0,
+      "indexed_documents": 43,
+      "manifest_documents": 43,
+      "missing_documents": 0,
+      "year": 2022
+    },
+    {
+      "coverage_percent": 100.0,
+      "indexed_documents": 64,
+      "manifest_documents": 64,
+      "missing_documents": 0,
+      "year": 2021
+    },
+    {
+      "coverage_percent": 100.0,
+      "indexed_documents": 49,
+      "manifest_documents": 49,
+      "missing_documents": 0,
+      "year": 2020
+    },
+    {
+      "coverage_percent": 100.0,
+      "indexed_documents": 43,
+      "manifest_documents": 43,
+      "missing_documents": 0,
+      "year": 2019
+    },
+    {
+      "coverage_percent": 100.0,
+      "indexed_documents": 62,
+      "manifest_documents": 62,
+      "missing_documents": 0,
+      "year": 2018
+    },
+    {
+      "coverage_percent": 100.0,
+      "indexed_documents": 41,
+      "manifest_documents": 41,
+      "missing_documents": 0,
+      "year": 2017
+    },
+    {
+      "coverage_percent": 100.0,
+      "indexed_documents": 40,
+      "manifest_documents": 40,
+      "missing_documents": 0,
+      "year": 2016
+    },
+    {
+      "coverage_percent": 100.0,
+      "indexed_documents": 41,
+      "manifest_documents": 41,
+      "missing_documents": 0,
+      "year": 2015
+    },
+    {
+      "coverage_percent": 100.0,
+      "indexed_documents": 30,
+      "manifest_documents": 30,
+      "missing_documents": 0,
+      "year": 2014
+    },
+    {
+      "coverage_percent": 100.0,
+      "indexed_documents": 54,
+      "manifest_documents": 54,
+      "missing_documents": 0,
+      "year": 2013
+    }
+  ],
+  "database_bytes": 600956928,
+  "database_mib": 573.1,
+  "documents_without_chunks": [],
+  "documents_without_pages": [],
+  "expected_schema_version": 4,
+  "fts_rows": 321246,
+  "generated_at": "2026-09-02T14:38:58.711428+00:00",
+  "indexed_documents": 638,
+  "manifest_documents": 638,
+  "missing_documents": [],
+  "ocr_candidates": [],
+  "page_inventory_pending": [],
+  "pages_indexed": 130809,
+  "pdf_pages": 130809,
+  "regulatory_documents": 638,
+  "regulatory_extraction_errors": [],
+  "regulatory_extraction_pending": [],
+  "regulatory_records": 24187,
+  "schema_version": 4,
+  "sqlite_integrity": "ok",
+  "status": "ok",
+  "text_page_coverage_percent": 100.0,
+  "unexpected_documents": []
+}

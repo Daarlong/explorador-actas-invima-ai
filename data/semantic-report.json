@@ -1,0 +1,13 @@
+{
+  "documents_indexed": 321246,
+  "documents_skipped_empty": 0,
+  "generated_at": "2026-09-02T14:38:58.695295+00:00",
+  "index_size_bytes": 70770688,
+  "lexical_dimension": 128,
+  "message": "Índice semántico local construido correctamente.",
+  "semantic_dimension": 48,
+  "semantic_vocabulary_size": 15000,
+  "source_fingerprint": "0cf31f3a8aff0ed0ddf173159b059c10325c21ecfcf1f9ada1b227605b5ddbb9",
+  "status": "built",
+  "vocabulary_size": 146368
+}

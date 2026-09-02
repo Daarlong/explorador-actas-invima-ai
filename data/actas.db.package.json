@@ -1,0 +1,20 @@
+{
+  "compressed_bytes": 122288088,
+  "database_bytes": 600956928,
+  "database_file": "actas.db",
+  "database_sha256": "d61d19ef809120be8dcaee025f4452541414f15d3518d90dacab14d2c0b8186c",
+  "format_version": 1,
+  "part_size_bytes": 94371840,
+  "parts": [
+    {
+      "bytes": 94371840,
+      "name": "actas.db.gz.part-000",
+      "sha256": "b9c2a36531b57e0c12cc2c8df43b2fe171b26c616971a53e57faec01ffc822c3"
+    },
+    {
+      "bytes": 27916248,
+      "name": "actas.db.gz.part-001",
+      "sha256": "49743d9af009da986c70607cba323529b9cc10f291b0bcec95ee0e56825fb2c7"
+    }
+  ]
+}

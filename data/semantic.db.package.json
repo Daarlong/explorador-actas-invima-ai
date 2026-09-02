@@ -1,0 +1,15 @@
+{
+  "compressed_bytes": 39094628,
+  "database_bytes": 70770688,
+  "database_file": "semantic.db",
+  "database_sha256": "b506fc92d9996a30bfeb34572b6aa2a44ae28a4c5b8a41923fd7071280fa66b1",
+  "format_version": 1,
+  "part_size_bytes": 94371840,
+  "parts": [
+    {
+      "bytes": 39094628,
+      "name": "semantic.db.gz.part-000",
+      "sha256": "6c7440268e9eb0ff1df106ab13257a44477862479f49d3dc853db911b95a268e"
+    }
+  ]
+}
