@@ -28,6 +28,7 @@ from services.database import (
     is_current_schema,
     migrate_database_schema,
     optimize_database,
+    sync_document_metadata,
 )
 from services.downloader import download_pdf_resource, file_sha256
 from services.manifest import load_manifest
@@ -42,6 +43,7 @@ class IndexingReport:
     documents_total: int = 0
     documents_existing: int = 0
     documents_migrated: int = 0
+    documents_metadata_updated: int = 0
     documents_indexed: int = 0
     documents_skipped: int = 0
     documents_failed: int = 0
@@ -416,6 +418,7 @@ def update_index(
             )
 
     existing = indexed_document_catalog(database_path)
+    metadata_updated = sync_document_metadata(database_path, documents)
     expected = {document.url: _metadata_signature(document) for document in documents}
     existing_urls = set(existing)
     expected_urls = set(expected)
@@ -444,6 +447,7 @@ def update_index(
         documents_total=len(documents),
         documents_existing=len(existing),
         documents_migrated=migration[0] if migration else 0,
+        documents_metadata_updated=metadata_updated,
         documents_skipped=len(existing),
         pages_indexed=migration[1] if migration else 0,
         chunks_indexed=migration[2] if migration else 0,

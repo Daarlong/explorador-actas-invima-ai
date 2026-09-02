@@ -43,6 +43,16 @@ aprobado.
 - Índice semántico SQLite independiente, local y cuantizado para limitar su
   tamaño; si no está disponible, la aplicación vuelve automáticamente a FTS5.
 - Informe de integridad visible desde la aplicación.
+- Auditoría por capas: página oficial → catálogo → manifiesto → índice, con
+  snapshot y huella SHA-256 del último descubrimiento válido.
+- Banco versionable de consultas y métricas Hit@K, Precision@K, Recall@K y MRR
+  para comparar objetivamente los tres modos de búsqueda.
+- Fichas enriquecidas con numeral, título, fecha de sesión, tipo de solicitud e
+  identificador estable independiente del enlace del PDF.
+- Cola protegida para corregir, revisar, aprobar o reabrir fichas, conservando
+  la huella de la extracción y un historial portable de eventos.
+- Comparación lado a lado, cronologías por producto, principio activo,
+  expediente o radicado, exportación CSV y reporte imprimible a PDF.
 - Actualización incremental para descargar e indexar únicamente actas nuevas.
 - Automatización completa: el catálogo lanza el índice cuando detecta cambios o
   documentos pendientes, sin intervención manual.
@@ -55,15 +65,15 @@ aprobado.
 
 No contiene funcionalidades relacionadas con un monitor de transparencia.
 
-## Cambios visibles en la versión 0.5.0
+## Cambios visibles en la versión 0.6.0
 
 | Módulo | Mejora |
 |---|---|
-| Inicio | Panel de cobertura, rango real, actividad reciente y estado del índice semántico |
-| Explorador | Tres modos de búsqueda, filtros regulatorios, agrupación por acta, orden y paginación |
-| Evidencia | Visor integrado de la página citada y selección de fragmentos |
-| Analista IA | Puede trabajar exclusivamente con las evidencias seleccionadas en el Explorador |
-| Índice | Migración aditiva al esquema 4, fichas regulatorias e índice semántico local |
+| Calidad | Auditoría de cobertura por capas y snapshot verificable de la página oficial |
+| Evaluación | Banco CSV reproducible y comparación textual/híbrida/semántica con métricas |
+| Fichas | Numeral, fecha de sesión, tipo de solicitud, identidad estable y revisión humana |
+| Comparación | Matriz lado a lado, cronologías, CSV y reporte HTML imprimible a PDF |
+| Índice | Migración aditiva al esquema 5 sin descargar nuevamente los PDF existentes |
 
 `LLM_PROVIDER = "prompt_only"` puede mantenerse sin cambios. Ese ajuste solo
 controla la generación de respuestas; la búsqueda semántica de esta versión se
@@ -105,11 +115,15 @@ todo el histórico visible desde 2013; el año inicial se configura con
 │   ├── 2_Analista_IA.py
 │   ├── 3_Administracion.py
 │   ├── 4_Integridad.py
-│   └── 5_Catalogo.py
+│   ├── 5_Catalogo.py
+│   ├── 6_Evaluacion.py
+│   ├── 7_Comparar.py
+│   └── 8_Revision_Fichas.py
 ├── services/
 │   ├── catalog.py
 │   ├── database.py
 │   ├── downloader.py
+│   ├── evaluation.py
 │   ├── indexing.py
 │   ├── integrity.py
 │   ├── llm.py
@@ -118,6 +132,8 @@ todo el histórico visible desde 2013; el año inicial se configura con
 │   ├── pdf_reader.py
 │   ├── pdf_viewer.py
 │   ├── regulatory.py
+│   ├── reviews.py
+│   ├── comparison.py
 │   ├── retrieval.py
 │   ├── search.py
 │   ├── semantic.py
@@ -127,6 +143,8 @@ todo el histórico visible desde 2013; el año inicial se configura con
 ├── documents_manifest.csv
 ├── build_index.py
 ├── check_index_pending.py
+├── evaluate_search.py
+├── evaluation_cases.csv
 ├── package_index.py
 ├── packages.txt
 ├── sync_catalog.py
@@ -176,26 +194,29 @@ El flujo de construcción del índice:
    desde los fragmentos ya almacenados;
 6. construye o actualiza el índice semántico local;
 7. genera informes de ejecución, integridad y cobertura por año;
-8. comprime ambas bases, calcula hashes y las divide en fragmentos de 90 MiB;
-9. guarda los índices y los informes automáticamente en el repositorio privado.
+8. ejecuta el banco de evaluación y registra sus métricas cuando contiene casos
+   habilitados;
+9. comprime ambas bases, calcula hashes y las divide en fragmentos de 90 MiB;
+10. guarda los índices y los informes automáticamente en el repositorio privado.
 
 No es necesario descargar un artefacto ni subir manualmente `actas.db`.
 
 El workflow de catálogo se ejecuta automáticamente de lunes a viernes a las
-18:30, hora de Colombia. Solo realiza un commit cuando detecta un cambio. Si
-encuentra una publicación nueva, dispara la actualización del índice. Si el
-informe de integridad conserva documentos pendientes por una caída temporal o
-un enlace problemático, vuelve a intentar incorporarlos en la siguiente
-revisión programada.
+18:30, hora de Colombia. Cada consulta válida actualiza la evidencia fechada de
+la página oficial; solo dispara la construcción del índice cuando encuentra una
+publicación nueva o un documento pendiente. Si el informe de integridad conserva
+documentos pendientes por una caída temporal o un enlace problemático, vuelve a
+intentar incorporarlos en la siguiente revisión programada.
 
 La primera construcción después de ampliar el índice a 2013 puede tardar varias
 horas y aumentar considerablemente el tamaño de la base. El workflow dispone de
 un máximo de seis horas, conserva los PDF descargados en caché y deja los
 documentos fallidos pendientes para reintentarlos sin perder los correctos.
 
-La primera ejecución de la versión 0.5.0 migra los esquemas anteriores al
-esquema 4 sobre una copia verificada de la base, extrae los campos regulatorios
-y crea el índice semántico. No vuelve a descargar los PDF ya indexados. Después, las ejecuciones
+La primera ejecución de la versión 0.6.0 migra los esquemas anteriores al
+esquema 5 sobre una copia verificada de la base, completa los metadatos estables
+del catálogo y vuelve a extraer las fichas desde los fragmentos existentes. No
+vuelve a descargar los PDF ya indexados. Después, las ejecuciones
 normales son incrementales. Selecciona `full_rebuild` únicamente cuando necesites
 volver a procesar todos los documentos, por ejemplo para aplicar OCR
 retroactivamente. No lo selecciones para instalar esta actualización ni para
@@ -290,6 +311,10 @@ La página **Integridad** muestra:
 - enlaces alternativos utilizados;
 - cobertura documental por año y por serie/sala;
 - avance y errores de la extracción de fichas regulatorias;
+- calidad de las fichas: identidad, numeral, fecha, tipo de solicitud y
+  confianza;
+- claves foráneas, correspondencia entre fragmentos y FTS y posibles PDF
+  duplicados por hash;
 - estado de construcción del índice semántico local;
 - tamaño de la base compactada.
 
@@ -304,6 +329,27 @@ La extracción regulatoria es deliberadamente conservadora. Una ficha puede
 estar incompleta o mal clasificada por diferencias históricas de formato; por
 eso se marca como automática y siempre debe comprobarse contra la página del
 PDF mostrada en el visor.
+
+## Evaluación, comparación y revisión humana
+
+La página **Evaluación** no califica respuestas generadas por IA. Mide si el
+buscador recupera las actas que un revisor regulatorio definió previamente como
+correctas. El archivo `evaluation_cases.csv` comienza con un ejemplo
+deshabilitado; completa y habilita casos únicamente después de validar la
+fuente esperada. El workflow conserva el resultado en
+`data/evaluation-report.json`.
+
+Desde el **Explorador** se pueden marcar evidencias y enviarlas a **Comparar**.
+Allí se muestran las fichas lado a lado, se pueden construir cronologías y se
+pueden descargar un CSV compatible con Excel y un reporte HTML que el navegador
+permite guardar como PDF.
+
+La página **Revisión de fichas** guarda eventos separados del índice automático:
+una reconstrucción no sobrescribe las correcciones, pero la aplicación marca
+una revisión como desactualizada si cambia el PDF o la extracción. En el piloto,
+el archivo escrito por Streamlit es temporal; tras revisar, descarga
+`regulatory-review-log.csv` y haz commit en `data/` para conservar el historial.
+Para producción se debe sustituir este mecanismo por una base persistente y SSO.
 
 ## Verificación
 
@@ -324,7 +370,7 @@ Antes de publicar una versión se debe comprobar:
 
 El flujo `.github/workflows/tests.yml` repite automáticamente la compilación y
 las pruebas con Python 3.12 después de cada cambio enviado a GitHub. La versión
-0.5.0 usa directamente la API `pymupdf`, sin depender del nombre heredado
+0.6.0 usa directamente la API `pymupdf`, sin depender del nombre heredado
 `fitz`, y Tesseract se instala dentro del runner de GitHub. La búsqueda
 semántica también es local y usa únicamente la biblioteca estándar de Python.
 No requiere instalar herramientas de desarrollo en el computador corporativo.

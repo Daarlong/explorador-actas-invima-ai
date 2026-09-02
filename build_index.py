@@ -201,6 +201,8 @@ if __name__ == "__main__":
             bool(integrity.get("documents_without_pages")),
             bool(integrity.get("documents_without_chunks")),
             integrity.get("chunks") != integrity.get("fts_rows"),
+            bool(integrity.get("foreign_key_errors")),
+            bool(integrity.get("fts_rowid_mismatches")),
         )
     )
     if integrity["status"] == "error" and (

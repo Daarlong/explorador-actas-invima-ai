@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 from services.catalog import (
@@ -11,6 +12,7 @@ from services.catalog import (
     manifest_rows,
     merge_catalog,
     parse_catalog_html,
+    validate_discovery,
     write_catalog,
 )
 from services.models import DocumentMetadata
@@ -24,6 +26,27 @@ ALLOWED_HOSTS = ("www.invima.gov.co",)
 
 
 class CatalogTests(unittest.TestCase):
+    @staticmethod
+    def _historical_records(per_year: int = 20) -> list[CatalogRecord]:
+        records = []
+        for year in range(2013, datetime.now().year + 1):
+            for number in range(1, per_year + 1):
+                records.append(
+                    CatalogRecord(
+                        catalog_id=catalog_id_for(year, str(number), "SEMPB", None),
+                        title=f"Acta No {number:02d} de {year} SEMPB",
+                        published_title=f"Acta No {number:02d} de {year} SEMPB",
+                        url=(
+                            "https://www.invima.gov.co/biblioteca/download/"
+                            f"{year}-{number}"
+                        ),
+                        year=year,
+                        acta_number=f"{number:02d}",
+                        section="SEMPB",
+                    )
+                )
+        return records
+
     def test_parses_years_parts_dates_context_and_duplicates(self) -> None:
         fixture = Path(__file__).parent / "fixtures" / "catalog_page.html"
         records = parse_catalog_html(
@@ -140,6 +163,26 @@ class CatalogTests(unittest.TestCase):
         rows = manifest_rows(records, minimum_year=2020)
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["year"], 2020)
+
+    def test_discovery_rejects_a_missing_closed_year_even_above_minimum(self) -> None:
+        records = [
+            record for record in self._historical_records() if record.year != 2018
+        ]
+        self.assertGreaterEqual(len(records), 250)
+
+        with self.assertRaisesRegex(ValueError, "2018"):
+            validate_discovery(records)
+
+    def test_discovery_rejects_a_large_per_year_collapse(self) -> None:
+        previous = self._historical_records(per_year=25)
+        current = [
+            record
+            for record in previous
+            if record.year != 2020 or record.acta_number == "01"
+        ]
+
+        with self.assertRaisesRegex(ValueError, "2020"):
+            validate_discovery(current, previous)
 
 
 if __name__ == "__main__":

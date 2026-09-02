@@ -40,6 +40,18 @@ SEMANTIC_REPORT_PATH = Path(
 CATALOG_REPORT_PATH = Path(
     os.getenv("ACTAS_CATALOG_REPORT_PATH", DATA_DIR / "catalog-report.json")
 )
+SOURCE_SNAPSHOT_PATH = Path(
+    os.getenv("ACTAS_SOURCE_SNAPSHOT_PATH", DATA_DIR / "source-snapshot.json")
+)
+REVIEW_LOG_PATH = Path(
+    os.getenv("ACTAS_REVIEW_LOG_PATH", DATA_DIR / "regulatory-review-log.csv")
+)
+EVALUATION_CASES_PATH = Path(
+    os.getenv("ACTAS_EVALUATION_CASES_PATH", ROOT_DIR / "evaluation_cases.csv")
+)
+EVALUATION_REPORT_PATH = Path(
+    os.getenv("ACTAS_EVALUATION_REPORT_PATH", DATA_DIR / "evaluation-report.json")
+)
 
 CHUNK_SIZE = int(os.getenv("ACTAS_CHUNK_SIZE", "1200"))
 CHUNK_OVERLAP = int(os.getenv("ACTAS_CHUNK_OVERLAP", "180"))

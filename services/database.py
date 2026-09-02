@@ -14,9 +14,9 @@ from services.regulatory import RegulatoryRecord, extract_regulatory_records
 from services.text_utils import normalize_text, tokenize_query
 
 
-DATABASE_SCHEMA_VERSION = 4
+DATABASE_SCHEMA_VERSION = 5
 
-REGULATORY_EXTRACTOR_VERSION = "2"
+REGULATORY_EXTRACTOR_VERSION = "3"
 
 FEATURE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS document_extractions (
@@ -33,8 +33,15 @@ CREATE TABLE IF NOT EXISTS regulatory_records (
     id INTEGER PRIMARY KEY,
     document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
     record_key TEXT NOT NULL,
+    decision_uid TEXT NOT NULL DEFAULT '',
     page_number INTEGER NOT NULL,
     end_page_number INTEGER NOT NULL,
+    numeral TEXT,
+    numeral_title TEXT,
+    session_date TEXT,
+    session_date_raw TEXT,
+    request_type_code TEXT,
+    identity_strategy TEXT,
     product_name TEXT,
     normalized_product_name TEXT,
     active_ingredient TEXT,
@@ -73,6 +80,12 @@ CREATE INDEX IF NOT EXISTS idx_records_radicado
     ON regulatory_records(normalized_radicado);
 CREATE INDEX IF NOT EXISTS idx_records_outcome
     ON regulatory_records(outcome_code);
+CREATE INDEX IF NOT EXISTS idx_records_numeral
+    ON regulatory_records(numeral);
+CREATE INDEX IF NOT EXISTS idx_records_request_type
+    ON regulatory_records(request_type_code);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_records_decision_uid
+    ON regulatory_records(decision_uid) WHERE decision_uid != '';
 """
 
 SCHEMA = """
@@ -94,6 +107,8 @@ CREATE TABLE IF NOT EXISTS documents (
     section TEXT,
     part TEXT,
     source_type TEXT NOT NULL DEFAULT 'official',
+    catalog_id TEXT,
+    publication_date TEXT,
     document_hash TEXT NOT NULL,
     pdf_page_count INTEGER NOT NULL,
     indexed_page_count INTEGER NOT NULL,
@@ -137,6 +152,7 @@ CREATE INDEX IF NOT EXISTS idx_chunks_page ON chunks(page_id);
 
 def _ensure_legacy_columns(connection: sqlite3.Connection) -> None:
     """Mantiene consultable el índice anterior durante una actualización."""
+    changed = False
     table_exists = connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'documents'"
     ).fetchone()
@@ -145,11 +161,55 @@ def _ensure_legacy_columns(connection: sqlite3.Connection) -> None:
     columns = {
         row[1] for row in connection.execute("PRAGMA table_info(documents)").fetchall()
     }
-    if "source_type" not in columns:
-        connection.execute(
-            "ALTER TABLE documents ADD COLUMN source_type TEXT NOT NULL "
-            "DEFAULT 'official'"
-        )
+    document_additions = {
+        "source_type": "TEXT NOT NULL DEFAULT 'official'",
+        "catalog_id": "TEXT",
+        "publication_date": "TEXT",
+    }
+    for column, definition in document_additions.items():
+        if column not in columns:
+            connection.execute(f"ALTER TABLE documents ADD COLUMN {column} {definition}")
+            changed = True
+    records_exist = connection.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'regulatory_records'"
+    ).fetchone()
+    if records_exist:
+        record_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(regulatory_records)"
+            ).fetchall()
+        }
+        additions = {
+            "decision_uid": "TEXT NOT NULL DEFAULT ''",
+            "numeral": "TEXT",
+            "numeral_title": "TEXT",
+            "session_date": "TEXT",
+            "session_date_raw": "TEXT",
+            "request_type_code": "TEXT",
+            "identity_strategy": "TEXT",
+        }
+        for column, definition in additions.items():
+            if column not in record_columns:
+                connection.execute(
+                    f"ALTER TABLE regulatory_records ADD COLUMN {column} {definition}"
+                )
+                changed = True
+        if changed:
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_records_numeral "
+                "ON regulatory_records(numeral)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_records_request_type "
+                "ON regulatory_records(request_type_code)"
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_records_decision_uid "
+                "ON regulatory_records(decision_uid) WHERE decision_uid != ''"
+            )
+    if changed:
         connection.commit()
 
 
@@ -213,7 +273,7 @@ def table_exists(database_path: Path, table_name: str) -> bool:
 
 
 def migrate_database_schema(database_path: Path) -> bool:
-    """Aplica migraciones aditivas v2/v3→v4 sobre una copia verificada."""
+    """Aplica migraciones aditivas v2/v3/v4→v5 sobre una copia verificada."""
     version = database_schema_version(database_path)
     if version == DATABASE_SCHEMA_VERSION:
         return False
@@ -222,10 +282,10 @@ def migrate_database_schema(database_path: Path) -> bool:
             f"La base usa el esquema {version}, superior al soportado "
             f"({DATABASE_SCHEMA_VERSION})"
         )
-    if version not in {2, 3}:
+    if version not in {2, 3, 4}:
         return False
 
-    temporary_path = database_path.with_suffix(".schema-v3.db")
+    temporary_path = database_path.with_suffix(".schema-v5.db")
     temporary_path.unlink(missing_ok=True)
     shutil.copy2(database_path, temporary_path)
     tables_to_verify = ("documents", "pages", "chunks", "chunks_fts")
@@ -243,6 +303,11 @@ def migrate_database_schema(database_path: Path) -> bool:
                 "WHERE type='table' AND name='regulatory_records'"
             ).fetchone()
             if has_regulatory_records:
+                before["regulatory_records"] = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM regulatory_records"
+                    ).fetchone()[0]
+                )
                 record_columns = {
                     row[1]
                     for row in connection.execute(
@@ -257,6 +322,33 @@ def migrate_database_schema(database_path: Path) -> bool:
                     connection.execute(
                         "UPDATE regulatory_records "
                         "SET end_page_number = page_number"
+                    )
+                additions = {
+                    "decision_uid": "TEXT NOT NULL DEFAULT ''",
+                    "numeral": "TEXT",
+                    "numeral_title": "TEXT",
+                    "session_date": "TEXT",
+                    "session_date_raw": "TEXT",
+                    "request_type_code": "TEXT",
+                    "identity_strategy": "TEXT",
+                }
+                for column, definition in additions.items():
+                    if column not in record_columns:
+                        connection.execute(
+                            "ALTER TABLE regulatory_records ADD COLUMN "
+                            f"{column} {definition}"
+                        )
+            document_columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(documents)").fetchall()
+            }
+            for column, definition in {
+                "catalog_id": "TEXT",
+                "publication_date": "TEXT",
+            }.items():
+                if column not in document_columns:
+                    connection.execute(
+                        f"ALTER TABLE documents ADD COLUMN {column} {definition}"
                     )
             connection.executescript(FEATURE_SCHEMA)
             connection.execute(
@@ -275,6 +367,12 @@ def migrate_database_schema(database_path: Path) -> bool:
                 )
                 for table in tables_to_verify
             }
+            if has_regulatory_records:
+                after["regulatory_records"] = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM regulatory_records"
+                    ).fetchone()[0]
+                )
             if integrity.lower() != "ok" or foreign_key_errors or before != after:
                 raise RuntimeError(
                     "La verificación de la migración aditiva no fue satisfactoria"
@@ -327,10 +425,11 @@ def insert_document(
             """
             INSERT INTO documents (
                 title, normalized_title, url, manifest_url, year, acta_number,
-                section, part, source_type, document_hash, pdf_page_count,
+                section, part, source_type, catalog_id, publication_date,
+                document_hash, pdf_page_count,
                 indexed_page_count, ocr_candidate_pages, page_inventory_complete,
                 indexed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 metadata.title,
@@ -342,6 +441,8 @@ def insert_document(
                 metadata.section,
                 metadata.part,
                 metadata.source_type,
+                metadata.catalog_id,
+                metadata.publication_date,
                 document_hash,
                 pdf_page_count,
                 len(indexed_pages),
@@ -388,6 +489,58 @@ def _regulatory_record_key(record: RegulatoryRecord) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _decision_locator(record: RegulatoryRecord) -> tuple[str, str]:
+    """Devuelve una identidad estable y la estrategia usada para construirla."""
+
+    numeral = normalize_text(record.numeral or "")
+    radicado = _normalized_identifier(record.radicado)
+    expediente = _normalized_identifier(record.expediente)
+    product = normalize_text(record.producto or "")
+    if numeral and radicado:
+        return f"numeral:{numeral}|radicado:{radicado}", "numeral_radicado"
+    if numeral and expediente:
+        return f"numeral:{numeral}|expediente:{expediente}", "numeral_expediente"
+    if radicado:
+        return f"radicado:{radicado}", "radicado"
+    if expediente and product:
+        return (
+            f"expediente:{expediente}|producto:{product}",
+            "expediente_producto",
+        )
+    if numeral:
+        return f"numeral:{numeral}", "numeral"
+    return f"pagina:{record.pagina}", "pagina_ordinal"
+
+
+def _decision_uid(
+    document_identity: str,
+    record: RegulatoryRecord,
+    occurrence: int,
+) -> tuple[str, str]:
+    locator, strategy = _decision_locator(record)
+    payload = f"{document_identity}|{locator}|ocurrencia:{occurrence}"
+    return "dec_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32], strategy
+
+
+def _merge_overlapping_chunks(chunks: Iterable[str], maximum_overlap: int = 400) -> str:
+    """Reconstruye una página sin duplicar el solapamiento de sus fragmentos."""
+
+    values = [str(value) for value in chunks if str(value)]
+    if not values:
+        return ""
+    merged = values[0]
+    for value in values[1:]:
+        limit = min(maximum_overlap, len(merged), len(value))
+        overlap = 0
+        for size in range(limit, 19, -1):
+            if merged[-size:] == value[:size]:
+                overlap = size
+                break
+        separator = "" if overlap else "\n"
+        merged += separator + value[overlap:]
+    return merged
+
+
 def _store_regulatory_records(
     connection: sqlite3.Connection,
     document_id: int,
@@ -399,11 +552,28 @@ def _store_regulatory_records(
 ) -> int:
     values = list(records)
     now = datetime.now(timezone.utc).isoformat()
+    document = connection.execute(
+        "SELECT manifest_url, catalog_id FROM documents WHERE id = ?",
+        (document_id,),
+    ).fetchone()
+    document_identity = (
+        str(document["catalog_id"] or document["manifest_url"])
+        if document
+        else str(document_id)
+    )
     connection.execute(
         "DELETE FROM regulatory_records WHERE document_id = ?",
         (document_id,),
     )
+    locator_counts: dict[str, int] = {}
     for record in values:
+        locator, _ = _decision_locator(record)
+        locator_counts[locator] = locator_counts.get(locator, 0) + 1
+        decision_uid, identity_strategy = _decision_uid(
+            document_identity,
+            record,
+            locator_counts[locator],
+        )
         populated = sum(
             bool(value)
             for value in (
@@ -425,20 +595,29 @@ def _store_regulatory_records(
         connection.execute(
             """
             INSERT INTO regulatory_records (
-                document_id, record_key, page_number, end_page_number, product_name,
+                document_id, record_key, decision_uid, page_number,
+                end_page_number, numeral, numeral_title, session_date,
+                session_date_raw, request_type_code, identity_strategy, product_name,
                 normalized_product_name, active_ingredient,
                 normalized_active_ingredient, interested_party,
                 normalized_interested_party, expediente,
                 normalized_expediente, radicado, normalized_radicado,
                 request_text, concept_text, outcome_code, extraction_method,
                 confidence, needs_review, extractor_version, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
             """,
             (
                 document_id,
                 _regulatory_record_key(record),
+                decision_uid,
                 record.pagina,
                 record.pagina_final or record.pagina,
+                record.numeral,
+                record.titulo_numeral,
+                record.fecha_sesion,
+                record.fecha_sesion_original,
+                record.tipo_solicitud,
+                identity_strategy,
                 record.producto,
                 normalize_text(record.producto or ""),
                 record.principio_activo,
@@ -508,6 +687,7 @@ def sync_regulatory_extractions(
             ):
                 summary["documents_skipped"] += 1
                 continue
+            connection.execute("SAVEPOINT regulatory_document")
             try:
                 rows = connection.execute(
                     """
@@ -519,17 +699,18 @@ def sync_regulatory_extractions(
                     """,
                     (document["id"],),
                 ).fetchall()
-                pages: list[dict] = []
+                page_chunks: dict[int, list[str]] = {}
                 for row in rows:
-                    if pages and pages[-1]["page"] == int(row["page_number"]):
-                        pages[-1]["text"] += "\n" + row["text"]
-                    else:
-                        pages.append(
-                            {
-                                "page": int(row["page_number"]),
-                                "text": str(row["text"]),
-                            }
-                        )
+                    page_chunks.setdefault(int(row["page_number"]), []).append(
+                        str(row["text"])
+                    )
+                pages = [
+                    {
+                        "page": page_number,
+                        "text": _merge_overlapping_chunks(chunks),
+                    }
+                    for page_number, chunks in sorted(page_chunks.items())
+                ]
                 records = extract_regulatory_records(pages)
                 count = _store_regulatory_records(
                     connection,
@@ -541,7 +722,10 @@ def sync_regulatory_extractions(
                 )
                 summary["documents_processed"] += 1
                 summary["records_extracted"] += count
+                connection.execute("RELEASE SAVEPOINT regulatory_document")
             except Exception as exc:
+                connection.execute("ROLLBACK TO SAVEPOINT regulatory_document")
+                connection.execute("RELEASE SAVEPOINT regulatory_document")
                 summary["documents_failed"] += 1
                 detail = f"{document['title']}: {exc}"
                 summary["errors"].append(detail)
@@ -667,13 +851,18 @@ def regulatory_records_for_chunks(
             rows = connection.execute(
                 f"""
                 SELECT c.id AS chunk_id, p.page_number AS evidence_page,
-                       r.page_number, r.end_page_number, r.product_name,
+                       r.id AS record_id, r.record_key, r.decision_uid,
+                       r.page_number, r.end_page_number, r.numeral,
+                       r.numeral_title, r.session_date, r.session_date_raw,
+                       r.request_type_code, r.identity_strategy, r.product_name,
                        r.active_ingredient,
                        r.interested_party, r.expediente, r.radicado,
                        r.request_text, r.concept_text, r.outcome_code,
-                       r.confidence, r.needs_review, r.extraction_method
+                       r.confidence, r.needs_review, r.extraction_method,
+                       d.document_hash
                 FROM chunks c
                 JOIN pages p ON p.id = c.page_id
+                JOIN documents d ON d.id = p.document_id
                 JOIN regulatory_records r ON r.document_id = p.document_id
                 WHERE c.id IN ({placeholders})
                   AND p.page_number BETWEEN r.page_number AND r.end_page_number
@@ -686,6 +875,168 @@ def regulatory_records_for_chunks(
                     {key: row[key] for key in row.keys() if key != "chunk_id"}
                 )
     return result
+
+
+_REGULATORY_DETAIL_SELECT = """
+    SELECT r.id AS record_id, r.record_key, r.decision_uid,
+           r.page_number, r.end_page_number, r.numeral, r.numeral_title,
+           r.session_date, r.session_date_raw, r.request_type_code,
+           r.identity_strategy, r.product_name, r.active_ingredient,
+           r.interested_party, r.expediente, r.radicado, r.request_text,
+           r.concept_text, r.outcome_code, r.confidence, r.needs_review,
+           r.extraction_method, r.extractor_version, r.created_at,
+           d.id AS document_id, d.title, d.url, d.manifest_url, d.year,
+           d.acta_number, d.section, d.part, d.source_type,
+           d.document_hash, d.pdf_page_count
+    FROM regulatory_records r
+    JOIN documents d ON d.id = r.document_id
+"""
+
+
+def get_regulatory_records_by_uids(
+    database_path: Path,
+    decision_uids: Iterable[str],
+) -> list[dict]:
+    """Recupera fichas exactas conservando el orden solicitado."""
+
+    values = [
+        str(value).strip()
+        for value in dict.fromkeys(decision_uids)
+        if str(value).strip()
+    ]
+    if not values or not database_path.exists():
+        return []
+    rows_by_uid: dict[str, dict] = {}
+    with connect(database_path) as connection:
+        for start in range(0, len(values), 800):
+            batch = values[start : start + 800]
+            placeholders = ",".join("?" for _ in batch)
+            rows = connection.execute(
+                _REGULATORY_DETAIL_SELECT
+                + f" WHERE r.decision_uid IN ({placeholders})",
+                batch,
+            ).fetchall()
+            rows_by_uid.update(
+                {str(row["decision_uid"]): dict(row) for row in rows}
+            )
+    return [rows_by_uid[value] for value in values if value in rows_by_uid]
+
+
+def list_regulatory_records(
+    database_path: Path,
+    *,
+    query: str = "",
+    years: Iterable[int] = (),
+    outcomes: Iterable[str] = (),
+    request_types: Iterable[str] = (),
+    missing_field: str = "",
+    limit: int = 100,
+    offset: int = 0,
+) -> list[dict]:
+    """Lista fichas para revisión, comparación o exportación."""
+
+    if not database_path.exists() or limit < 1 or offset < 0:
+        return []
+    clauses, parameters = _regulatory_filter_clauses(
+        query=query,
+        years=years,
+        outcomes=outcomes,
+        request_types=request_types,
+        missing_field=missing_field,
+    )
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    with connect(database_path) as connection:
+        rows = connection.execute(
+            _REGULATORY_DETAIL_SELECT
+            + where
+            + " ORDER BY d.year DESC, d.section, d.acta_number DESC, "
+            "r.page_number, r.id LIMIT ? OFFSET ?",
+            [*parameters, min(int(limit), 1000), int(offset)],
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _regulatory_filter_clauses(
+    *,
+    query: str = "",
+    years: Iterable[int] = (),
+    outcomes: Iterable[str] = (),
+    request_types: Iterable[str] = (),
+    missing_field: str = "",
+) -> tuple[list[str], list[object]]:
+    clauses: list[str] = []
+    parameters: list[object] = []
+    clean_query = normalize_text(query)
+    if clean_query:
+        like = f"%{clean_query}%"
+        identifier = f"%{_normalized_identifier(query)}%"
+        clauses.append(
+            "(r.normalized_product_name LIKE ? OR "
+            "r.normalized_active_ingredient LIKE ? OR "
+            "r.normalized_interested_party LIKE ? OR "
+            "r.normalized_expediente LIKE ? OR r.normalized_radicado LIKE ? OR "
+            "LOWER(COALESCE(r.numeral, '')) LIKE ? OR "
+            "LOWER(COALESCE(r.request_text, '')) LIKE ?)"
+        )
+        parameters.extend((like, like, like, identifier, identifier, like, like))
+    for values, column in (
+        ([int(value) for value in years], "d.year"),
+        ([str(value) for value in outcomes if value], "r.outcome_code"),
+        ([str(value) for value in request_types if value], "r.request_type_code"),
+    ):
+        if values:
+            placeholders = ",".join("?" for _ in values)
+            clauses.append(f"{column} IN ({placeholders})")
+            parameters.extend(values)
+    missing_columns = {
+        "numeral": "r.numeral",
+        "session_date": "r.session_date",
+        "product": "r.product_name",
+    }
+    if missing_field in missing_columns:
+        column = missing_columns[missing_field]
+        clauses.append(f"({column} IS NULL OR TRIM({column}) = '')")
+    elif missing_field == "request_type":
+        clauses.append(
+            "(r.request_type_code IS NULL OR TRIM(r.request_type_code) = '' "
+            "OR r.request_type_code = 'otra_solicitud')"
+        )
+    elif missing_field == "outcome":
+        clauses.append(
+            "(r.outcome_code IS NULL OR TRIM(r.outcome_code) = '' "
+            "OR r.outcome_code = 'sin_clasificar')"
+        )
+    return clauses, parameters
+
+
+def count_regulatory_records(
+    database_path: Path,
+    *,
+    query: str = "",
+    years: Iterable[int] = (),
+    outcomes: Iterable[str] = (),
+    request_types: Iterable[str] = (),
+    missing_field: str = "",
+) -> int:
+    """Cuenta todas las fichas que coinciden con la cola de revisión."""
+
+    if not database_path.exists():
+        return 0
+    clauses, parameters = _regulatory_filter_clauses(
+        query=query,
+        years=years,
+        outcomes=outcomes,
+        request_types=request_types,
+        missing_field=missing_field,
+    )
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    with connect(database_path) as connection:
+        row = connection.execute(
+            "SELECT COUNT(*) FROM regulatory_records r "
+            "JOIN documents d ON d.id = r.document_id" + where,
+            parameters,
+        ).fetchone()
+    return int(row[0] if row else 0)
 
 
 def indexed_document_catalog(database_path: Path) -> dict[str, dict]:
@@ -711,6 +1062,58 @@ def indexed_document_catalog(database_path: Path) -> dict[str, dict]:
     }
 
 
+def sync_document_metadata(
+    database_path: Path,
+    documents: Iterable[DocumentMetadata],
+) -> int:
+    """Completa metadatos de catálogo sin descargar ni reindexar los PDF.
+
+    Si aparece o cambia ``catalog_id``, invalida únicamente la extracción
+    estructurada para que el siguiente ``sync_regulatory_extractions`` regenere
+    los identificadores de decisión con esa identidad estable.
+    """
+
+    if not database_path.exists() or not is_current_schema(database_path):
+        return 0
+    updated = 0
+    with connect(database_path) as connection:
+        for document in documents:
+            row = connection.execute(
+                "SELECT id, catalog_id, publication_date FROM documents "
+                "WHERE manifest_url = ?",
+                (document.url,),
+            ).fetchone()
+            if row is None:
+                continue
+            old_catalog_id = str(row["catalog_id"] or "")
+            old_publication_date = str(row["publication_date"] or "")
+            new_catalog_id = str(document.catalog_id or old_catalog_id)
+            new_publication_date = str(
+                document.publication_date or old_publication_date
+            )
+            if (
+                new_catalog_id == old_catalog_id
+                and new_publication_date == old_publication_date
+            ):
+                continue
+            connection.execute(
+                "UPDATE documents SET catalog_id = ?, publication_date = ? "
+                "WHERE id = ?",
+                (
+                    new_catalog_id or None,
+                    new_publication_date or None,
+                    int(row["id"]),
+                ),
+            )
+            if new_catalog_id != old_catalog_id:
+                connection.execute(
+                    "DELETE FROM document_extractions WHERE document_id = ?",
+                    (int(row["id"]),),
+                )
+            updated += 1
+    return updated
+
+
 def get_filter_options(database_path: Path) -> dict[str, list]:
     if not database_path.exists():
         return {
@@ -719,6 +1122,7 @@ def get_filter_options(database_path: Path) -> dict[str, list]:
             "parts": [],
             "acta_numbers": [],
             "outcomes": [],
+            "request_types": [],
         }
     with connect(database_path) as connection:
         mapping = {
@@ -745,8 +1149,18 @@ def get_filter_options(database_path: Path) -> dict[str, list]:
                 """
             ).fetchall()
             options["outcomes"] = [row[0] for row in rows]
+            rows = connection.execute(
+                """
+                SELECT DISTINCT request_type_code
+                FROM regulatory_records
+                WHERE request_type_code IS NOT NULL AND request_type_code != ''
+                ORDER BY request_type_code
+                """
+            ).fetchall()
+            options["request_types"] = [row[0] for row in rows]
         else:
             options["outcomes"] = []
+            options["request_types"] = []
         return options
 
 
@@ -774,6 +1188,12 @@ def _filter_sql(filters: dict[str, list] | None) -> tuple[str, list]:
         placeholders = ",".join("?" for _ in outcomes)
         record_clauses.append(f"rr.outcome_code IN ({placeholders})")
         record_parameters.extend(outcomes)
+
+    request_types = [value for value in filters.get("request_types", []) if value]
+    if request_types:
+        placeholders = ",".join("?" for _ in request_types)
+        record_clauses.append(f"rr.request_type_code IN ({placeholders})")
+        record_parameters.extend(request_types)
 
     structured_mapping = {
         "products": "normalized_product_name",

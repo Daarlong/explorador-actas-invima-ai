@@ -44,6 +44,14 @@ col6.metric(
 )
 col7.metric("Integridad SQLite", report.get("sqlite_integrity", "desconocida"))
 
+technical_col1, technical_col2 = st.columns(2)
+technical_col1.metric(
+    "Errores de claves internas", report.get("foreign_key_errors", 0)
+)
+technical_col2.metric(
+    "Desajustes texto–FTS", report.get("fts_rowid_mismatches", 0)
+)
+
 st.subheader("Cobertura del índice")
 coverage_by_year = report.get("coverage_by_year", [])
 if coverage_by_year:
@@ -222,6 +230,39 @@ if regulatory_pending or regulatory_errors:
         if regulatory_errors:
             st.write("Errores detectados:")
             st.dataframe(regulatory_errors, hide_index=True, use_container_width=True)
+
+st.subheader("Calidad de las fichas regulatorias")
+quality = report.get("regulatory_quality") or {}
+if quality:
+    quality_col1, quality_col2, quality_col3, quality_col4, quality_col5 = st.columns(5)
+    quality_col1.metric("Fichas", quality.get("total", 0))
+    quality_col2.metric("Sin numeral", quality.get("without_numeral", 0))
+    quality_col3.metric("Sin fecha de sesión", quality.get("without_session_date", 0))
+    quality_col4.metric(
+        "Tipo sin clasificar", quality.get("unclassified_request_type", 0)
+    )
+    quality_col5.metric("Confianza baja", quality.get("low_confidence", 0))
+    if quality.get("without_uid"):
+        st.warning(
+            f"{quality['without_uid']} fichas aún no tienen identificador v0.6. "
+            "Ejecuta Construir índice sin full_rebuild para completar la migración."
+        )
+else:
+    st.info("La próxima construcción del índice generará las métricas de fichas.")
+
+duplicate_hashes = report.get("duplicate_document_hashes") or []
+with st.expander(
+    f"PDF con contenido duplicado ({len(duplicate_hashes)})",
+    expanded=False,
+):
+    if duplicate_hashes:
+        st.write(
+            "Son señales para revisión: dos enlaces pueden apuntar legítimamente al "
+            "mismo documento o indicar un enlace oficial duplicado."
+        )
+        st.dataframe(duplicate_hashes, hide_index=True, use_container_width=True)
+    else:
+        st.write("No se detectaron hashes de PDF duplicados.")
 
 st.caption(
     f"Generado: {report.get('generated_at', 'sin fecha')} · "

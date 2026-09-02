@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import re
 import time
@@ -36,6 +37,8 @@ CATALOG_FIELDS = (
     "page_occurrences",
     "alternate_urls",
 )
+
+CATALOG_PARSER_VERSION = "2"
 
 MANIFEST_FIELDS = (
     "title",
@@ -658,7 +661,12 @@ def write_manifest_from_catalog(
     temporary.replace(path)
 
 
-def validate_discovery(records: list[CatalogRecord]) -> None:
+def validate_discovery(
+    records: list[CatalogRecord],
+    previous_records: list[CatalogRecord] | None = None,
+) -> None:
+    """Cierra de forma segura ante extracciones parciales de la página fuente."""
+
     years = {record.year for record in records}
     if len(records) < 250:
         raise ValueError(
@@ -668,6 +676,79 @@ def validate_discovery(records: list[CatalogRecord]) -> None:
         raise ValueError("La página no produjo el histórico esperado desde 2013")
     if max(years) < datetime.now().year - 1:
         raise ValueError("La página no produjo las actas de los años recientes")
+    expected_closed_years = set(range(2013, datetime.now().year))
+    missing_closed_years = sorted(expected_closed_years - years)
+    if missing_closed_years:
+        raise ValueError(
+            "La página no produjo uno o más años cerrados del histórico: "
+            + ", ".join(str(year) for year in missing_closed_years)
+        )
+
+    prior = [
+        record
+        for record in (previous_records or [])
+        if record.listing_status.startswith("listed")
+    ]
+    if len(prior) >= 250:
+        minimum_global = max(250, int(len(prior) * 0.75))
+        if len(records) < minimum_global:
+            raise ValueError(
+                "La extracción cayó de forma anómala frente al último catálogo "
+                f"válido ({len(records)} frente a {len(prior)} registros)."
+            )
+        prior_by_year: dict[int, int] = {}
+        current_by_year: dict[int, int] = {}
+        for record in prior:
+            prior_by_year[record.year] = prior_by_year.get(record.year, 0) + 1
+        for record in records:
+            current_by_year[record.year] = current_by_year.get(record.year, 0) + 1
+        collapsed = [
+            year
+            for year, count in prior_by_year.items()
+            if year < datetime.now().year
+            and count >= 3
+            and current_by_year.get(year, 0) < max(1, int(count * 0.6))
+        ]
+        if collapsed:
+            raise ValueError(
+                "La extracción perdió una proporción anómala de publicaciones "
+                "en los años: " + ", ".join(str(year) for year in sorted(collapsed))
+            )
+
+
+def build_source_snapshot(
+    discovered: list[CatalogRecord],
+    source_page_url: str,
+    source_html: str,
+) -> dict:
+    """Crea evidencia compacta y reproducible de la última consulta válida."""
+
+    years: dict[str, int] = {}
+    for record in discovered:
+        key = str(record.year)
+        years[key] = years.get(key, 0) + 1
+    return {
+        "status": "valid",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "source_page_url": source_page_url,
+        "parser_version": CATALOG_PARSER_VERSION,
+        "html_bytes": len(source_html.encode("utf-8")),
+        "html_sha256": hashlib.sha256(source_html.encode("utf-8")).hexdigest(),
+        "discovered_records": len(discovered),
+        "records_without_url": sum(not record.url for record in discovered),
+        "years": dict(sorted(years.items())),
+        "catalog_ids": sorted(record.catalog_id for record in discovered),
+    }
+
+
+def write_source_snapshot(snapshot: dict, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(f"{path.suffix}.tmp")
+    temporary.write_text(
+        json.dumps(snapshot, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
 
 
 def build_catalog_report(

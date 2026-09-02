@@ -38,6 +38,11 @@ class RegulatoryRecord:
     resultado_normalizado: str
     pagina: int
     pagina_final: int | None = None
+    numeral: str | None = None
+    titulo_numeral: str | None = None
+    fecha_sesion: str | None = None
+    fecha_sesion_original: str | None = None
+    tipo_solicitud: str | None = None
 
     @property
     def page(self) -> int:
@@ -113,7 +118,8 @@ _BARE_LABEL_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _SECTION_HEADING_RE = re.compile(
-    r"^\s*\d+(?:\.\d+){1,5}\.?\s*(?:[A-ZÁÉÍÓÚÑ][^:]{0,100})?$"
+    r"^\s*(?P<numeral>\d+(?:\.\d+){1,7})\.?\s*"
+    r"(?P<title>[A-ZÁÉÍÓÚÑ][^:]{0,160})?$"
 )
 _PAGE_NOISE_RE = re.compile(
     r"^(?:pagina\s+)?\d+\s+(?:de|/\s*)\s*\d+$|^pagina\s+\d+$",
@@ -129,6 +135,59 @@ _DOCUMENT_HEADER_RE = re.compile(
 _FIELDS = tuple(field for field, _ in _FIELD_PATTERNS)
 _IDENTITY_FIELDS = {"producto", "expediente", "radicado"}
 _NARRATIVE_FIELDS = {"solicitud", "concepto"}
+
+_SPANISH_MONTHS = {
+    "enero": 1,
+    "febrero": 2,
+    "marzo": 3,
+    "abril": 4,
+    "mayo": 5,
+    "junio": 6,
+    "julio": 7,
+    "agosto": 8,
+    "septiembre": 9,
+    "setiembre": 9,
+    "octubre": 10,
+    "noviembre": 11,
+    "diciembre": 12,
+}
+
+_SESSION_DATE_RE = re.compile(
+    r"\b(?:fecha(?:\s+de\s+(?:la\s+)?(?:sesion|reunion))?|"
+    r"sesion(?:\s+(?:realizada|celebrada))?)\s*(?::|-)?\s*"
+    r"(?P<day>\d{1,2})\s+(?:de\s+)?"
+    r"(?P<month>enero|febrero|marzo|abril|mayo|junio|julio|agosto|"
+    r"septiembre|setiembre|octubre|noviembre|diciembre)\s+(?:de\s+)?"
+    r"(?P<year>20\d{2})\b",
+    flags=re.IGNORECASE,
+)
+
+_SESSION_NUMERIC_DATE_RE = re.compile(
+    r"\b(?:fecha(?:\s+de\s+(?:la\s+)?(?:sesion|reunion))?|"
+    r"sesion(?:\s+(?:realizada|celebrada))?)\s*(?::|-)?\s*"
+    r"(?P<day>\d{1,2})[/-](?P<month>\d{1,2})[/-](?P<year>20\d{2})\b",
+    flags=re.IGNORECASE,
+)
+
+_REQUEST_TYPES: tuple[tuple[str, str], ...] = (
+    ("renovacion_registro", r"\brenovacion(?:\s+del)?\s+registro\s+sanitario\b"),
+    ("modificacion_registro", r"\bmodificacion(?:\s+del)?\s+registro\s+sanitario\b"),
+    ("evaluacion_farmacologica", r"\bevaluacion\s+farmacologica\b"),
+    ("registro_sanitario", r"\b(?:nuevo\s+)?registro\s+sanitario\b"),
+    (
+        "indicaciones",
+        r"\b(?:nueva|ampliacion|modificacion|inclusion|cambio)\s+de\s+"
+        r"indicacion(?:es)?\b|\bindicacion(?:es)?\b",
+    ),
+    (
+        "informacion_prescribir",
+        r"\binformacion\s+(?:para|de)\s+prescribir\b",
+    ),
+    ("cambio_fabricante", r"\bcambio\s+(?:de\s+)?fabricante\b"),
+    ("cambio_titular", r"\bcambio\s+(?:de\s+)?titular\b"),
+    ("recurso_reposicion", r"\brecurso\s+de\s+reposicion\b"),
+    ("cancelacion", r"\bcancelacion(?:\s+voluntaria)?\b"),
+)
 
 
 def _without_accents(text: str) -> str:
@@ -148,6 +207,56 @@ def _clean_value(text: str) -> str:
     value = re.sub(r"\s+", " ", text).strip()
     value = re.sub(r"^[\s:;,.\-–—]+", "", value)
     return value.strip()
+
+
+def normalize_request_type(request_text: str | None) -> str | None:
+    """Clasifica conservadoramente el tipo general de solicitud."""
+
+    comparable = _normalized(request_text)
+    if not comparable:
+        return None
+    for code, pattern in _REQUEST_TYPES:
+        if re.search(pattern, comparable, flags=re.IGNORECASE):
+            return code
+    return "otra_solicitud"
+
+
+def extract_session_date(
+    pages: Sequence[Mapping[str, object]],
+    *,
+    maximum_pages: int = 8,
+) -> tuple[str | None, str | None]:
+    """Extrae una fecha únicamente cuando está rotulada como sesión/reunión.
+
+    No usa fechas aisladas para evitar confundir la fecha de publicación, un
+    radicado o un antecedente con la fecha de la sesión del acta.
+    """
+
+    for page_data in list(pages)[: max(1, maximum_pages)]:
+        raw_text = page_data.get("text", "")
+        text = raw_text if isinstance(raw_text, str) else str(raw_text or "")
+        comparable = _without_accents(text)
+        for pattern in (_SESSION_DATE_RE, _SESSION_NUMERIC_DATE_RE):
+            match = pattern.search(comparable)
+            if not match:
+                continue
+            try:
+                day = int(match.group("day"))
+                raw_month = match.group("month")
+                month = (
+                    int(raw_month)
+                    if raw_month.isdigit()
+                    else _SPANISH_MONTHS[raw_month.lower()]
+                )
+                year = int(match.group("year"))
+                from datetime import date
+
+                normalized_date = date(year, month, day).isoformat()
+            except (KeyError, TypeError, ValueError):
+                continue
+            original = " ".join(text[match.start() : match.end()].split())
+            return normalized_date, original
+    return None, None
 
 
 def _field_from_match(match: re.Match[str]) -> str | None:
@@ -274,6 +383,11 @@ def _build_decision(
     values: Mapping[str, str],
     page: int,
     end_page: int,
+    *,
+    numeral: str | None = None,
+    numeral_title: str | None = None,
+    session_date: str | None = None,
+    session_date_raw: str | None = None,
 ) -> RegulatoryRecord | None:
     if not _has_enough_evidence(values):
         return None
@@ -289,6 +403,11 @@ def _build_decision(
         resultado_normalizado=normalize_regulatory_result(cleaned["concepto"]),
         pagina=max(1, int(page)),
         pagina_final=max(int(page), int(end_page)),
+        numeral=numeral,
+        titulo_numeral=numeral_title,
+        fecha_sesion=session_date,
+        fecha_sesion_original=session_date_raw,
+        tipo_solicitud=normalize_request_type(cleaned["solicitud"]),
     )
 
 
@@ -359,6 +478,17 @@ def _merge_duplicate(first: RegulatoryRecord, second: RegulatoryRecord) -> Regul
             first.pagina_final or first.pagina,
             second.pagina_final or second.pagina,
         ),
+        numeral=first.numeral or second.numeral,
+        titulo_numeral=first.titulo_numeral or second.titulo_numeral,
+        fecha_sesion=first.fecha_sesion or second.fecha_sesion,
+        fecha_sesion_original=(
+            first.fecha_sesion_original or second.fecha_sesion_original
+        ),
+        tipo_solicitud=(
+            first.tipo_solicitud
+            if first.tipo_solicitud not in {None, "otra_solicitud"}
+            else second.tipo_solicitud
+        ),
     )
 
 
@@ -400,14 +530,30 @@ def extract_regulatory_records(
     active_field: str | None = None
     start_page = 1
     record_end_page = 1
+    current_numeral: str | None = None
+    current_numeral_title: str | None = None
+    record_numeral: str | None = None
+    record_numeral_title: str | None = None
+    session_date, session_date_raw = extract_session_date(pages)
 
     def flush() -> None:
         nonlocal values, active_field, start_page, record_end_page
-        decision = _build_decision(values, start_page, record_end_page)
+        nonlocal record_numeral, record_numeral_title
+        decision = _build_decision(
+            values,
+            start_page,
+            record_end_page,
+            numeral=record_numeral,
+            numeral_title=record_numeral_title,
+            session_date=session_date,
+            session_date_raw=session_date_raw,
+        )
         if decision is not None:
             decisions.append(decision)
         values = {}
         active_field = None
+        record_numeral = current_numeral
+        record_numeral_title = current_numeral_title
 
     for page_index, page_data in enumerate(pages, start=1):
         try:
@@ -421,8 +567,16 @@ def extract_regulatory_records(
             line = _clean_value(raw_line)
             if _is_noise(line):
                 continue
-            if _SECTION_HEADING_RE.fullmatch(line) and values.get("concepto"):
-                flush()
+            section_match = _SECTION_HEADING_RE.fullmatch(line)
+            if section_match and (section_match.group("title") or not values):
+                if values:
+                    flush()
+                current_numeral = section_match.group("numeral")
+                current_numeral_title = _clean_value(
+                    section_match.group("title") or ""
+                ) or None
+                record_numeral = current_numeral
+                record_numeral_title = current_numeral_title
                 start_page = page_number
                 continue
 
@@ -449,6 +603,8 @@ def extract_regulatory_records(
                 elif not values:
                     start_page = page_number
                     record_end_page = page_number
+                    record_numeral = current_numeral
+                    record_numeral_title = current_numeral_title
 
                 active_field = field
                 _append_value(values, field, value)

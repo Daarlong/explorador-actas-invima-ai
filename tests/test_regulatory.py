@@ -10,6 +10,7 @@ from services.regulatory import (
     extract_regulatory_dicts,
     extract_regulatory_records,
     normalize_regulatory_result,
+    normalize_request_type,
 )
 
 
@@ -47,6 +48,8 @@ class RegulatoryExtractionTests(unittest.TestCase):
         self.assertEqual(record.resultado_normalizado, RESULT_APPROVED)
         self.assertEqual(record.pagina, 18)
         self.assertEqual(record.page, 18)
+        self.assertEqual(record.numeral, "3.1.2")
+        self.assertEqual(record.tipo_solicitud, "evaluacion_farmacologica")
 
     def test_accepts_label_variants_and_continuations_between_pages(self) -> None:
         pages = [
@@ -205,6 +208,38 @@ class RegulatoryExtractionTests(unittest.TestCase):
             normalize_regulatory_result("La Sala niega la solicitud."),
             RESULT_DENIED,
         )
+
+    def test_extracts_labeled_session_date_and_keeps_numbered_text(self) -> None:
+        records = extract_regulatory_records(
+            [
+                {
+                    "page": 1,
+                    "text": "Fecha de la sesión: 15 de enero de 2026",
+                },
+                {
+                    "page": 8,
+                    "text": (
+                        "3.2.1. EVALUACIONES FARMACOLÓGICAS\n"
+                        "Producto: MEDICAMENTO A\nExpediente: 12345\n"
+                        "Solicitud: Renovación del registro sanitario.\n"
+                        "Concepto: La Sala requiere:\n1.2\n"
+                        "Presentar información complementaria."
+                    ),
+                },
+            ]
+        )
+
+        self.assertEqual(records[0].fecha_sesion, "2026-01-15")
+        self.assertEqual(records[0].numeral, "3.2.1")
+        self.assertIn("1.2", records[0].concepto or "")
+        self.assertEqual(records[0].tipo_solicitud, "renovacion_registro")
+
+    def test_normalizes_common_request_types(self) -> None:
+        self.assertEqual(
+            normalize_request_type("Modificación del registro sanitario"),
+            "modificacion_registro",
+        )
+        self.assertEqual(normalize_request_type("texto no categorizado"), "otra_solicitud")
 
 
 if __name__ == "__main__":

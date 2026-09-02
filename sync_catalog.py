@@ -11,9 +11,11 @@ from config import (
     CATALOG_SOURCE_URL,
     INDEX_START_YEAR,
     MANIFEST_PATH,
+    SOURCE_SNAPSHOT_PATH,
 )
 from services.catalog import (
     build_catalog_report,
+    build_source_snapshot,
     catalog_content_signature,
     fetch_catalog_html,
     load_catalog,
@@ -24,6 +26,7 @@ from services.catalog import (
     write_catalog,
     write_catalog_report,
     write_manifest_from_catalog,
+    write_source_snapshot,
 )
 from services.manifest import load_manifest
 
@@ -66,21 +69,22 @@ if __name__ == "__main__":
     existing = load_catalog(ACTAS_CATALOG_PATH)
     manifest_documents = load_manifest(MANIFEST_PATH, ALLOWED_DOCUMENT_HOSTS)
 
+    source_html = ""
     if arguments.bootstrap_only:
         discovered = []
     else:
-        html = (
+        source_html = (
             arguments.html_file.read_text(encoding="utf-8")
             if arguments.html_file
             else fetch_catalog_html(CATALOG_SOURCE_URL, ALLOWED_DOCUMENT_HOSTS)
         )
         discovered = parse_catalog_html(
-            html,
+            source_html,
             CATALOG_SOURCE_URL,
             ALLOWED_DOCUMENT_HOSTS,
         )
         if not arguments.no_strict:
-            validate_discovery(discovered)
+            validate_discovery(discovered, existing)
 
     records = merge_catalog(
         existing,
@@ -112,31 +116,19 @@ if __name__ == "__main__":
         )
         for row in rows
     }
-    if (
+    content_unchanged = (
         existing
         and not arguments.force
         and catalog_content_signature(existing) == catalog_content_signature(records)
         and current_manifest_signature == desired_manifest_signature
-    ):
-        print(
-            json.dumps(
-                {
-                    "status": "unchanged",
-                    "catalog_records": len(existing),
-                    "source_page_url": CATALOG_SOURCE_URL,
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-        )
-        raise SystemExit(0)
-
-    write_catalog(records, ACTAS_CATALOG_PATH)
-    write_manifest_from_catalog(
-        records,
-        MANIFEST_PATH,
-        minimum_year=arguments.index_from_year,
     )
+    if not content_unchanged:
+        write_catalog(records, ACTAS_CATALOG_PATH)
+        write_manifest_from_catalog(
+            records,
+            MANIFEST_PATH,
+            minimum_year=arguments.index_from_year,
+        )
     report = build_catalog_report(
         records,
         discovered,
@@ -144,5 +136,11 @@ if __name__ == "__main__":
         CATALOG_SOURCE_URL,
         source_checked=not arguments.bootstrap_only,
     )
+    report["content_status"] = "unchanged" if content_unchanged else "changed"
     write_catalog_report(report, CATALOG_REPORT_PATH)
+    if source_html:
+        write_source_snapshot(
+            build_source_snapshot(discovered, CATALOG_SOURCE_URL, source_html),
+            SOURCE_SNAPSHOT_PATH,
+        )
     print(json.dumps(report, ensure_ascii=False, indent=2))

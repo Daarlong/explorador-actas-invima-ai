@@ -12,6 +12,7 @@ from config import (
     DATABASE_PATH,
     MAX_PDF_BYTES,
     PDF_CACHE_DIR,
+    REVIEW_LOG_PATH,
     SEMANTIC_INDEX_PATH,
 )
 from services.database import (
@@ -22,6 +23,7 @@ from services.database import (
 )
 from services.models import SearchResult
 from services.pdf_viewer import render_pdf_page
+from services.reviews import apply_latest_reviews, load_review_events
 from services.search import SearchResponse, search_corpus
 from services.ui_helpers import group_search_results, highlight_query, pdf_page_url
 
@@ -76,6 +78,8 @@ def cached_pdf_page(title: str, url: str, page: int, dpi: int = 125):
 
 def clear_selected_evidence() -> None:
     st.session_state["selected_evidence"] = {}
+    st.session_state.pop("comparison_selected_sources", None)
+    st.session_state.pop("analysis_selected_sources", None)
     for key in list(st.session_state):
         if str(key).startswith("select_evidence_"):
             del st.session_state[key]
@@ -91,6 +95,9 @@ def update_selected_evidence(widget_key: str, result: dict) -> None:
         selected[chunk_id] = result
     else:
         selected.pop(chunk_id, None)
+    # Cualquier cambio invalida los snapshots enviados previamente a otras páginas.
+    st.session_state.pop("comparison_selected_sources", None)
+    st.session_state.pop("analysis_selected_sources", None)
 
 
 stats = database_stats(DATABASE_PATH)
@@ -147,6 +154,7 @@ with st.sidebar:
     sections = st.multiselect("Sala o sección", options["sections"])
     parts = st.multiselect("Parte", options["parts"])
     outcomes: list[str] = []
+    request_types: list[str] = []
     product = active_ingredient = interested_party = identifier = ""
     if has_structured_data:
         with st.expander("Campos regulatorios", expanded=False):
@@ -154,6 +162,11 @@ with st.sidebar:
                 "Resultado extraído",
                 options.get("outcomes", []),
                 format_func=lambda value: outcome_labels.get(value, value),
+            )
+            request_types = st.multiselect(
+                "Tipo de solicitud",
+                options.get("request_types", []),
+                format_func=lambda value: str(value).replace("_", " ").capitalize(),
             )
             product = st.text_input("Producto")
             active_ingredient = st.text_input("Principio activo")
@@ -180,6 +193,15 @@ with st.sidebar:
         )
         st.session_state["analysis_use_selected"] = True
         st.switch_page("pages/2_Analista_IA.py")
+    if st.button(
+        "Comparar seleccionadas",
+        use_container_width=True,
+        disabled=analyze_disabled,
+    ):
+        st.session_state["comparison_selected_sources"] = list(
+            selected_evidence.values()
+        )
+        st.switch_page("pages/7_Comparar.py")
     if st.button(
         "Limpiar selección",
         use_container_width=True,
@@ -210,6 +232,7 @@ filters = {
     "sections": sections,
     "parts": parts,
     "outcomes": outcomes,
+    "request_types": request_types,
     "products": [product] if product else [],
     "active_ingredients": [active_ingredient] if active_ingredient else [],
     "interested_parties": [interested_party] if interested_party else [],
@@ -249,7 +272,7 @@ elif response.requested_mode != response.used_mode:
     st.warning(
         "El índice semántico todavía no está disponible; esta consulta se "
         "resolvió con búsqueda textual. Ejecuta Construir índice una vez con "
-        "la versión 0.5."
+        "la versión 0.6."
     )
 
 groups = group_search_results(response.results, order=order_labels[selected_order_label])
@@ -269,6 +292,14 @@ structured_by_chunk = regulatory_records_for_chunks(
     DATABASE_PATH,
     [result.chunk_id for result in visible_results],
 )
+try:
+    review_events = load_review_events(REVIEW_LOG_PATH)
+except ValueError:
+    review_events = []
+structured_by_chunk = {
+    chunk_id: apply_latest_reviews(records, review_events)
+    for chunk_id, records in structured_by_chunk.items()
+}
 
 summary_col1, summary_col2, summary_col3 = st.columns([1.2, 1, 1])
 summary_col1.metric("PDF recuperados", len(groups))
@@ -344,10 +375,27 @@ with results_column:
                 )
 
                 structured = structured_by_chunk.get(result.chunk_id, [])
-                if structured:
-                    record = structured[0]
-                    with st.expander("Ficha regulatoria extraída", expanded=False):
+                for record_index, record in enumerate(structured, start=1):
+                    ficha_label = "Ficha regulatoria"
+                    if len(structured) > 1:
+                        ficha_label += f" {record_index} de {len(structured)}"
+                    review_labels = {
+                        "automatic": "Automática",
+                        "reviewed": "Revisada",
+                        "approved": "Aprobada",
+                        "reopened": "Reabierta",
+                        "stale": "Revisión desactualizada",
+                    }
+                    ficha_label += " · " + review_labels.get(
+                        str(record.get("review_status") or "automatic"),
+                        "Automática",
+                    )
+                    with st.expander(ficha_label, expanded=False):
                         field_rows = {
+                            "Numeral": record.get("numeral"),
+                            "Título del numeral": record.get("numeral_title"),
+                            "Fecha de sesión": record.get("session_date"),
+                            "Tipo de solicitud": record.get("request_type_code"),
                             "Producto": record.get("product_name"),
                             "Principio activo": record.get("active_ingredient"),
                             "Interesado": record.get("interested_party"),
@@ -381,9 +429,19 @@ with results_column:
                             else f"{start_page}–{end_page}"
                         )
                         st.caption(
-                            "Extracción automática pendiente de verificación "
-                            f"humana · páginas {page_label}."
+                            f"Estado: {review_labels.get(str(record.get('review_status') or 'automatic'), 'Automática')} "
+                            f"· páginas {page_label}."
                         )
+                        if record.get("review_stale"):
+                            st.warning(
+                                "La fuente cambió después de la revisión; esta ficha "
+                                "debe verificarse nuevamente."
+                            )
+                        if record.get("reviewer"):
+                            st.caption(
+                                f"Revisor declarado: {record.get('reviewer')} · "
+                                f"{record.get('reviewed_at', '')}"
+                            )
                 if fragment_index < min(3, len(group["results"])):
                     st.divider()
 

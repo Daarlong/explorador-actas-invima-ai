@@ -53,6 +53,9 @@ def load_manifest(
                     section=(row.get("section") or parsed.section),
                     part=(row.get("part") or parsed.part),
                     source_type=source_type,
+                    catalog_id=(row.get("catalog_id") or "").strip() or None,
+                    publication_date=(row.get("publication_date") or "").strip()
+                    or None,
                 )
             )
 

@@ -1,0 +1,2 @@
+case_id,query,expected_refs,filters_json,k,exact_phrase,notes,enabled
+ejemplo-001,producto o concepto que deseas recuperar,acta:2026:01:SEMPB,"{""years"":[2026]}",10,false,Reemplaza este ejemplo por una consulta validada por un revisor,false

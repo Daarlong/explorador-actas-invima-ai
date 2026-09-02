@@ -108,10 +108,15 @@ def build_integrity_report(
             "regulatory_documents": 0,
             "regulatory_extraction_pending": [],
             "regulatory_extraction_errors": [],
+            "regulatory_quality": {},
+            "foreign_key_errors": 0,
+            "fts_rowid_mismatches": 0,
+            "duplicate_document_hashes": [],
         }
 
     with connect(database_path) as connection:
         sqlite_integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
+        foreign_key_errors = len(connection.execute("PRAGMA foreign_key_check").fetchall())
         counts = {
             table: int(
                 connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
@@ -152,6 +157,37 @@ def build_integrity_report(
                 """
             ).fetchall()
         ]
+        fts_rowid_mismatches = int(
+            connection.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM chunks c
+                     LEFT JOIN chunks_fts f ON f.rowid = c.id
+                     WHERE f.rowid IS NULL)
+                  + (SELECT COUNT(*) FROM chunks_fts f
+                     LEFT JOIN chunks c ON c.id = f.rowid
+                     WHERE c.id IS NULL)
+                """
+            ).fetchone()[0]
+        )
+        duplicate_document_hashes = [
+            {
+                "document_hash": row["document_hash"],
+                "documents": int(row["documents"]),
+                "titles": str(row["titles"]).split(" || "),
+            }
+            for row in connection.execute(
+                """
+                SELECT document_hash, COUNT(*) AS documents,
+                       GROUP_CONCAT(title, ' || ') AS titles
+                FROM documents
+                WHERE document_hash != ''
+                GROUP BY document_hash
+                HAVING COUNT(*) > 1
+                ORDER BY COUNT(*) DESC, document_hash
+                """
+            ).fetchall()
+        ]
         feature_tables = {
             row[0]
             for row in connection.execute(
@@ -162,6 +198,7 @@ def build_integrity_report(
         regulatory_documents = 0
         regulatory_pending: list[str] = []
         regulatory_errors: list[dict] = []
+        regulatory_quality: dict[str, int] = {}
         if {"regulatory_records", "document_extractions"}.issubset(feature_tables):
             regulatory_records = int(
                 connection.execute("SELECT COUNT(*) FROM regulatory_records").fetchone()[0]
@@ -196,6 +233,28 @@ def build_integrity_report(
                     """
                 ).fetchall()
             ]
+            regulatory_quality_row = connection.execute(
+                """
+                SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN decision_uid IS NULL OR decision_uid = ''
+                           THEN 1 ELSE 0 END) AS without_uid,
+                       SUM(CASE WHEN numeral IS NULL OR TRIM(numeral) = ''
+                           THEN 1 ELSE 0 END) AS without_numeral,
+                       SUM(CASE WHEN session_date IS NULL OR TRIM(session_date) = ''
+                           THEN 1 ELSE 0 END) AS without_session_date,
+                       SUM(CASE WHEN request_type_code IS NULL
+                                      OR TRIM(request_type_code) = ''
+                                      OR request_type_code = 'otra_solicitud'
+                           THEN 1 ELSE 0 END) AS unclassified_request_type,
+                       SUM(CASE WHEN confidence IS NULL OR confidence < 0.70
+                           THEN 1 ELSE 0 END) AS low_confidence
+                FROM regulatory_records
+                """
+            ).fetchone()
+            regulatory_quality = {
+                key: int(regulatory_quality_row[key] or 0)
+                for key in regulatory_quality_row.keys()
+            }
 
     manifest_by_url = {document.url: document.title for document in manifest}
     indexed_by_url = {row["manifest_url"]: row["title"] for row in document_rows}
@@ -231,6 +290,8 @@ def build_integrity_report(
             bool(without_pages),
             bool(without_chunks),
             counts["chunks"] != counts["chunks_fts"],
+            foreign_key_errors,
+            fts_rowid_mismatches,
         )
     )
     status = (
@@ -281,6 +342,10 @@ def build_integrity_report(
         "regulatory_documents": regulatory_documents,
         "regulatory_extraction_pending": regulatory_pending,
         "regulatory_extraction_errors": regulatory_errors,
+        "regulatory_quality": regulatory_quality,
+        "foreign_key_errors": foreign_key_errors,
+        "fts_rowid_mismatches": fts_rowid_mismatches,
+        "duplicate_document_hashes": duplicate_document_hashes,
     }
 
 

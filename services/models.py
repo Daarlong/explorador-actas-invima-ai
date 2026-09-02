@@ -13,6 +13,8 @@ class DocumentMetadata:
     section: str | None = None
     part: str | None = None
     source_type: str = "official"
+    catalog_id: str | None = None
+    publication_date: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)

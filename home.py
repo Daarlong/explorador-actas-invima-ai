@@ -6,13 +6,18 @@ import streamlit as st
 
 from config import (
     ACTAS_CATALOG_PATH,
+    CATALOG_REPORT_PATH,
     DATABASE_PATH,
+    INDEXING_REPORT_PATH,
     INTEGRITY_REPORT_PATH,
     SEMANTIC_INDEX_PATH,
+    SEMANTIC_REPORT_PATH,
+    SOURCE_SNAPSHOT_PATH,
     ensure_directories,
 )
 from services.catalog import load_catalog
 from services.database import dashboard_summary
+from services.evaluation import audit_corpus_reports
 from services.integrity import load_integrity_report
 from services.semantic import semantic_index_status
 
@@ -28,6 +33,13 @@ summary = dashboard_summary(DATABASE_PATH)
 integrity = load_integrity_report(INTEGRITY_REPORT_PATH) or {}
 catalog = load_catalog(ACTAS_CATALOG_PATH)
 semantic = semantic_index_status(SEMANTIC_INDEX_PATH)
+audit = audit_corpus_reports(
+    INTEGRITY_REPORT_PATH,
+    INDEXING_REPORT_PATH,
+    SEMANTIC_REPORT_PATH,
+    catalog_report_path=CATALOG_REPORT_PATH,
+    source_snapshot_path=SOURCE_SNAPSHOT_PATH,
+)
 version_path = Path(__file__).with_name("VERSION")
 version = version_path.read_text(encoding="utf-8").strip() if version_path.exists() else ""
 
@@ -40,9 +52,12 @@ st.caption(
 status = integrity.get("status")
 if summary["documents"] == 0:
     st.error("El índice documental todavía no está disponible.")
-elif status == "error":
-    st.error("El último control detectó documentos pendientes o inconsistencias.")
-elif status == "warning":
+elif status == "error" or audit.get("status") == "error":
+    st.warning(
+        "El índice puede consultarse, pero la auditoría detectó cobertura, "
+        "integridad o fuente oficial pendiente de verificar."
+    )
+elif status == "warning" or audit.get("status") != "ok":
     st.warning("El corpus está disponible con advertencias documentales por revisar.")
 else:
     st.success("El corpus está disponible para consulta.")
@@ -79,7 +94,7 @@ metric1.metric("Actas únicas", summary["unique_acts"])
 metric2.metric("PDF/partes", summary["documents"])
 metric3.metric("Páginas", summary["pages"])
 metric4.metric("Registros extraídos", summary["regulatory_records"])
-metric5.metric("Cobertura", f"{coverage} %")
+metric5.metric("Manifiesto → índice", f"{coverage} %")
 metric6.metric("Rango real", range_label)
 
 pending_documents = len(integrity.get("missing_documents", []) or [])
@@ -171,13 +186,21 @@ with activity_col:
         + " Campos regulatorios estructurados"
     )
     st.write("✅ Visor de página y selección de evidencia")
+    st.write(
+        ("✅" if audit.get("status") == "ok" else "⚠️")
+        + " Auditoría reproducible del corpus"
+    )
 
 st.subheader("Accesos")
 link1, link2, link3, link4 = st.columns(4)
 link1.page_link("pages/1_Explorador.py", label="Abrir Explorador", icon="🔍")
 link2.page_link("pages/2_Analista_IA.py", label="Abrir Analista", icon="💬")
-link3.page_link("pages/4_Integridad.py", label="Ver Integridad", icon="✅")
-link4.page_link("pages/5_Catalogo.py", label="Ver Catálogo", icon="📚")
+link3.page_link("pages/7_Comparar.py", label="Comparar decisiones", icon="⚖️")
+link4.page_link("pages/6_Evaluacion.py", label="Evaluar búsquedas", icon="📊")
+link5, link6, link7, _ = st.columns(4)
+link5.page_link("pages/8_Revision_Fichas.py", label="Revisar fichas", icon="📝")
+link6.page_link("pages/4_Integridad.py", label="Ver Integridad", icon="✅")
+link7.page_link("pages/5_Catalogo.py", label="Ver Catálogo", icon="📚")
 
 st.info(
     "Las fichas regulatorias y las asociaciones semánticas son ayudas de "

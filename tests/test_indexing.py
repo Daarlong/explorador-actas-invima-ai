@@ -7,7 +7,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from services.catalog import CatalogRecord, catalog_id_for, write_catalog
-from services.database import database_stats, is_current_schema, search_chunks
+from services.database import (
+    connect,
+    database_stats,
+    is_current_schema,
+    search_chunks,
+    sync_regulatory_extractions,
+)
 from services.downloader import DownloadedPdf
 from services.indexing import (
     IndexingReport,
@@ -19,6 +25,97 @@ from services.indexing import (
 
 
 class IndexingTests(unittest.TestCase):
+    def test_backfills_catalog_id_without_download_and_keeps_uid_after_url_change(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = root / "manifest.csv"
+            database_path = root / "actas.db"
+            cache_path = root / "cache"
+            pdf_path = root / "sample.pdf"
+            pdf_path.write_bytes(b"%PDF-test")
+            original_url = "https://www.invima.gov.co/biblioteca/download/original"
+            replacement_url = "https://www.invima.gov.co/biblioteca/download/reemplazo"
+            catalog_id = "2024-sempb-01-completa"
+            title = "Acta No 01 de 2024 SEMPB"
+            manifest_path.write_text(
+                f"title,url\n{title},{original_url}\n",
+                encoding="utf-8",
+            )
+            extracted = (
+                [
+                    {
+                        "page": 6,
+                        "text": (
+                            "3.1.1 EVALUACIONES FARMACOLÓGICAS\n"
+                            "Producto: MEDICAMENTO ALFA\n"
+                            "Expediente: EXP-2024-1\n"
+                            "Radicado: RAD-2024-1\n"
+                            "Solicitud: Evaluación farmacológica.\n"
+                            "Concepto: La Sala aprueba lo solicitado."
+                        ),
+                    }
+                ],
+                [],
+            )
+            with patch(
+                "services.indexing.download_pdf_resource",
+                return_value=DownloadedPdf(pdf_path, original_url),
+            ), patch(
+                "services.indexing.extract_pdf_pages",
+                return_value=extracted,
+            ):
+                rebuild_index(manifest_path, database_path, cache_path)
+
+            sync_regulatory_extractions(database_path)
+            with connect(database_path) as connection:
+                uid_before_backfill = connection.execute(
+                    "SELECT decision_uid FROM regulatory_records"
+                ).fetchone()[0]
+
+            manifest_path.write_text(
+                "title,url,catalog_id,publication_date\n"
+                f"{title},{original_url},{catalog_id},2024-01-15\n",
+                encoding="utf-8",
+            )
+            with patch("services.indexing.download_pdf_resource") as downloader:
+                report = update_index(manifest_path, database_path, cache_path)
+
+            downloader.assert_not_called()
+            self.assertEqual(report.documents_metadata_updated, 1)
+            with connect(database_path) as connection:
+                metadata = connection.execute(
+                    "SELECT catalog_id, publication_date FROM documents"
+                ).fetchone()
+                pending_extraction = connection.execute(
+                    "SELECT COUNT(*) FROM document_extractions"
+                ).fetchone()[0]
+            self.assertEqual(tuple(metadata), (catalog_id, "2024-01-15"))
+            self.assertEqual(pending_extraction, 0)
+
+            sync_regulatory_extractions(database_path)
+            with connect(database_path) as connection:
+                uid_from_catalog = connection.execute(
+                    "SELECT decision_uid FROM regulatory_records"
+                ).fetchone()[0]
+                connection.execute(
+                    "UPDATE documents SET manifest_url = ?",
+                    (replacement_url,),
+                )
+                connection.execute(
+                    "UPDATE document_extractions SET extractor_version = 'anterior'"
+                )
+
+            sync_regulatory_extractions(database_path)
+            with connect(database_path) as connection:
+                uid_after_url_change = connection.execute(
+                    "SELECT decision_uid FROM regulatory_records"
+                ).fetchone()[0]
+
+        self.assertNotEqual(uid_before_backfill, uid_from_catalog)
+        self.assertEqual(uid_from_catalog, uid_after_url_change)
+
     def test_migrates_legacy_index_without_downloading_pdfs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
