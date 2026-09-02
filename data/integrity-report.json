@@ -144,13 +144,42 @@
       "year": 2013
     }
   ],
-  "database_bytes": 600956928,
-  "database_mib": 573.1,
+  "database_bytes": 601374720,
+  "database_mib": 573.5,
   "documents_without_chunks": [],
   "documents_without_pages": [],
-  "expected_schema_version": 4,
+  "duplicate_document_hashes": [
+    {
+      "document_hash": "3073de963cef54842edb311003321d899f3ed4316af7fd57a86aa7ca2f7ed34b",
+      "documents": 3,
+      "titles": [
+        "Acta No 01 de 2022 SEMNNIMB Séptima Parte",
+        "Acta No 01 de 2022 SEMNNIMB Séptima Parte A",
+        "Acta No 01 de 2022 SEMNNIMB Séptima Parte B"
+      ]
+    },
+    {
+      "document_hash": "5cdd1727349f2f57204e75cce513db88857d1c5491f3b35a201c4a0cea631353",
+      "documents": 2,
+      "titles": [
+        "Acta No 11 de 2024 SEMNNIMB",
+        "Acta No 11 de 2024 SEMNNIMB Primera Parte"
+      ]
+    },
+    {
+      "document_hash": "ee1148caab03c3b22aecb8af650f477bad33e2e697ec2114bb302533668471d3",
+      "documents": 2,
+      "titles": [
+        "Acta No 09 de 2024 SEM",
+        "Acta No 09 de 2024 SEMNNIMB"
+      ]
+    }
+  ],
+  "expected_schema_version": 5,
+  "foreign_key_errors": 0,
+  "fts_rowid_mismatches": 0,
   "fts_rows": 321246,
-  "generated_at": "2026-09-02T14:38:58.711428+00:00",
+  "generated_at": "2026-09-02T17:10:11.741402+00:00",
   "indexed_documents": 638,
   "manifest_documents": 638,
   "missing_documents": [],
@@ -161,8 +190,16 @@
   "regulatory_documents": 638,
   "regulatory_extraction_errors": [],
   "regulatory_extraction_pending": [],
-  "regulatory_records": 24187,
-  "schema_version": 4,
+  "regulatory_quality": {
+    "low_confidence": 7472,
+    "total": 22748,
+    "unclassified_request_type": 15684,
+    "without_numeral": 22748,
+    "without_session_date": 3770,
+    "without_uid": 0
+  },
+  "regulatory_records": 22748,
+  "schema_version": 5,
   "sqlite_integrity": "ok",
   "status": "ok",
   "text_page_coverage_percent": 100.0,
