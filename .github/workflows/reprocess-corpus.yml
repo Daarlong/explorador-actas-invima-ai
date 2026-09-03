@@ -1,0 +1,287 @@
+name: Reprocesar estructura y fichas
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Qué hacer con la base candidata validada"
+        required: true
+        type: choice
+        default: diagnostic
+        options:
+          - diagnostic
+          - publish
+      resume_run_id:
+        description: "ID de una ejecución interrumpida (opcional)"
+        required: false
+        type: string
+        default: ""
+      max_batches:
+        description: "Máximo de lotes en esta ejecución; 0 procesa todos"
+        required: false
+        type: string
+        default: "4"
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: mantenimiento-actas
+  cancel-in-progress: false
+
+jobs:
+  reprocess-corpus:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      ACTAS_DISABLE_DATABASE_PACKAGE: "1"
+      ACTAS_DATABASE_PATH: .reprocess/candidate/data/actas.db
+      ACTAS_SEMANTIC_INDEX_PATH: .reprocess/candidate/data/semantic.db
+      ACTAS_INDEXING_REPORT_PATH: .reprocess/candidate/data/indexing-report.json
+      ACTAS_INTEGRITY_REPORT_PATH: .reprocess/candidate/data/integrity-report.json
+      ACTAS_SEMANTIC_REPORT_PATH: .reprocess/candidate/data/semantic-report.json
+      ACTAS_EVALUATION_REPORT_PATH: .reprocess/candidate/data/evaluation-report.json
+      ACTAS_REVIEW_LOG_PATH: data/regulatory-review-log.csv
+      ACTAS_INDEX_START_YEAR: "2013"
+      ACTAS_OCR_ENABLED: "1"
+      ACTAS_OCR_LANGUAGES: "spa+eng"
+      ACTAS_OCR_DPI: "180"
+      ACTAS_REPROCESS_BATCH_SIZE: "50"
+      ACTAS_REPROCESS_MIN_FREE_MIB: "4096"
+    steps:
+      - name: Descargar código
+        uses: actions/checkout@v7
+
+      - name: Configurar Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Restaurar caché de PDF
+        uses: actions/cache@v6
+        with:
+          path: local_cache/documents
+          key: actas-pdf-${{ runner.os }}-${{ hashFiles('documents_manifest.csv') }}-${{ github.run_id }}
+          restore-keys: |
+            actas-pdf-${{ runner.os }}-${{ hashFiles('documents_manifest.csv') }}-
+            actas-pdf-${{ runner.os }}-
+
+      - name: Instalar dependencias
+        run: python -m pip install --requirement requirements.txt
+
+      - name: Instalar reconocimiento óptico en español
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes tesseract-ocr tesseract-ocr-spa
+
+      - name: Verificar código antes de procesar
+        run: python -m unittest discover -v
+
+      - name: Validar parámetros de continuación
+        env:
+          MODE: ${{ inputs.mode }}
+          RESUME_RUN_ID: ${{ inputs.resume_run_id }}
+          MAX_BATCHES: ${{ inputs.max_batches }}
+        shell: bash
+        run: |
+          if [[ ! "$MODE" =~ ^(diagnostic|publish)$ ]]; then
+            echo "mode debe ser diagnostic o publish."
+            exit 1
+          fi
+          if [ -n "$RESUME_RUN_ID" ] && [[ ! "$RESUME_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "resume_run_id debe contener únicamente el número de ejecución."
+            exit 1
+          fi
+          if [[ ! "$MAX_BATCHES" =~ ^[0-9]+$ ]]; then
+            echo "max_batches debe ser 0 o un número entero positivo."
+            exit 1
+          fi
+
+      - name: Recuperar punto de continuación solicitado
+        if: ${{ inputs.resume_run_id != '' }}
+        uses: actions/download-artifact@v7
+        with:
+          name: reprocess-checkpoint-${{ inputs.resume_run_id }}
+          path: .reprocess-resume
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.resume_run_id }}
+
+      - name: Preflight y restauración de referencia
+        env:
+          RESUME_RUN_ID: ${{ inputs.resume_run_id }}
+        shell: bash
+        run: |
+          args=(
+            prepare
+            --workspace .reprocess
+            --published-data data
+            --manifest documents_manifest.csv
+            --review-log data/regulatory-review-log.csv
+          )
+          if [ -n "$RESUME_RUN_ID" ]; then
+            args+=(--resume-from .reprocess-resume)
+          fi
+          python reprocess_corpus.py "${args[@]}"
+
+      - name: Medir la base publicada de referencia
+        shell: bash
+        run: |
+          python reprocess_corpus.py baseline-integrity \
+            --workspace .reprocess \
+            --manifest documents_manifest.csv
+          ACTAS_DATABASE_PATH=.reprocess/baseline/data/actas.db \
+          ACTAS_SEMANTIC_INDEX_PATH=.reprocess/baseline/data/semantic.db \
+          ACTAS_EVALUATION_REPORT_PATH=.reprocess/baseline/data/evaluation-report.json \
+          python evaluate_search.py \
+            --output .reprocess/baseline/data/evaluation-report.json \
+            --integrity-report .reprocess/baseline/data/integrity-report.json \
+            --allow-empty
+
+      - name: Reprocesar documentos por lotes
+        id: batches
+        env:
+          MAX_BATCHES: ${{ inputs.max_batches }}
+        shell: bash
+        run: |
+          args=(
+            build
+            --workspace .reprocess
+            --manifest documents_manifest.csv
+            --pdf-cache local_cache/documents
+          )
+          if [ "$MAX_BATCHES" -gt 0 ]; then
+            args+=(--max-batches "$MAX_BATCHES")
+          fi
+          python reprocess_corpus.py "${args[@]}"
+          complete=$(python -c 'import json; print(str(json.load(open(".reprocess/candidate/checkpoint.json"))["complete"]).lower())')
+          echo "complete=$complete" >> "$GITHUB_OUTPUT"
+
+      - name: Informar continuación pendiente
+        if: ${{ steps.batches.outputs.complete != 'true' }}
+        run: >-
+          echo "::notice title=Reprocesamiento parcial::La candidata quedó
+          guardada. En la siguiente ejecución usa resume_run_id=${{ github.run_id }}
+          para continuar sin repetir los lotes terminados."
+
+      - name: Finalizar fichas, índice semántico e integridad
+        if: ${{ steps.batches.outputs.complete == 'true' }}
+        run: python build_index.py --fail-on-semantic-error
+
+      - name: Reconciliar identidades y revisiones con la base publicada
+        if: ${{ steps.batches.outputs.complete == 'true' }}
+        run: >-
+          python reprocess_corpus.py reconcile
+          --workspace .reprocess
+          --manifest documents_manifest.csv
+          --review-log data/regulatory-review-log.csv
+
+      - name: Evaluar candidata contra la referencia
+        if: ${{ steps.batches.outputs.complete == 'true' }}
+        continue-on-error: true
+        env:
+          MODE: ${{ inputs.mode }}
+        shell: bash
+        run: |
+          if [ "$MODE" = "publish" ]; then
+            python evaluate_search.py \
+              --output .reprocess/candidate/data/evaluation-report.json \
+              --release \
+              --baseline .reprocess/baseline/data/evaluation-report.json
+          else
+            python evaluate_search.py \
+              --output .reprocess/candidate/data/evaluation-report.json \
+              --allow-empty \
+              --baseline .reprocess/baseline/data/evaluation-report.json
+          fi
+
+      - name: Empaquetar candidata sin borrar las bases de trabajo
+        if: ${{ steps.batches.outputs.complete == 'true' }}
+        shell: bash
+        run: |
+          python package_index.py create \
+            --database .reprocess/candidate/data/actas.db \
+            --part-size-mib 90
+          python package_index.py create \
+            --database .reprocess/candidate/data/semantic.db \
+            --part-size-mib 90
+
+      - name: Restaurar paquetes, ejecutar smoke test y validar publicación
+        if: ${{ steps.batches.outputs.complete == 'true' }}
+        env:
+          MODE: ${{ inputs.mode }}
+        shell: bash
+        run: |
+          python reprocess_corpus.py validate \
+            --workspace .reprocess \
+            --manifest documents_manifest.csv \
+            --review-log data/regulatory-review-log.csv \
+            --mode "$MODE"
+
+      - name: Publicar la base aprobada
+        if: ${{ inputs.mode == 'publish' && steps.batches.outputs.complete == 'true' }}
+        run: >-
+          python reprocess_corpus.py publish
+          --workspace .reprocess
+          --published-data data
+          --review-log data/regulatory-review-log.csv
+
+      - name: Guardar publicación en el repositorio privado
+        if: ${{ inputs.mode == 'publish' && steps.batches.outputs.complete == 'true' }}
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -u data
+          git add data/actas.db.package.json data/semantic.db.package.json
+          git add data/indexing-report.json data/integrity-report.json
+          git add data/semantic-report.json data/evaluation-report.json
+          git add data/reconciliation-report.json
+          git add data/reprocess-report.json
+          git add -f data/actas.db.gz.part-* data/semantic.db.gz.part-*
+          if git diff --cached --quiet; then
+            echo "La base publicada ya era idéntica."
+          else
+            git commit -m "Publicar reprocesamiento validado del corpus"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+
+      - name: Publicar informe de diagnóstico
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: reprocess-report-${{ github.run_id }}
+          path: |
+            .reprocess/run-state.json
+            .reprocess/candidate/checkpoint.json
+            .reprocess/reprocess-report.json
+            .reprocess/candidate/data/indexing-report.json
+            .reprocess/candidate/data/integrity-report.json
+            .reprocess/candidate/data/semantic-report.json
+            .reprocess/candidate/data/evaluation-report.json
+            .reprocess/candidate/data/reconciliation-report.json
+            .reprocess/baseline/data/evaluation-report.json
+          if-no-files-found: warn
+          include-hidden-files: true
+          overwrite: true
+          retention-days: 30
+
+      - name: Conservar candidata para continuar sin repetir los PDF
+        if: >-
+          ${{ always() && (
+            failure() || cancelled() || inputs.mode == 'diagnostic' ||
+            steps.batches.outputs.complete != 'true'
+          ) }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: reprocess-checkpoint-${{ github.run_id }}
+          path: |
+            .reprocess/run-state.json
+            .reprocess/candidate/checkpoint.json
+            .reprocess/candidate/data/actas.db
+          if-no-files-found: warn
+          compression-level: 6
+          include-hidden-files: true
+          overwrite: true
+          retention-days: 7

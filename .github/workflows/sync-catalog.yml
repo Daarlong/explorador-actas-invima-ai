@@ -7,10 +7,11 @@ on:
     - cron: "30 23 * * 1-5"
 
 permissions:
+  actions: write
   contents: write
 
 concurrency:
-  group: actualizar-catalogo
+  group: mantenimiento-actas
   cancel-in-progress: false
 
 jobs:
@@ -31,22 +32,54 @@ jobs:
       - name: Consultar la página oficial y actualizar el registro
         run: python sync_catalog.py
 
+      - name: Detectar cambios y documentos pendientes
+        id: update-status
+        shell: bash
+        run: |
+          if git diff --quiet -- actas_catalog.csv documents_manifest.csv; then
+            echo "catalog_changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "catalog_changed=true" >> "$GITHUB_OUTPUT"
+          fi
+          if git diff --quiet -- data/catalog-report.json data/source-snapshot.json; then
+            echo "audit_changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "audit_changed=true" >> "$GITHUB_OUTPUT"
+          fi
+          if python check_index_pending.py; then
+            echo "index_pending=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "index_pending=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Verificar catálogo y manifiesto
         run: >-
           python -m unittest
+          tests.test_automation
           tests.test_catalog
           tests.test_manifest
           -v
 
       - name: Guardar cambios del catálogo
+        if: >-
+          steps.update-status.outputs.catalog_changed == 'true' ||
+          steps.update-status.outputs.audit_changed == 'true'
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add actas_catalog.csv documents_manifest.csv data/catalog-report.json
+          git add actas_catalog.csv documents_manifest.csv data/catalog-report.json data/source-snapshot.json
           if git diff --cached --quiet; then
             echo "No se encontraron nuevas publicaciones."
           else
             git commit -m "Actualizar catálogo oficial de actas"
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
+
+      - name: Iniciar actualización del índice
+        if: >-
+          steps.update-status.outputs.catalog_changed == 'true' ||
+          steps.update-status.outputs.index_pending == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run build-index.yml --ref "${GITHUB_REF_NAME}"

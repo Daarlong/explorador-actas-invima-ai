@@ -2,18 +2,12 @@ name: Construir índice
 
 on:
   workflow_dispatch:
-    inputs:
-      full_rebuild:
-        description: "Reconstruir todos los PDF (normalmente no es necesario)"
-        required: false
-        type: boolean
-        default: false
 
 permissions:
   contents: write
 
 concurrency:
-  group: construir-indice
+  group: mantenimiento-actas
   cancel-in-progress: false
 
 jobs:
@@ -28,7 +22,6 @@ jobs:
       ACTAS_OCR_ENABLED: "1"
       ACTAS_OCR_LANGUAGES: "spa+eng"
       ACTAS_OCR_DPI: "180"
-
     steps:
       - name: Descargar código
         uses: actions/checkout@v7
@@ -64,13 +57,10 @@ jobs:
           python package_index.py restore --database data/semantic.db
 
       - name: Construir o actualizar base de búsqueda
-        shell: bash
-        run: |
-          if [ "${{ inputs.full_rebuild }}" = "true" ]; then
-            python build_index.py --full
-          else
-            python build_index.py --allow-partial
-          fi
+        run: python build_index.py --allow-partial
+
+      - name: Evaluar los modos de búsqueda
+        run: python evaluate_search.py --allow-empty
 
       - name: Comprimir, verificar y dividir los índices
         shell: bash
@@ -80,13 +70,25 @@ jobs:
             python package_index.py create --database data/semantic.db --part-size-mib 90 --delete-source
           fi
 
+      - name: Restaurar y verificar los paquetes generados
+        shell: bash
+        run: |
+          python package_index.py verify \
+            --database data/actas.db \
+            --target .package-smoke/actas.db
+          if [ -f data/semantic.db.package.json ]; then
+            python package_index.py verify \
+              --database data/semantic.db \
+              --target .package-smoke/semantic.db
+          fi
+
       - name: Guardar índice e informe en el repositorio privado
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -u data
-          git add data/actas.db.package.json data/integrity-report.json data/indexing-report.json data/semantic-report.json
+          git add data/actas.db.package.json data/integrity-report.json data/indexing-report.json data/semantic-report.json data/evaluation-report.json
           git add -f data/actas.db.gz.part-*
           if [ -f data/semantic.db.package.json ]; then
             git add data/semantic.db.package.json
