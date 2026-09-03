@@ -247,21 +247,20 @@ jobs:
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
 
-      - name: Publicar informe de diagnóstico
+      - name: Resumir resultado y preparar informes
+        if: ${{ always() }}
+        shell: bash
+        run: >-
+          python reprocess_corpus.py export-reports
+          --workspace .reprocess
+          --github-summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Publicar informes de diagnóstico
         if: ${{ always() }}
         uses: actions/upload-artifact@v7
         with:
           name: reprocess-report-${{ github.run_id }}
-          path: |
-            .reprocess/run-state.json
-            .reprocess/candidate/checkpoint.json
-            .reprocess/reprocess-report.json
-            .reprocess/candidate/data/indexing-report.json
-            .reprocess/candidate/data/integrity-report.json
-            .reprocess/candidate/data/semantic-report.json
-            .reprocess/candidate/data/evaluation-report.json
-            .reprocess/candidate/data/reconciliation-report.json
-            .reprocess/baseline/data/evaluation-report.json
+          path: .reprocess/export/
           if-no-files-found: warn
           include-hidden-files: true
           overwrite: true
@@ -280,6 +279,7 @@ jobs:
             .reprocess/run-state.json
             .reprocess/candidate/checkpoint.json
             .reprocess/candidate/data/actas.db
+            .reprocess/candidate/data/semantic.db
           if-no-files-found: warn
           compression-level: 6
           include-hidden-files: true
