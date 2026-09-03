@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hmac
+import json
 import os
+from pathlib import Path
 
 import streamlit as st
 
@@ -12,6 +14,14 @@ from services.database import (
     get_regulatory_records_by_uids,
     list_regulatory_records,
 )
+from services.effective_records import (
+    display_value,
+    field_evidence_details,
+    field_metadata,
+    hydrate_field_evidence,
+    provenance_label,
+    scan_effective_record_page,
+)
 from services.reviews import (
     OUTCOME_CODES,
     REQUEST_TYPE_CODES,
@@ -19,6 +29,7 @@ from services.reviews import (
     append_review_event,
     apply_latest_reviews,
     load_review_events,
+    latest_reviews,
     new_review_event,
     parse_review_events,
     serialize_review_events,
@@ -33,6 +44,31 @@ st.title("📝 Revisión de fichas regulatorias")
 st.caption(
     "Corrige y aprueba la extracción automática sin modificar el texto oficial."
 )
+
+
+def _file_identity(path: Path) -> tuple[int, int]:
+    if not path.exists():
+        return (0, 0)
+    stat = path.stat()
+    return (stat.st_size, stat.st_mtime_ns)
+
+
+@st.cache_data(show_spinner=False, ttl=600)
+def cached_effective_queue_page(
+    filters_json: str,
+    page: int,
+    database_identity: tuple[int, int],
+    review_identity: tuple[int, int],
+):
+    del database_identity, review_identity
+    cached_events = load_review_events(REVIEW_LOG_PATH)
+    return scan_effective_record_page(
+        DATABASE_PATH,
+        latest_reviews(cached_events),
+        page=page,
+        page_size=100,
+        **json.loads(filters_json),
+    )
 
 try:
     secrets = dict(st.secrets)
@@ -56,26 +92,67 @@ saved_message = st.session_state.pop("review_saved_message", "")
 if saved_message:
     st.success(saved_message)
 
-options = get_filter_options(DATABASE_PATH)
+try:
+    events = load_review_events(REVIEW_LOG_PATH)
+except ValueError as exc:
+    st.error(f"El registro de revisiones no es válido: {exc}")
+    st.stop()
+
+options = get_filter_options(DATABASE_PATH, review_events=events)
+status_labels = {
+    "automatic": "Automática",
+    "reviewed": "Revisada",
+    "approved": "Aprobada",
+    "reopened": "Reabierta",
+    "stale": "Revisión desactualizada",
+}
+provenance_options = {
+    "Explícito": "explicit",
+    "Inferido": "inferred",
+    "Mixto": "mixed",
+    "Verificado": "verified",
+    "Automático anterior": "legacy_automatic",
+    "No extraído": "not_extracted",
+}
 with st.sidebar:
     st.header("Cola de revisión")
-    query = st.text_input("Producto, expediente, radicado o numeral")
-    years = st.multiselect("Año", options.get("years", []))
-    outcomes = st.multiselect("Resultado", options.get("outcomes", []))
-    request_types = st.multiselect(
-        "Tipo de solicitud", options.get("request_types", [])
-    )
-    missing_label = st.selectbox(
-        "Priorizar campo faltante",
-        [
-            "Todos",
-            "Numeral",
-            "Fecha de sesión",
-            "Tipo de solicitud",
-            "Producto",
-            "Resultado",
-        ],
-    )
+    with st.form("review_queue_filters"):
+        query = st.text_input(
+            "Producto, principio activo, expediente, radicado o numeral"
+        )
+        years = st.multiselect("Año", options.get("years", []))
+        outcomes = st.multiselect("Resultado", options.get("outcomes", []))
+        request_types = st.multiselect(
+            "Tipo de solicitud", options.get("request_types", [])
+        )
+        selected_status_labels = st.multiselect(
+            "Estado de revisión", list(status_labels.values())
+        )
+        selected_provenance_labels = st.multiselect(
+            "Procedencia del principio activo", list(provenance_options)
+        )
+        confidence_choice = st.selectbox(
+            "Confianza mínima del principio activo",
+            ["Cualquiera", "Media (≥ 60 %)", "Alta (≥ 85 %)"],
+        )
+        confidence_minimum = {
+            "Cualquiera": None,
+            "Media (≥ 60 %)": 0.60,
+            "Alta (≥ 85 %)": 0.85,
+        }[confidence_choice]
+        missing_label = st.selectbox(
+            "Priorizar campo faltante",
+            [
+                "Todos",
+                "Numeral",
+                "Fecha de sesión",
+                "Tipo de solicitud",
+                "Producto",
+                "Principio activo",
+                "Resultado",
+            ],
+        )
+        st.form_submit_button("Aplicar filtros", type="primary")
 
 missing_mapping = {
     "Todos": "",
@@ -83,45 +160,72 @@ missing_mapping = {
     "Fecha de sesión": "session_date",
     "Tipo de solicitud": "request_type",
     "Producto": "product",
+    "Principio activo": "active_ingredient",
     "Resultado": "outcome",
 }
-total_records = count_regulatory_records(
-    DATABASE_PATH,
-    query=query,
-    years=years,
-    outcomes=outcomes,
-    request_types=request_types,
-    missing_field=missing_mapping[missing_label],
-)
 page_size = 100
-page_count = max(1, (total_records + page_size - 1) // page_size)
 queue_page_key = "review_queue_page"
-stored_queue_page = int(st.session_state.get(queue_page_key, 1) or 1)
-if stored_queue_page < 1 or stored_queue_page > page_count:
+if int(st.session_state.get(queue_page_key, 1) or 1) < 1:
     st.session_state[queue_page_key] = 1
 with st.sidebar:
     page_number_filter = st.number_input(
         "Página de resultados",
         min_value=1,
-        max_value=page_count,
         step=1,
         key=queue_page_key,
     )
-records = list_regulatory_records(
-    DATABASE_PATH,
-    query=query,
-    years=years,
-    outcomes=outcomes,
-    request_types=request_types,
-    missing_field=missing_mapping[missing_label],
-    limit=page_size,
-    offset=(int(page_number_filter) - 1) * page_size,
+requested_uid = str(st.session_state.get("review_target_uid") or "").strip()
+selected_statuses = [
+    code for code, label in status_labels.items() if label in selected_status_labels
+]
+selected_provenances = [
+    provenance_options[label] for label in selected_provenance_labels
+]
+effective_filters = {
+    "query": query,
+    "years": years,
+    "outcomes": outcomes,
+    "request_types": request_types,
+    "missing_field": missing_mapping[missing_label],
+    "provenances": selected_provenances,
+    "confidence_minimum": confidence_minimum,
+    "review_statuses": selected_statuses,
+}
+requires_effective_scan = bool(
+    query
+    or outcomes
+    or request_types
+    or missing_mapping[missing_label]
+    or selected_status_labels
+    or selected_provenance_labels
+    or confidence_minimum is not None
 )
-try:
-    events = load_review_events(REVIEW_LOG_PATH)
-except ValueError as exc:
-    st.error(f"El registro de revisiones no es válido: {exc}")
-    events = []
+if requires_effective_scan:
+    scanned_page = cached_effective_queue_page(
+        json.dumps(effective_filters, ensure_ascii=False, sort_keys=True),
+        int(page_number_filter),
+        _file_identity(DATABASE_PATH),
+        _file_identity(REVIEW_LOG_PATH),
+    )
+    total_records = scanned_page.total_matches
+    effective_records = list(scanned_page.records)
+else:
+    total_records = count_regulatory_records(DATABASE_PATH, years=years)
+    records = list_regulatory_records(
+        DATABASE_PATH,
+        years=years,
+        limit=page_size,
+        offset=(int(page_number_filter) - 1) * page_size,
+    )
+    effective_records = apply_latest_reviews(
+        hydrate_field_evidence(DATABASE_PATH, records), events
+    )
+
+page_count = max(1, (total_records + page_size - 1) // page_size)
+if int(page_number_filter) > page_count:
+    st.session_state[queue_page_key] = page_count
+    st.rerun()
+
 event_uids = sorted({event.decision_uid for event in events})
 known_event_uids = {
     str(item.get("decision_uid") or "")
@@ -133,10 +237,35 @@ if orphan_event_uids:
         f"Hay {len(orphan_event_uids)} ficha(s) revisada(s) que ya no existen "
         "en la extracción vigente. El historial se conserva, pero no se aplica."
     )
-effective_records = apply_latest_reviews(records, events)
+if requested_uid:
+    requested_records = [
+        record
+        for record in apply_latest_reviews(
+            hydrate_field_evidence(
+                DATABASE_PATH,
+                get_regulatory_records_by_uids(DATABASE_PATH, [requested_uid]),
+            ),
+            events,
+        )
+        if str(record.get("decision_uid") or "") == requested_uid
+    ]
+    if requested_records:
+        effective_records = requested_records
+        st.info("Mostrando la ficha enviada desde el Explorador.")
+        if st.button("Volver a la cola completa"):
+            st.session_state.pop("review_target_uid", None)
+            st.rerun()
+    else:
+        st.warning(
+            "La ficha solicitada ya no existe en la extracción vigente. El "
+            "historial de revisión no se modificó."
+        )
+        if st.button("Cerrar ficha solicitada"):
+            st.session_state.pop("review_target_uid", None)
+            st.rerun()
 
 metric1, metric2, metric3, metric4, metric5 = st.columns(5)
-metric1.metric("Coincidencias totales", total_records)
+metric1.metric("Coincidencias vigentes", total_records)
 metric2.metric("Fichas en esta página", len(effective_records))
 metric3.metric(
     "Automáticas",
@@ -150,6 +279,17 @@ metric5.metric(
     "Aprobadas",
     sum(record.get("review_status") == "approved" for record in effective_records),
 )
+if requires_effective_scan:
+    st.caption(
+        f"Los filtros se aplicaron al valor vigente de {scanned_page.scanned_records} "
+        "fichas en lotes controlados; las correcciones humanas no requieren "
+        "reindexación."
+    )
+    if scanned_page.truncated:
+        st.warning(
+            "El diagnóstico alcanzó el límite de seguridad de 100.000 fichas. "
+            "Acota por año antes de continuar."
+        )
 
 if not effective_records:
     st.info("No hay fichas que coincidan con los filtros.")
@@ -157,8 +297,8 @@ if not effective_records:
 
 
 def record_label(record: dict) -> str:
-    product = record.get("product_name") or "Producto sin extraer"
-    numeral = record.get("numeral") or "sin numeral"
+    product = display_value(record.get("product_name"))
+    numeral = display_value(record.get("numeral"))
     return (
         f"{record.get('year') or 's/a'} · Acta {record.get('acta_number') or '?'} "
         f"· {numeral} · {product}"
@@ -171,10 +311,16 @@ selection_signature = (
     tuple(outcomes),
     tuple(request_types),
     missing_label,
+    tuple(selected_status_labels),
+    tuple(selected_provenance_labels),
+    confidence_minimum,
     int(page_number_filter),
+    requested_uid,
 )
 if st.session_state.get("review_selection_signature") != selection_signature:
     st.session_state["review_selection_signature"] = selection_signature
+    st.session_state["review_record_index"] = 0
+elif int(st.session_state.get("review_record_index", 0) or 0) >= len(effective_records):
     st.session_state["review_record_index"] = 0
 selected_index = st.selectbox(
     "Ficha a revisar",
@@ -192,22 +338,16 @@ with source_col:
         f"Páginas {record.get('page_number')}–{record.get('end_page_number')} · "
         f"ID {record.get('decision_uid')}"
     )
-    st.link_button(
-        "Abrir fuente en la página",
-        pdf_page_url(
-            str(record.get("url") or ""),
-            int(record.get("page_number") or 1),
-            ALLOWED_DOCUMENT_HOSTS,
-        ),
+    source_url = pdf_page_url(
+        str(record.get("url") or ""),
+        int(record.get("page_number") or 1),
+        ALLOWED_DOCUMENT_HOSTS,
     )
+    if source_url:
+        st.link_button("Abrir fuente en la página", source_url)
+    else:
+        st.warning("La URL de esta ficha no pertenece a una fuente permitida.")
 with status_col:
-    status_labels = {
-        "automatic": "Automática",
-        "reviewed": "Revisada",
-        "approved": "Aprobada",
-        "reopened": "Reabierta",
-        "stale": "Revisión desactualizada",
-    }
     st.metric("Estado", status_labels.get(str(record.get("review_status")), "Automática"))
     if record.get("reviewer"):
         st.caption(
@@ -217,6 +357,12 @@ with status_col:
         st.warning(
             "El PDF o la extracción cambió desde esta revisión. Verifica "
             "nuevamente antes de aprobar."
+        )
+    elif record.get("review_needs_reconfirmation"):
+        st.warning(
+            "La extracción cambió, pero el PDF y el ID estable coinciden. Las "
+            "correcciones se conservaron; reconfirma la ficha antes de darla "
+            "por definitivamente validada."
         )
 
 with st.expander("Valores automáticos de referencia", expanded=False):
@@ -240,18 +386,79 @@ with st.expander("Valores automáticos de referencia", expanded=False):
         "page_number": "Página inicial",
         "end_page_number": "Página final",
     }
-    st.dataframe(
-        [
+    reference_rows = []
+    for field in REVIEW_FIELDS:
+        meta = field_metadata(record, field)
+        confidence = meta.get("confidence")
+        reference_rows.append(
             {
                 "Campo": field_labels.get(field, field),
-                "Valor automático": automatic.get(field),
-                "Valor vigente": record.get(field),
+                "Valor automático": display_value(automatic.get(field)),
+                "Valor vigente": display_value(record.get(field)),
+                "Procedencia": provenance_label(meta.get("provenance")),
+                "Confianza": (
+                    f"{float(confidence):.0%}"
+                    if confidence is not None
+                    else "No disponible"
+                ),
             }
-            for field in REVIEW_FIELDS
-        ],
+        )
+    st.dataframe(
+        reference_rows,
         hide_index=True,
         use_container_width=True,
     )
+    evidence_labels = {
+        **field_labels,
+        "titulo_numeral": "Título del numeral",
+        "fecha_sesion": "Fecha de sesión",
+        "fecha_sesion_original": "Fecha de sesión (literal original)",
+        "tipo_solicitud": "Tipo de solicitud",
+        "producto": "Producto",
+        "principio_activo": "Principio activo",
+        "interesado": "Interesado",
+        "solicitud": "Solicitud",
+        "concepto": "Concepto",
+        "resultado_normalizado": "Resultado normalizado",
+        "rango_paginas": "Rango de páginas",
+    }
+    evidence_rows = []
+    seen_evidence: set[tuple] = set()
+    for detail in field_evidence_details(record):
+        source_field = str(detail.get("source_field") or detail.get("field"))
+        evidence_key = (
+            source_field,
+            detail.get("ordinal"),
+            detail.get("literal_value"),
+            detail.get("page"),
+            detail.get("end_page"),
+            detail.get("method"),
+        )
+        if evidence_key in seen_evidence:
+            continue
+        seen_evidence.add(evidence_key)
+        start = detail.get("page")
+        end = detail.get("end_page") or start
+        page_range = start if start == end or end is None else f"{start}–{end}"
+        evidence_rows.append(
+            {
+                "Campo": evidence_labels.get(source_field, source_field),
+                "Valor literal": display_value(detail.get("literal_value")),
+                "Normalizado": display_value(detail.get("normalized_value")),
+                "Canónico": display_value(detail.get("canonical_value")),
+                "Página(s)": display_value(page_range),
+                "Método": display_value(detail.get("method")),
+                "Confianza": (
+                    f"{float(detail['confidence']):.0%}"
+                    if detail.get("confidence") is not None
+                    else "No disponible"
+                ),
+                "Evidencia": display_value(detail.get("fragment")),
+            }
+        )
+    if evidence_rows:
+        st.markdown("**Evidencia de extracción por campo**")
+        st.dataframe(evidence_rows, hide_index=True, use_container_width=True)
 
 with st.form(f"review_{record.get('decision_uid')}"):
     field_col1, field_col2 = st.columns(2)

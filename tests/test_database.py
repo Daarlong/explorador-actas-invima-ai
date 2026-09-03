@@ -1,25 +1,34 @@
 import tempfile
 import unittest
 import sqlite3
+import zlib
 from pathlib import Path
+from unittest.mock import patch
 
 from services.database import (
     DATABASE_SCHEMA_VERSION,
+    _regulatory_record_key,
     connect,
     count_regulatory_records,
     database_schema_version,
     database_stats,
+    extraction_uid_reconciliation,
     get_filter_options,
     initialize_database,
     insert_document,
+    list_regulatory_records,
     migrate_database_schema,
     optimize_database,
     regulatory_records_for_chunks,
+    reconcile_database_decision_uids,
     search_chunks,
+    source_pages_for_document,
     sync_regulatory_extractions,
     table_exists,
 )
 from services.models import DocumentMetadata
+from services.regulatory import FieldEvidence, RegulatoryRecord
+from services.reviews import new_review_event
 
 
 class DatabaseTests(unittest.TestCase):
@@ -77,6 +86,699 @@ class DatabaseTests(unittest.TestCase):
         optimize_database(self.database_path)
         self.assertEqual(len(search_chunks(self.database_path, "semaglutida")), 1)
 
+    def test_preserves_original_page_text_and_source_metadata(self) -> None:
+        source_pages = source_pages_for_document(self.database_path, 1)
+
+        self.assertEqual(
+            source_pages[0]["text"],
+            "La comisión evaluó semaglutida para el trámite.",
+        )
+        self.assertEqual(source_pages[0]["text_source"], "native_pdf")
+        with connect(self.database_path) as connection:
+            row = connection.execute(
+                """
+                SELECT raw_text_compressed, raw_text_codec, text_source,
+                       text_extractor_version
+                FROM pages WHERE document_id = 1
+                """
+            ).fetchone()
+        self.assertIsInstance(row["raw_text_compressed"], bytes)
+        self.assertEqual(row["raw_text_codec"], "zlib-utf8-v1")
+        self.assertEqual(row["text_source"], "native_pdf")
+        self.assertTrue(row["text_extractor_version"])
+
+    def test_source_text_keeps_line_breaks_and_ocr_metadata(self) -> None:
+        insert_document(
+            self.database_path,
+            DocumentMetadata(
+                title="Acta OCR",
+                url="https://www.invima.gov.co/biblioteca/download/ocr",
+            ),
+            "hash-ocr",
+            [
+                {
+                    "page": 1,
+                    "text": "Producto: ALFA\nPrincipio activo: Semaglutida",
+                    "chunks": ["Producto: ALFA Principio activo: Semaglutida"],
+                    "ocr_used": True,
+                    "text_quality": 0.82,
+                    "extraction_error": "rotación corregida",
+                    "text_extractor_version": "ocr-v2",
+                }
+            ],
+        )
+
+        pages = source_pages_for_document(self.database_path, 2)
+
+        self.assertEqual(
+            pages[0]["text"],
+            "Producto: ALFA\nPrincipio activo: Semaglutida",
+        )
+        self.assertEqual(pages[0]["text_source"], "ocr")
+        self.assertEqual(pages[0]["text_quality"], 0.82)
+        self.assertEqual(pages[0]["extraction_error"], "rotación corregida")
+        self.assertEqual(pages[0]["text_extractor_version"], "ocr-v2")
+
+    def test_persists_failed_page_inventory_without_fabricating_text(self) -> None:
+        document_id = insert_document(
+            self.database_path,
+            DocumentMetadata(
+                title="Acta con página no legible",
+                url="https://www.invima.gov.co/biblioteca/download/fallo",
+            ),
+            "hash-fallo",
+            [
+                {
+                    "page": 1,
+                    "text": None,
+                    "chunks": [],
+                    "text_source": None,
+                    "text_quality": 0.0,
+                    "extraction_error": "OCR falló: tiempo agotado",
+                    "text_extractor_version": "pymupdf-text-v1+tesseract-ocr-v1",
+                }
+            ],
+            pdf_page_count=1,
+            possible_scans=[1],
+        )
+
+        with connect(self.database_path) as connection:
+            row = connection.execute(
+                """
+                SELECT raw_text_compressed, raw_text_codec, text_source,
+                       text_quality, extraction_error, text_extractor_version
+                FROM pages WHERE document_id = ?
+                """,
+                (document_id,),
+            ).fetchone()
+
+        self.assertIsNone(row["raw_text_compressed"])
+        self.assertIsNone(row["raw_text_codec"])
+        self.assertIsNone(row["text_source"])
+        self.assertEqual(row["text_quality"], 0.0)
+        self.assertIn("tiempo agotado", row["extraction_error"])
+        self.assertIn("tesseract-ocr-v1", row["text_extractor_version"])
+        self.assertEqual(source_pages_for_document(self.database_path, document_id), [])
+
+    def test_regulatory_backfill_prefers_source_text_over_chunks(self) -> None:
+        original = "Producto: ALFA\nPrincipio activo: Semaglutida"
+        with connect(self.database_path) as connection:
+            connection.execute(
+                "UPDATE pages SET raw_text_compressed = ?, raw_text_codec = ?",
+                (zlib.compress(original.encode("utf-8")), "zlib-utf8-v1"),
+            )
+        with patch(
+            "services.database.extract_regulatory_records", return_value=[]
+        ) as extractor:
+            summary = sync_regulatory_extractions(self.database_path)
+
+        self.assertEqual(summary["documents_processed"], 1)
+        self.assertEqual(extractor.call_args.args[0][0]["text"], original)
+        with connect(self.database_path) as connection:
+            method = connection.execute(
+                "SELECT extractor_version, status FROM document_extractions"
+            ).fetchone()
+        self.assertEqual(tuple(method), ("4", "complete"))
+
+    def test_corrupt_source_text_degrades_to_legacy_chunks(self) -> None:
+        with connect(self.database_path) as connection:
+            connection.execute(
+                "UPDATE pages SET raw_text_compressed = X'0102', "
+                "raw_text_codec = 'zlib-utf8-v1'"
+            )
+        with patch(
+            "services.database.extract_regulatory_records", return_value=[]
+        ) as extractor:
+            summary = sync_regulatory_extractions(self.database_path)
+
+        self.assertEqual(summary["documents_failed"], 0)
+        self.assertEqual(
+            extractor.call_args.args[0][0]["text"],
+            "La comisión evaluó semaglutida para el trámite.",
+        )
+
+    def test_stores_field_evidence_and_reconciles_uid_by_expediente(self) -> None:
+        initial = RegulatoryRecord(
+            producto=None,
+            principio_activo=None,
+            interesado=None,
+            expediente="EXP-2018-01",
+            radicado=None,
+            solicitud="Solicitud inicial",
+            concepto="La Sala requiere información.",
+            resultado_normalizado="requerido",
+            pagina=7,
+        )
+        enhanced = RegulatoryRecord(
+            producto="OZEMPIC",
+            principio_activo="Semaglutida",
+            interesado=None,
+            expediente="EXP-2018-01",
+            radicado=None,
+            solicitud="Solicitud inicial ajustada",
+            concepto="La Sala requiere información adicional.",
+            resultado_normalizado="requerido",
+            pagina=7,
+            numeral="3.1.2",
+            principios_activos=("Semaglutida",),
+            principios_activos_normalizados=("semaglutida",),
+            principios_activos_canonicos=("Semaglutida",),
+            evidencias_campos=(
+                FieldEvidence(
+                    campo="principio_activo",
+                    valor_literal="Semaglutida",
+                    valor_normalizado="semaglutida",
+                    valor_canonico="Semaglutida",
+                    pagina=7,
+                    pagina_final=7,
+                    fragmento="Principio activo: Semaglutida",
+                    metodo="etiqueta_explicita",
+                    confianza=0.99,
+                ),
+            ),
+        )
+        with patch(
+            "services.database.extract_regulatory_records", return_value=[initial]
+        ):
+            sync_regulatory_extractions(self.database_path, extractor_version="3-test")
+        with connect(self.database_path) as connection:
+            original_uid = connection.execute(
+                "SELECT decision_uid FROM regulatory_records"
+            ).fetchone()[0]
+
+        with patch(
+            "services.database.extract_regulatory_records", return_value=[enhanced]
+        ):
+            summary = sync_regulatory_extractions(
+                self.database_path, extractor_version="4-test"
+            )
+
+        with connect(self.database_path) as connection:
+            record = connection.execute(
+                "SELECT decision_uid, identity_strategy FROM regulatory_records"
+            ).fetchone()
+            evidence = connection.execute(
+                """
+                SELECT field_name, literal_value, normalized_value,
+                       canonical_value, page_number, extraction_method, confidence
+                FROM regulatory_field_evidence
+                """
+            ).fetchone()
+        self.assertEqual(record["decision_uid"], original_uid)
+        self.assertEqual(record["identity_strategy"], "reconciled_v6")
+        self.assertEqual(summary["uids_reconciled"], 1)
+        self.assertEqual(summary["uids_orphaned"], 0)
+        self.assertEqual(
+            tuple(evidence)[:6],
+            (
+                "principio_activo",
+                "Semaglutida",
+                "semaglutida",
+                "Semaglutida",
+                7,
+                "etiqueta_explicita",
+            ),
+        )
+        self.assertAlmostEqual(evidence["confidence"], 0.99)
+        self.assertEqual(
+            extraction_uid_reconciliation(summary),
+            {
+                "uids_reconciled": 1,
+                "uids_generated": 0,
+                "uids_ambiguous": 0,
+                "uids_orphaned": 0,
+            },
+        )
+
+    def test_record_key_ignores_v4_evidence_only_changes(self) -> None:
+        base = RegulatoryRecord(
+            producto="OZEMPIC",
+            principio_activo="Semaglutida",
+            interesado="Ejemplo",
+            expediente="EXP-1",
+            radicado="RAD-1",
+            solicitud="Solicitud",
+            concepto="Concepto",
+            resultado_normalizado="aprobado",
+            pagina=7,
+        )
+        enriched = RegulatoryRecord(
+            **{
+                **{
+                    field: getattr(base, field)
+                    for field in (
+                        "producto",
+                        "principio_activo",
+                        "interesado",
+                        "expediente",
+                        "radicado",
+                        "solicitud",
+                        "concepto",
+                        "resultado_normalizado",
+                        "pagina",
+                    )
+                },
+                "principios_activos": ("Semaglutida",),
+                "principios_activos_normalizados": ("semaglutida",),
+                "principios_activos_canonicos": ("Semaglutida",),
+                "evidencias_campos": (
+                    FieldEvidence(
+                        campo="principio_activo",
+                        valor_literal="Semaglutida",
+                        valor_normalizado="semaglutida",
+                        valor_canonico="Semaglutida",
+                        pagina=7,
+                        pagina_final=7,
+                        fragmento="Principio activo: Semaglutida",
+                        metodo="etiqueta_explicita",
+                        confianza=0.99,
+                    ),
+                ),
+            }
+        )
+
+        self.assertEqual(
+            _regulatory_record_key(base), _regulatory_record_key(enriched)
+        )
+
+    def test_reconciles_rebuilt_database_and_preserves_review_uid(self) -> None:
+        baseline_path = Path(self.temp_dir.name) / "baseline.db"
+        candidate_path = Path(self.temp_dir.name) / "candidate.db"
+        catalog_id = "2018-sempb-01-completa"
+
+        baseline_records = [
+            RegulatoryRecord(
+                producto=None,
+                principio_activo=None,
+                interesado="Novo Nordisk Colombia S.A.S",
+                expediente="EXP-100",
+                radicado=None,
+                solicitud="Solicitud histórica",
+                concepto="La Sala requiere información.",
+                resultado_normalizado="requerido",
+                pagina=7,
+            ),
+            RegulatoryRecord(
+                producto="BETA",
+                principio_activo="Activo B",
+                interesado=None,
+                expediente="EXP-200",
+                radicado="RAD-200",
+                solicitud="Solicitud B",
+                concepto="La Sala aprueba.",
+                resultado_normalizado="aprobado",
+                pagina=8,
+            ),
+            RegulatoryRecord(
+                producto="RETIRADO",
+                principio_activo=None,
+                interesado=None,
+                expediente="EXP-300",
+                radicado="RAD-300",
+                solicitud="Solicitud C",
+                concepto="La Sala archiva.",
+                resultado_normalizado="archivado",
+                pagina=9,
+            ),
+        ]
+        candidate_records = [
+            RegulatoryRecord(
+                producto="OZEMPIC",
+                principio_activo="Semaglutida",
+                interesado="Novo Nordisk Colombia S.A.S",
+                expediente="EXP-100",
+                radicado=None,
+                solicitud="Solicitud histórica ajustada",
+                concepto="La Sala requiere información adicional.",
+                resultado_normalizado="requerido",
+                pagina=7,
+                numeral="3.1.2",
+            ),
+            baseline_records[1],
+            RegulatoryRecord(
+                producto="NUEVO",
+                principio_activo="Activo D",
+                interesado=None,
+                expediente="EXP-400",
+                radicado="RAD-400",
+                solicitud="Solicitud D",
+                concepto="La Sala aprueba.",
+                resultado_normalizado="aprobado",
+                pagina=10,
+            ),
+        ]
+
+        def build_database(
+            path: Path, url: str, records: list[RegulatoryRecord]
+        ) -> None:
+            initialize_database(path)
+            insert_document(
+                path,
+                DocumentMetadata(
+                    title="Acta No 01 de 2018 SEMPB",
+                    url=url,
+                    year=2018,
+                    acta_number="01",
+                    section="SEMPB",
+                    catalog_id=catalog_id,
+                ),
+                "same-pdf-hash",
+                [
+                    {
+                        "page": page,
+                        "text": f"Texto fuente página {page}",
+                        "chunks": [f"Texto fuente página {page}"],
+                    }
+                    for page in range(7, 11)
+                ],
+                pdf_page_count=10,
+            )
+            with patch(
+                "services.database.extract_regulatory_records",
+                return_value=records,
+            ):
+                sync_regulatory_extractions(path, extractor_version="fixture")
+
+        build_database(
+            baseline_path,
+            "https://www.invima.gov.co/biblioteca/download/old",
+            baseline_records,
+        )
+        build_database(
+            candidate_path,
+            "https://www.invima.gov.co/biblioteca/download/new",
+            candidate_records,
+        )
+        with connect(baseline_path) as connection:
+            reviewed = dict(
+                connection.execute(
+                    """
+                    SELECT r.decision_uid, r.record_key, r.page_number,
+                           r.end_page_number, d.document_hash, d.pdf_page_count
+                    FROM regulatory_records r
+                    JOIN documents d ON d.id = r.document_id
+                    WHERE r.normalized_expediente = 'exp100'
+                    """
+                ).fetchone()
+            )
+        review = new_review_event(
+            reviewed,
+            status="reviewed",
+            reviewer="Prueba",
+            notes="Corrección verificada",
+            corrections={"active_ingredient": "Semaglutida"},
+        )
+
+        report = reconcile_database_decision_uids(
+            baseline_path, candidate_path
+        )
+
+        with connect(candidate_path) as connection:
+            candidate_uid = connection.execute(
+                "SELECT decision_uid FROM regulatory_records "
+                "WHERE normalized_expediente = 'exp100'"
+            ).fetchone()[0]
+        self.assertEqual(report["exact"], 1)
+        self.assertEqual(report["reconciled"], 1)
+        self.assertEqual(report["generated"], 1)
+        self.assertEqual(report["orphaned"], 1)
+        self.assertEqual(report["ambiguous"], 0)
+        self.assertEqual(candidate_uid, review.decision_uid)
+        self.assertEqual(report["uid_map"][review.decision_uid], review.decision_uid)
+        self.assertTrue(report["record_key_map"][review.decision_uid]["changed"])
+
+    def test_rebuilt_database_does_not_guess_ambiguous_record_uid(self) -> None:
+        baseline_path = Path(self.temp_dir.name) / "ambiguous-baseline.db"
+        candidate_path = Path(self.temp_dir.name) / "ambiguous-candidate.db"
+
+        def prepare(path: Path, records: list[RegulatoryRecord]) -> None:
+            initialize_database(path)
+            insert_document(
+                path,
+                DocumentMetadata(
+                    title="Acta No 02 de 2019 SEMPB",
+                    url="https://www.invima.gov.co/biblioteca/download/ambiguous",
+                    catalog_id="2019-sempb-02-completa",
+                ),
+                "hash",
+                [
+                    {
+                        "page": 1,
+                        "text": "Texto",
+                        "chunks": ["Texto"],
+                    }
+                ],
+            )
+            with patch(
+                "services.database.extract_regulatory_records",
+                return_value=records,
+            ):
+                sync_regulatory_extractions(path, extractor_version="fixture")
+
+        prepare(
+            baseline_path,
+            [
+                RegulatoryRecord(
+                    producto="A",
+                    principio_activo=None,
+                    interesado=None,
+                    expediente="EXP-DUP",
+                    radicado=None,
+                    solicitud="Primera",
+                    concepto="Concepto uno",
+                    resultado_normalizado="sin_clasificar",
+                    pagina=3,
+                ),
+                RegulatoryRecord(
+                    producto="B",
+                    principio_activo=None,
+                    interesado=None,
+                    expediente="EXP-DUP",
+                    radicado=None,
+                    solicitud="Segunda",
+                    concepto="Concepto dos",
+                    resultado_normalizado="sin_clasificar",
+                    pagina=4,
+                ),
+            ],
+        )
+        prepare(
+            candidate_path,
+            [
+                RegulatoryRecord(
+                    producto="C",
+                    principio_activo=None,
+                    interesado=None,
+                    expediente="EXP-DUP",
+                    radicado=None,
+                    solicitud="Distinta",
+                    concepto="Sin correspondencia inequívoca",
+                    resultado_normalizado="sin_clasificar",
+                    pagina=9,
+                )
+            ],
+        )
+
+        report = reconcile_database_decision_uids(
+            baseline_path, candidate_path
+        )
+
+        self.assertEqual(report["exact"], 0)
+        self.assertEqual(report["reconciled"], 0)
+        self.assertEqual(report["generated"], 0)
+        self.assertEqual(report["ambiguous"], 1)
+        self.assertEqual(report["orphaned"], 2)
+        self.assertEqual(report["uid_map"], {})
+        self.assertEqual(len(report["ambiguous_examples"]), 1)
+        self.assertEqual(
+            report["ambiguous_examples"][0]["expediente"], "expdup"
+        )
+
+    def test_reconciliation_matches_document_by_unique_pdf_hash(self) -> None:
+        baseline_path = Path(self.temp_dir.name) / "hash-baseline.db"
+        candidate_path = Path(self.temp_dir.name) / "hash-candidate.db"
+        record = RegulatoryRecord(
+            producto="OZEMPIC",
+            principio_activo="Semaglutida",
+            interesado="Novo Nordisk",
+            expediente="EXP-HASH",
+            radicado="RAD-HASH",
+            solicitud="Evaluación farmacológica",
+            concepto="La Sala aprueba.",
+            resultado_normalizado="aprobado",
+            pagina=5,
+        )
+
+        def prepare(
+            path: Path,
+            *,
+            title: str,
+            url: str,
+            catalog_id: str,
+            year: int,
+            acta_number: str,
+        ) -> str:
+            initialize_database(path)
+            insert_document(
+                path,
+                DocumentMetadata(
+                    title=title,
+                    url=url,
+                    year=year,
+                    acta_number=acta_number,
+                    section="SEMPB",
+                    catalog_id=catalog_id,
+                ),
+                "same-unique-pdf-hash",
+                [{"page": 5, "text": "Texto", "chunks": ["Texto"]}],
+            )
+            with patch(
+                "services.database.extract_regulatory_records",
+                return_value=[record],
+            ):
+                sync_regulatory_extractions(path, extractor_version="fixture")
+            with connect(path) as connection:
+                return str(
+                    connection.execute(
+                        "SELECT decision_uid FROM regulatory_records"
+                    ).fetchone()[0]
+                )
+
+        baseline_uid = prepare(
+            baseline_path,
+            title="Acta antigua",
+            url="https://www.invima.gov.co/biblioteca/download/old-hash",
+            catalog_id="catalogo-antiguo",
+            year=2018,
+            acta_number="01",
+        )
+        candidate_uid_before = prepare(
+            candidate_path,
+            title="Acta corregida",
+            url="https://www.invima.gov.co/biblioteca/download/new-hash",
+            catalog_id="catalogo-nuevo",
+            year=2019,
+            acta_number="99",
+        )
+        self.assertNotEqual(candidate_uid_before, baseline_uid)
+
+        report = reconcile_database_decision_uids(
+            baseline_path, candidate_path
+        )
+
+        with connect(candidate_path) as connection:
+            candidate_uid_after = str(
+                connection.execute(
+                    "SELECT decision_uid FROM regulatory_records"
+                ).fetchone()[0]
+            )
+        self.assertEqual(report["documents_matched"], 1)
+        self.assertEqual(report["exact"], 1)
+        self.assertEqual(candidate_uid_after, baseline_uid)
+
+    def test_reconciliation_rotates_a_conflicting_candidate_uid(self) -> None:
+        baseline_path = Path(self.temp_dir.name) / "collision-baseline.db"
+        candidate_path = Path(self.temp_dir.name) / "collision-candidate.db"
+        shared = RegulatoryRecord(
+            producto="ALFA",
+            principio_activo=None,
+            interesado=None,
+            expediente="EXP-SHARED",
+            radicado=None,
+            solicitud="Solicitud original",
+            concepto="Concepto original",
+            resultado_normalizado="aprobado",
+            pagina=2,
+        )
+        changed = RegulatoryRecord(
+            producto="ALFA MEJORADO",
+            principio_activo="Activo A",
+            interesado=None,
+            expediente="EXP-SHARED",
+            radicado=None,
+            solicitud="Solicitud modificada",
+            concepto="Concepto modificado",
+            resultado_normalizado="aprobado",
+            pagina=2,
+        )
+        unrelated = RegulatoryRecord(
+            producto="NUEVO",
+            principio_activo=None,
+            interesado=None,
+            expediente="EXP-NEW",
+            radicado=None,
+            solicitud="Otra solicitud",
+            concepto="Otro concepto",
+            resultado_normalizado="sin_clasificar",
+            pagina=3,
+        )
+
+        def prepare(path: Path, records: list[RegulatoryRecord]) -> None:
+            initialize_database(path)
+            insert_document(
+                path,
+                DocumentMetadata(
+                    title="Acta No 03 de 2020 SEMPB",
+                    url="https://www.invima.gov.co/biblioteca/download/collision",
+                    catalog_id="2020-sempb-03-completa",
+                ),
+                "hash",
+                [
+                    {"page": 2, "text": "Texto 2", "chunks": ["Texto 2"]},
+                    {"page": 3, "text": "Texto 3", "chunks": ["Texto 3"]},
+                ],
+            )
+            with patch(
+                "services.database.extract_regulatory_records",
+                return_value=records,
+            ):
+                sync_regulatory_extractions(path, extractor_version="fixture")
+
+        prepare(baseline_path, [shared])
+        prepare(candidate_path, [changed, unrelated])
+        with connect(baseline_path) as connection:
+            protected_uid = connection.execute(
+                "SELECT decision_uid FROM regulatory_records"
+            ).fetchone()[0]
+        with connect(candidate_path) as connection:
+            matching_id = connection.execute(
+                "SELECT id FROM regulatory_records "
+                "WHERE normalized_expediente = 'expshared'"
+            ).fetchone()[0]
+            unrelated_id = connection.execute(
+                "SELECT id FROM regulatory_records "
+                "WHERE normalized_expediente = 'expnew'"
+            ).fetchone()[0]
+            connection.execute(
+                "UPDATE regulatory_records SET decision_uid = ? WHERE id = ?",
+                ("temporary-matching-uid", matching_id),
+            )
+            connection.execute(
+                "UPDATE regulatory_records SET decision_uid = ? WHERE id = ?",
+                (protected_uid, unrelated_id),
+            )
+
+        report = reconcile_database_decision_uids(
+            baseline_path, candidate_path
+        )
+
+        with connect(candidate_path) as connection:
+            rows = {
+                row["normalized_expediente"]: row["decision_uid"]
+                for row in connection.execute(
+                    "SELECT normalized_expediente, decision_uid "
+                    "FROM regulatory_records"
+                )
+            }
+            duplicate_count = connection.execute(
+                "SELECT COUNT(*) - COUNT(DISTINCT decision_uid) "
+                "FROM regulatory_records WHERE decision_uid != ''"
+            ).fetchone()[0]
+        self.assertEqual(rows["expshared"], protected_uid)
+        self.assertNotEqual(rows["expnew"], protected_uid)
+        self.assertEqual(duplicate_count, 0)
+        self.assertIn(protected_uid, report["candidate_uid_replacements"])
+
     def test_filters_are_applied(self) -> None:
         self.assertEqual(
             search_chunks(
@@ -93,6 +795,46 @@ class DatabaseTests(unittest.TestCase):
         options = get_filter_options(self.database_path)
         self.assertEqual(options["years"], [2026])
         self.assertEqual(options["sections"], ["SEMPB"])
+
+    def test_filter_options_include_current_human_only_categories(self) -> None:
+        extracted = RegulatoryRecord(
+            producto="Producto de prueba",
+            principio_activo="Semaglutida",
+            interesado="Titular",
+            expediente="EXP-FILTRO",
+            radicado="RAD-FILTRO",
+            solicitud="Solicitud",
+            concepto="La Sala requiere información.",
+            resultado_normalizado="requerido",
+            pagina=7,
+            tipo_solicitud="indicaciones",
+        )
+        with patch(
+            "services.database.extract_regulatory_records",
+            return_value=[extracted],
+        ):
+            sync_regulatory_extractions(self.database_path)
+        with connect(self.database_path) as connection:
+            connection.execute("UPDATE documents SET pdf_page_count = 7")
+        record = list_regulatory_records(self.database_path, limit=1)[0]
+        review = new_review_event(
+            record,
+            status="approved",
+            reviewer="Prueba",
+            notes="Categorías corregidas contra la fuente",
+            corrections={
+                "outcome_code": "archivado",
+                "request_type_code": "cancelacion",
+            },
+        )
+
+        automatic = get_filter_options(self.database_path)
+        effective = get_filter_options(self.database_path, review_events=[review])
+
+        self.assertNotIn("archivado", automatic["outcomes"])
+        self.assertNotIn("cancelacion", automatic["request_types"])
+        self.assertIn("archivado", effective["outcomes"])
+        self.assertIn("cancelacion", effective["request_types"])
 
     def test_adds_source_type_to_legacy_database(self) -> None:
         legacy_path = Path(self.temp_dir.name) / "legacy.db"
@@ -134,6 +876,28 @@ class DatabaseTests(unittest.TestCase):
         self.assertIn("end_page_number", record_columns)
         self.assertEqual(len(search_chunks(self.database_path, "semaglutida")), 1)
 
+    def test_accepts_v5_as_an_additive_migration_source(self) -> None:
+        with connect(self.database_path) as connection:
+            connection.execute("DROP TABLE regulatory_field_evidence")
+            connection.execute(
+                "UPDATE app_metadata SET value = '5' WHERE key = 'schema_version'"
+            )
+            before = {
+                table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in ("documents", "pages", "chunks", "chunks_fts")
+            }
+
+        self.assertTrue(migrate_database_schema(self.database_path))
+
+        with connect(self.database_path) as connection:
+            after = {
+                table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in before
+            }
+        self.assertEqual(before, after)
+        self.assertEqual(database_schema_version(self.database_path), 6)
+        self.assertTrue(table_exists(self.database_path, "regulatory_field_evidence"))
+
     def test_migrates_v3_records_to_page_ranges(self) -> None:
         with connect(self.database_path) as connection:
             columns = [
@@ -169,7 +933,7 @@ class DatabaseTests(unittest.TestCase):
             }
         self.assertIn("end_page_number", columns)
 
-    def test_migrates_v4_to_v5_without_changing_index_counts(self) -> None:
+    def test_migrates_v4_to_v6_without_changing_index_counts(self) -> None:
         legacy_path = Path(self.temp_dir.name) / "schema-v4.db"
         with sqlite3.connect(legacy_path) as connection:
             connection.executescript(
@@ -348,12 +1112,16 @@ class DatabaseTests(unittest.TestCase):
             document_columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(documents)")
             }
+            page_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(pages)")
+            }
             indexes = {
                 row[1]
                 for row in connection.execute("PRAGMA index_list(regulatory_records)")
             }
             record = connection.execute(
-                "SELECT record_key, product_name, active_ingredient, outcome_code "
+                "SELECT record_key, product_name, active_ingredient, outcome_code, "
+                "decision_uid, identity_strategy "
                 "FROM regulatory_records WHERE id = 1"
             ).fetchone()
         self.assertEqual(before, after)
@@ -362,9 +1130,46 @@ class DatabaseTests(unittest.TestCase):
         self.assertIn("request_type_code", record_columns)
         self.assertIn("catalog_id", document_columns)
         self.assertIn("publication_date", document_columns)
+        self.assertIn("raw_text_compressed", page_columns)
+        self.assertIn("text_source", page_columns)
+        self.assertTrue(table_exists(legacy_path, "regulatory_field_evidence"))
         self.assertIn("idx_records_decision_uid", indexes)
-        self.assertEqual(tuple(record), ("record-key-v4", "OZEMPIC", "Semaglutida", "aprobado"))
+        self.assertEqual(tuple(record)[:4], ("record-key-v4", "OZEMPIC", "Semaglutida", "aprobado"))
+        self.assertTrue(str(record[4]).startswith("dec_"))
+        self.assertEqual(record[5], "migration_generated_v6")
         self.assertEqual(len(search_chunks(legacy_path, "semaglutida")), 1)
+
+    def test_sync_repairs_blank_uid_even_when_extraction_is_current(self) -> None:
+        record = RegulatoryRecord(
+            producto="ALFA",
+            principio_activo="Semaglutida",
+            interesado=None,
+            expediente="EXP-UID",
+            radicado=None,
+            solicitud="Evaluación",
+            concepto="La Sala aprueba.",
+            resultado_normalizado="aprobado",
+            pagina=7,
+        )
+        with patch(
+            "services.database.extract_regulatory_records", return_value=[record]
+        ):
+            sync_regulatory_extractions(self.database_path)
+        with connect(self.database_path) as connection:
+            connection.execute("UPDATE regulatory_records SET decision_uid = ''")
+
+        with patch(
+            "services.database.extract_regulatory_records", return_value=[record]
+        ) as extractor:
+            summary = sync_regulatory_extractions(self.database_path)
+
+        with connect(self.database_path) as connection:
+            uid = connection.execute(
+                "SELECT decision_uid FROM regulatory_records"
+            ).fetchone()[0]
+        self.assertEqual(summary["documents_processed"], 1)
+        self.assertEqual(extractor.call_count, 1)
+        self.assertTrue(str(uid).startswith("dec_"))
 
     def test_regulatory_uid_is_stable_when_reextracted(self) -> None:
         insert_document(
@@ -510,6 +1315,60 @@ class DatabaseTests(unittest.TestCase):
             filters={"products": ["BETA"], "outcomes": ["negado"]},
         )
         self.assertEqual(len(beta), 1)
+
+    def test_missing_active_ingredient_filters_and_counts_the_complete_queue(self) -> None:
+        insert_document(
+            self.database_path,
+            DocumentMetadata(
+                title="Acta No 05 de 2026 SEMPB",
+                url="https://www.invima.gov.co/biblioteca/download/5",
+                year=2026,
+                acta_number="05",
+                section="SEMPB",
+            ),
+            "hash-5",
+            [
+                {
+                    "page": 30,
+                    "text": (
+                        "Producto: ALFA\nExpediente: 5001\n"
+                        "Solicitud: Renovación.\nConcepto: La Sala aprueba."
+                    ),
+                    "chunks": [
+                        "Producto: ALFA\nExpediente: 5001\n"
+                        "Solicitud: Renovación.\nConcepto: La Sala aprueba."
+                    ],
+                },
+                {
+                    "page": 31,
+                    "text": (
+                        "Producto: BETA\nPrincipio activo: Semaglutida\n"
+                        "Expediente: 5002\nSolicitud: Renovación.\n"
+                        "Concepto: La Sala aprueba."
+                    ),
+                    "chunks": [
+                        "Producto: BETA\nPrincipio activo: Semaglutida\n"
+                        "Expediente: 5002\nSolicitud: Renovación.\n"
+                        "Concepto: La Sala aprueba."
+                    ],
+                },
+            ],
+        )
+        sync_regulatory_extractions(self.database_path)
+
+        total = count_regulatory_records(
+            self.database_path, missing_field="active_ingredient"
+        )
+        records = list_regulatory_records(
+            self.database_path,
+            missing_field="active_ingredient",
+            limit=1,
+            offset=0,
+        )
+
+        self.assertEqual(total, 1)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["product_name"], "ALFA")
 
     def test_search_diversifies_fragments_before_grouping_documents(self) -> None:
         diverse_path = Path(self.temp_dir.name) / "diverse.db"

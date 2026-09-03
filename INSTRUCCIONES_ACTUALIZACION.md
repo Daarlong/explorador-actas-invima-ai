@@ -1,75 +1,135 @@
-# Actualización a la versión 0.6.0
+# Actualización a la versión 0.7.0
 
-Este paquete está preparado para actualizar un repositorio que ya contiene el
-catálogo y la base construida. Por seguridad, no incluye los archivos mutables:
+Esta actualización incorpora el extractor regulatorio v4 y el reprocesamiento
+seguro del histórico. El ZIP no contiene ni reemplaza los archivos mutables:
 
-- `actas_catalog.csv`
-- `documents_manifest.csv`
-- `data/actas.db.gz.part-*`
-- `data/actas.db.package.json`
-- `data/semantic.db.gz.part-*`
-- `data/semantic.db.package.json`
-- los informes actuales dentro de `data/`
-- `data/regulatory-review-log.csv`, si ya contiene revisiones humanas
+- `actas_catalog.csv`;
+- `documents_manifest.csv`;
+- `evaluation_cases.csv`;
+- las partes de `actas.db` y `semantic.db`;
+- los informes actuales de `data/`;
+- `data/regulatory-review-log.csv`.
 
-De esta forma, cargar la actualización no reemplaza la cobertura que ya obtuvo
-el workflow ni obliga a reconstruir toda la base.
+La aplicación puede abrir la base 0.6 después de subir el código. Sin embargo,
+las mejoras masivas de extracción solo quedarán activas en todo el histórico
+cuando termine el flujo de diagnóstico y publicación descrito abajo.
 
-## Instalación desde el navegador
+## 1. Subir el código
 
 1. Descomprime el ZIP.
 2. En el repositorio privado abre **Code → Add file → Upload files**.
 3. Abre la carpeta descomprimida y arrastra **su contenido**, no la carpeta
    exterior.
-4. Confirma que GitHub muestra también `.github/workflows`, `services`, `pages`
-   y `tests`.
+4. Confirma que GitHub muestra `.github/workflows`, `services`, `pages`,
+   `tests`, `reprocess_corpus.py` y `ALCANCE_V0.7.md`.
 5. Crea el commit en `main`.
 6. Espera a que **Actions → Pruebas** termine en verde.
-7. Ejecuta **Actions → Actualizar catálogo desde INVIMA → Run workflow** y
-   espera a que termine; esto crea la evidencia de la última consulta oficial.
-8. Si ese flujo no inició automáticamente otro llamado **Construir índice**,
-   ejecuta una vez **Actions → Construir índice → Run workflow**.
 
-Deja desmarcada la opción **Reconstruir todos los PDF** (`full_rebuild`). Si
-GitHub no muestra la casilla, el valor predeterminado ya es `false`: solo pulsa
-**Run workflow**. Esta ejecución reutiliza la base que ya construiste.
+No ejecutes una reconstrucción total desde **Construir índice**. En la 0.7 no
+hay casilla `full_rebuild`: el reprocesamiento histórico tiene su propio flujo
+y trabaja sobre una base candidata aislada.
 
-La primera ejecución con la versión 0.6.0 puede tardar más que una actualización
-normal porque realiza cuatro operaciones nuevas:
+## 2. Construir la candidata por lotes
 
-1. migra los esquemas anteriores al esquema 5 sobre una copia y verifica que no
-   cambien los documentos, páginas ni fragmentos;
-2. vuelve a extraer las fichas regulatorias desde el texto ya indexado para
-   incorporar numeral, fecha de sesión, tipo de solicitud e identidad estable;
-3. valida el índice y ejecuta el banco reproducible de consultas, si ya contiene
-   casos habilitados;
-4. actualiza y empaqueta `actas.db` y `semantic.db`.
+1. Abre **Actions → Reprocesar estructura y fichas**.
+2. Pulsa **Run workflow**.
+3. Elige:
+   - `mode`: `diagnostic`;
+   - `resume_run_id`: vacío en la primera ejecución;
+   - `max_batches`: deja `4` como opción segura.
+4. Pulsa el botón verde **Run workflow** y espera a que termine.
 
-No vuelve a descargar todos los PDF y no requiere `full_rebuild`. Al finalizar,
-la acción hará un commit automático con los paquetes de los índices y los
-informes. Espera a que la ejecución completa quede en verde.
+Cada lote procesa hasta 50 documentos. Con el valor predeterminado, una
+ejecución procesa como máximo 200 y guarda un punto de continuación. Esto evita
+perder varias horas de trabajo si GitHub interrumpe el runner.
 
-## Comprobación
+Si aparece el aviso **Reprocesamiento parcial**, repite el flujo así:
 
-1. Espera el redespliegue de Streamlit o reinicia la aplicación desde su panel.
-2. En **Inicio**, confirma que aparece `versión 0.6.0` y que la búsqueda
-   semántica figura como disponible.
-3. En **Explorador**, comprueba los modos Híbrida, Textual y Semántica local,
-   los resultados agrupados y el botón **Ver página**.
-4. Selecciona un fragmento y pulsa **Analizar seleccionadas** para comprobar la
-   integración con el Analista IA.
-5. Abre **Integridad** y revisa los registros regulatorios, el estado semántico
-   y la cobertura por año.
-6. Abre **Evaluación** para comprobar la cobertura por capas y descargar el
-   banco de consultas; los ejemplos iniciales están deshabilitados hasta que un
-   revisor defina la respuesta esperada.
-7. Selecciona al menos dos evidencias en el Explorador, pulsa **Comparar
-   seleccionadas** y prueba el CSV y el reporte imprimible.
-8. En **Revisión de fichas**, corrige una ficha de prueba. Descarga después
-   `regulatory-review-log.csv` y súbelo a `data/` si deseas conservarla tras un
-   reinicio de Streamlit.
-9. Si aparece algún documento fallido, no borres la base: quedará pendiente y
-   será reintentado automáticamente en la siguiente revisión.
+1. copia el número de la ejecución que acaba de terminar; es el número visible
+   en el título y también aparece en la URL después de `/runs/`;
+2. vuelve a pulsar **Run workflow**;
+3. conserva `mode = diagnostic` y `max_batches = 4`;
+4. pega ese número en `resume_run_id`.
 
-Mantén `LLM_PROVIDER = "prompt_only"` si todavía no existe una API corporativa
-aprobada. La búsqueda semántica local funciona igualmente en ese modo.
+En cada continuación se debe usar el número de la ejecución inmediatamente
+anterior. Repite hasta que se ejecuten en verde los pasos **Finalizar fichas**,
+**Reconciliar identidades**, **Empaquetar candidata** y **Restaurar paquetes**.
+También puedes usar `max_batches = 0` para intentar procesar todo en una sola
+ejecución, pero el valor `4` es más resistente a límites de tiempo.
+
+El modo `diagnostic`:
+
+- no modifica la base publicada;
+- conserva el texto fuente por página y aplica el extractor v4;
+- compara cobertura antes y después;
+- comprueba identidades y revisiones humanas;
+- restaura los paquetes y realiza una búsqueda de prueba;
+- deja los artefactos `reprocess-report-...` y `reprocess-checkpoint-...` en el
+  resumen de la ejecución.
+
+## 3. Completar el banco humano de publicación
+
+El diagnóstico puede terminar correctamente con un banco incompleto. La
+publicación, en cambio, exige criterios humanos reales para evitar aprobar el
+extractor solo porque llena más campos.
+
+En la página **Evaluación** de Streamlit:
+
+1. descarga la plantilla CSV;
+2. documenta al menos 15 consultas habilitadas y 30 referencias oficiales
+   esperadas distintas;
+3. incluye y verifica el caso `Semaglutida` de `acta:2017:14:SEMPB`;
+4. cambia `enabled` a `true` únicamente después de comprobar cada referencia;
+5. guarda el archivo como `evaluation_cases.csv`;
+6. súbelo a la raíz del repositorio y crea el commit.
+
+Las referencias admiten `acta:AÑO:NÚMERO:SALA`, `title:TÍTULO` o
+`url:ENLACE`. Se separan con `|` cuando una consulta tiene varias respuestas
+esperadas. No inventes referencias para alcanzar el mínimo: cada fila debe
+provenir de una comprobación humana del acta oficial.
+
+## 4. Publicar la candidata aprobada
+
+1. Abre otra vez **Actions → Reprocesar estructura y fichas → Run workflow**.
+2. Selecciona `mode = publish`.
+3. En `resume_run_id`, pega el número de la **última ejecución diagnóstica
+   completa**.
+4. Deja `max_batches = 4`; como la candidata ya está completa, no repetirá los
+   lotes.
+5. Ejecuta el workflow.
+
+La publicación se bloquea automáticamente si encuentra una regresión de
+cobertura, un paquete dañado, un banco inválido, una revisión huérfana o una
+identidad ambigua. Si todo pasa, GitHub hace un commit automático con las
+nuevas partes de las bases y los informes. El CSV de revisiones se comprueba
+por hash y nunca se sustituye como parte de esa publicación.
+
+Si el flujo falla, abre el artefacto `reprocess-report-...` y revisa
+`reprocess-report.json` y `evaluation-report.json`. Puedes corregir el banco o
+la revisión indicada y continuar usando el número de esa ejecución mientras el
+checkpoint siga disponible. Los checkpoints se conservan durante 7 días.
+
+## 5. Comprobar Streamlit
+
+1. Espera el redespliegue automático. Si después de unos minutos aún muestra la
+   base anterior, abre el panel de Streamlit y pulsa **Reboot app**.
+2. En **Inicio**, confirma `versión 0.7.0`.
+3. En **Integridad**, confirma esquema `6`, texto fuente disponible y cero
+   documentos pendientes.
+4. En **Explorador**, busca `Semaglutida`, abre la ficha de Ozempic y comprueba
+   la evidencia del principio activo en el PDF.
+5. Activa **Solo fichas sin principio activo** para revisar pendientes reales.
+6. En **Comparar**, construye una cronología y comprueba las etiquetas:
+   verificada, revisada, estructurada, inferida o mención textual.
+7. En **Revisión de fichas**, confirma que los vacíos aparecen como **No
+   extraído** y que una corrección se refleja también en filtros y exportación.
+
+Mantén `LLM_PROVIDER = "prompt_only"`. La versión 0.7 no añade ni necesita
+nuevas llamadas a IA.
+
+## Operación posterior
+
+Después de publicar la 0.7, el mantenimiento normal vuelve a ser automático:
+**Actualizar catálogo desde INVIMA** detecta publicaciones y dispara
+**Construir índice** solo cuando hay actas nuevas o pendientes. No es necesario
+repetir el reprocesamiento histórico para cada acta nueva.

@@ -9,7 +9,9 @@ from services.integrity import load_integrity_report
 
 st.set_page_config(page_title="Integridad del corpus", page_icon="✅", layout="wide")
 st.title("✅ Integridad del corpus")
-st.caption("Cobertura, consistencia del índice y páginas que podrían requerir OCR")
+st.caption(
+    "Cobertura, consistencia técnica y completitud de la extracción regulatoria"
+)
 
 report = load_integrity_report(INTEGRITY_REPORT_PATH)
 indexing_report = load_indexing_report(INDEXING_REPORT_PATH)
@@ -244,11 +246,111 @@ if quality:
     quality_col5.metric("Confianza baja", quality.get("low_confidence", 0))
     if quality.get("without_uid"):
         st.warning(
-            f"{quality['without_uid']} fichas aún no tienen identificador v0.6. "
-            "Ejecuta Construir índice sin full_rebuild para completar la migración."
+            f"{quality['without_uid']} fichas aún no tienen identificador estable. "
+            "Ejecuta el flujo Reprocesar estructura y fichas para corregirlas "
+            "sobre una base candidata."
         )
 else:
     st.info("La próxima construcción del índice generará las métricas de fichas.")
+
+quality_snapshot = report.get("regulatory_quality_snapshot") or {}
+field_rows = quality_snapshot.get("fields") or []
+if quality_snapshot.get("status") == "available" and field_rows:
+    st.markdown("#### Completitud automática por campo")
+    st.caption(
+        "Estas cifras miden si el extractor encontró un valor; no demuestran que "
+        "el valor sea correcto. La precisión requiere casos revisados por una persona."
+    )
+    st.dataframe(
+        [
+            {
+                "Campo": item.get("label"),
+                "Con valor": item.get("present", 0),
+                "Sin extraer": item.get("missing", 0),
+                "Cobertura": (
+                    f"{float(item['coverage_percent']):.1f} %"
+                    if item.get("coverage_percent") is not None
+                    else "No disponible en este esquema"
+                ),
+            }
+            for item in field_rows
+        ],
+        hide_index=True,
+        use_container_width=True,
+    )
+    core_col1, core_col2, core_col3 = st.columns(3)
+    core_col1.metric("Fichas medidas", quality_snapshot.get("records", 0))
+    core_col2.metric(
+        "Fichas con campos núcleo completos",
+        quality_snapshot.get("complete_core_records", 0),
+    )
+    core_percent = quality_snapshot.get("complete_core_percent")
+    core_col3.metric(
+        "Completitud conjunta",
+        f"{float(core_percent):.1f} %" if core_percent is not None else "N/D",
+    )
+
+    evidence = quality_snapshot.get("field_evidence") or {}
+    if evidence.get("available"):
+        st.markdown("#### Procedencia y confianza por campo")
+        ev_col1, ev_col2, ev_col3 = st.columns(3)
+        ev_col1.metric("Evidencias", evidence.get("rows", 0))
+        ev_col2.metric("Fichas con evidencia", evidence.get("records", 0))
+        evidence_coverage = evidence.get("record_coverage_percent")
+        ev_col3.metric(
+            "Fichas trazables",
+            f"{float(evidence_coverage):.1f} %"
+            if evidence_coverage is not None
+            else "N/D",
+        )
+        evidence_tabs = st.tabs(["Por campo", "Por método"])
+        with evidence_tabs[0]:
+            st.dataframe(
+                [
+                    {
+                        "Campo": item.get("field"),
+                        "Evidencias": item.get("evidence_rows", 0),
+                        "Fichas": item.get("records", 0),
+                        "Cobertura": (
+                            f"{float(item['record_coverage_percent']):.1f} %"
+                            if item.get("record_coverage_percent") is not None
+                            else "N/D"
+                        ),
+                        "Confianza media": (
+                            f"{float(item['average_confidence']):.1%}"
+                            if item.get("average_confidence") is not None
+                            else "N/D"
+                        ),
+                        "Confianza baja": item.get("low_confidence", 0),
+                    }
+                    for item in evidence.get("by_field") or []
+                ],
+                hide_index=True,
+                use_container_width=True,
+            )
+        with evidence_tabs[1]:
+            st.dataframe(
+                [
+                    {
+                        "Método": item.get("method"),
+                        "Origen": item.get("origin", "otro método"),
+                        "Evidencias": item.get("evidence_rows", 0),
+                        "Confianza media": (
+                            f"{float(item['average_confidence']):.1%}"
+                            if item.get("average_confidence") is not None
+                            else "N/D"
+                        ),
+                    }
+                    for item in evidence.get("by_method") or []
+                ],
+                hide_index=True,
+                use_container_width=True,
+            )
+    else:
+        st.info(
+            "La base actual es compatible, pero todavía no contiene evidencia y "
+            "confianza por campo. El reprocesamiento 0.7 completará esa trazabilidad."
+        )
 
 duplicate_hashes = report.get("duplicate_document_hashes") or []
 with st.expander(

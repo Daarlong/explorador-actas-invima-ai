@@ -9,12 +9,14 @@ import streamlit as st
 
 from config import ALLOWED_DOCUMENT_HOSTS, DATABASE_PATH, REVIEW_LOG_PATH
 from services.comparison import (
+    HUMAN_CORRECTION_WITHOUT_SOURCE_FRAGMENT,
     MAX_COMPARISON_ITEMS,
     MAX_SELECTED_SOURCES,
     MAX_TIMELINE_QUERY_CHARS,
     comparison_matrix,
     comparison_to_csv,
     load_selected_decisions,
+    match_origin_label,
     outcome_label,
     printable_html_report,
     request_type_label,
@@ -22,7 +24,8 @@ from services.comparison import (
     search_timeline,
     timeline_to_csv,
 )
-from services.database import database_stats
+from services.database import database_stats, get_filter_options
+from services.effective_records import display_value
 from services.reviews import parse_review_events
 from services.ui_helpers import pdf_page_url
 
@@ -60,6 +63,9 @@ def cached_timeline(
     field: str,
     value: str,
     limit: int,
+    years: tuple[int, ...],
+    origins: tuple[str, ...],
+    review_statuses: tuple[str, ...],
     review_payload: str,
     database_identity: tuple[int, int],
 ):
@@ -70,6 +76,9 @@ def cached_timeline(
         value,
         limit=limit,
         review_events=parse_review_events(review_payload),
+        years=years,
+        origins=origins,
+        review_statuses=review_statuses,
     )
 
 
@@ -110,7 +119,7 @@ try:
         if REVIEW_LOG_PATH.exists()
         else ""
     )
-    parse_review_events(review_payload)
+    review_events = parse_review_events(review_payload)
 except (OSError, UnicodeDecodeError, ValueError) as exc:
     st.error(
         "No se puede abrir la comparación de forma coherente porque falló el "
@@ -167,7 +176,7 @@ with st.sidebar:
     ):
         st.session_state["selected_evidence"] = {}
         for key in list(st.session_state):
-            if str(key).startswith("select_evidence_"):
+            if str(key).startswith(("select_evidence_", "select_reviewed_")):
                 del st.session_state[key]
         st.session_state.pop("comparison_selected_sources", None)
         st.rerun()
@@ -280,9 +289,9 @@ else:
 st.divider()
 st.subheader("Cronología de precedentes")
 st.write(
-    "Busca todas las fichas relacionadas con un producto, principio activo, "
-    "expediente o radicado. Se ordenan por fecha de sesión y, si falta, por "
-    "año y número de acta."
+    "Busca fichas estructuradas y, como respaldo, menciones en el texto completo. "
+    "Una mención textual se muestra con su fragmento, pero no se presenta como "
+    "producto o principio activo confirmado."
 )
 
 timeline_field_labels = {
@@ -322,6 +331,42 @@ timeline_limit = st.select_slider(
     value=100,
 )
 
+filter_options = get_filter_options(DATABASE_PATH, review_events=review_events)
+with st.expander("Filtros de la cronología", expanded=False):
+    filter_col1, filter_col2, filter_col3 = st.columns(3)
+    timeline_years = filter_col1.multiselect(
+        "Año",
+        options=filter_options.get("years", []),
+        help="Vacío incluye todos los años.",
+    )
+    origin_options = {
+        "Verificada/corregida": "verified",
+        "Revisada/corregida": "reviewed",
+        "Estructurada automática": "structured",
+        "Inferida automáticamente": "inferred",
+        "Mención textual": "textual",
+    }
+    selected_origin_labels = filter_col2.multiselect(
+        "Origen de la coincidencia",
+        options=list(origin_options),
+        help="Vacío incluye todas las procedencias.",
+    )
+    status_options = {
+        "Automática": "automatic",
+        "Revisada": "reviewed",
+        "Aprobada": "approved",
+        "Reabierta": "reopened",
+        "Revisión desactualizada": "stale",
+        "Sin ficha estructurada": "unstructured",
+    }
+    selected_status_labels = filter_col3.multiselect(
+        "Estado de revisión",
+        options=list(status_options),
+        help="Vacío incluye todos los estados.",
+    )
+timeline_origins = tuple(origin_options[label] for label in selected_origin_labels)
+timeline_statuses = tuple(status_options[label] for label in selected_status_labels)
+
 if st.button("Construir cronología", type="primary"):
     st.session_state.pop("comparison_timeline_request", None)
     try:
@@ -329,6 +374,9 @@ if st.button("Construir cronología", type="primary"):
             timeline_field,
             timeline_value.strip(),
             timeline_limit,
+            tuple(int(year) for year in timeline_years),
+            timeline_origins,
+            timeline_statuses,
             review_payload,
             _file_identity(DATABASE_PATH),
         )
@@ -337,6 +385,9 @@ if st.button("Construir cronología", type="primary"):
             "field_label": timeline_field_label,
             "value": timeline_value.strip(),
             "limit": timeline_limit,
+            "years": tuple(int(year) for year in timeline_years),
+            "origins": timeline_origins,
+            "review_statuses": timeline_statuses,
         }
     except (ValueError, sqlite3.Error) as exc:
         st.error(str(exc))
@@ -349,6 +400,9 @@ if timeline_request:
             timeline_request["field"],
             timeline_request["value"],
             int(timeline_request["limit"]),
+            tuple(int(year) for year in timeline_request.get("years", ())),
+            tuple(timeline_request.get("origins", ())),
+            tuple(timeline_request.get("review_statuses", ())),
             review_payload,
             _file_identity(DATABASE_PATH),
         )
@@ -357,7 +411,10 @@ if timeline_request:
         st.error(f"No fue posible construir la cronología: {exc}")
 
 if timeline_request and not timeline_results:
-    st.warning("No se encontraron fichas estructuradas para ese valor.")
+    st.warning(
+        "No se encontraron fichas estructuradas ni menciones textuales para ese "
+        "valor con los filtros seleccionados."
+    )
     render_comparison_report_download(selected_decisions)
 elif timeline_results:
     st.success(
@@ -366,18 +423,25 @@ elif timeline_results:
     )
     timeline_table = [
         {
-            "Año": item.year,
-            "Acta": item.acta_number,
+            "Año": display_value(item.year),
+            "Acta": display_value(item.acta_number),
             "Página": item.page_number,
-            "Fecha de sesión": item.session_date,
-            "Numeral": item.numeral,
-            "Producto": item.product_name,
-            "Principio activo": item.active_ingredient,
-            "Expediente": item.expediente,
-            "Radicado": item.radicado,
+            "Fecha de sesión": display_value(item.session_date),
+            "Numeral": display_value(item.numeral),
+            "Producto": display_value(item.product_name),
+            "Principio activo": display_value(item.active_ingredient),
+            "Expediente": display_value(item.expediente),
+            "Radicado": display_value(item.radicado),
             "Resultado": outcome_label(item.outcome_code),
             "Tipo de solicitud": request_type_label(item.request_type),
             "Estado de revisión": review_status_label(item.review_status),
+            "Origen de coincidencia": match_origin_label(item.match_origin),
+            "Confianza": (
+                round(item.confidence, 2)
+                if item.confidence is not None
+                else "No aplica"
+            ),
+            "Página de coincidencia": item.match_page,
         }
         for item in timeline_results
     ]
@@ -389,19 +453,86 @@ elif timeline_results:
     )
     for index, item in enumerate(timeline_results[:50], start=1):
         with st.expander(f"{index}. {item.label} · {outcome_label(item.outcome_code)}"):
-            if item.request_text:
-                st.markdown("**Solicitud**")
-                st.write(item.request_text)
-            if item.concept_text:
-                st.markdown("**Concepto**")
-                st.write(item.concept_text)
+            st.markdown(
+                f"**Origen de la coincidencia:** "
+                f"{match_origin_label(item.match_origin)}"
+            )
+            if item.match_origin == "textual":
+                st.warning(
+                    "Esta es una mención en el texto. No confirma por sí sola "
+                    f"que {timeline_request['value']} sea el "
+                    f"{timeline_request['field_label'].lower()} de la decisión."
+                )
+            elif item.match_origin == "inferred":
+                st.info(
+                    "Este valor fue inferido automáticamente a partir del contexto "
+                    "o de una asociación controlada. Confírmalo en la evidencia "
+                    "antes de tratarlo como verificado."
+                )
+            elif (
+                item.match_origin in {"verified", "reviewed"}
+                and not item.match_evidence
+                and not item.match_evidences
+            ):
+                st.warning(
+                    HUMAN_CORRECTION_WITHOUT_SOURCE_FRAGMENT
+                )
+            if item.match_evidence and not item.match_evidences:
+                st.markdown(
+                    f"**Evidencia de coincidencia · página "
+                    f"{item.match_page or item.page_number}**"
+                )
+                st.write(item.match_evidence)
+            if item.match_evidences:
+                st.markdown("**Evidencias textuales agrupadas**")
+                for evidence_index, evidence in enumerate(
+                    item.match_evidences,
+                    start=1,
+                ):
+                    st.caption(f"Página {evidence.page} · F{evidence.chunk_id}")
+                    st.write(evidence.text)
+                    mention_url = pdf_page_url(
+                        item.url,
+                        evidence.page,
+                        ALLOWED_DOCUMENT_HOSTS,
+                    )
+                    if mention_url:
+                        st.link_button(
+                            f"Abrir mención {index}.{evidence_index}",
+                            mention_url,
+                        )
+            st.markdown("**Solicitud**")
+            st.write(display_value(item.request_text))
+            st.markdown("**Concepto**")
+            st.write(display_value(item.concept_text))
             source_url = pdf_page_url(
                 item.url,
-                item.page_number,
+                item.match_page or item.page_number,
                 ALLOWED_DOCUMENT_HOSTS,
             )
             if source_url:
-                st.link_button(f"Abrir evidencia {index}", source_url)
+                st.link_button(
+                    f"Abrir evidencia {index}",
+                    source_url,
+                )
+            st.caption("Identificador para revisión")
+            st.code(item.review_identifier, language=None)
+            if item.decision_uid:
+                review_key = hashlib.sha256(
+                    item.review_identifier.encode("utf-8")
+                ).hexdigest()[:12]
+                if st.button(
+                    f"Revisar esta ficha · resultado {index}",
+                    key=f"timeline_review_{index}_{review_key}",
+                ):
+                    st.session_state["review_target_uid"] = item.decision_uid
+                    st.switch_page("pages/8_Revision_Fichas.py")
+            else:
+                st.info(
+                    "Esta mención todavía no está asociada a una ficha. Usa el "
+                    "fragmento y la página enlazada como evidencia; primero debe "
+                    "crearse o asociarse una ficha para poder revisarla."
+                )
     if len(timeline_results) > 50:
         st.caption("Se muestran 50 detalles; el CSV contiene toda la cronología.")
 

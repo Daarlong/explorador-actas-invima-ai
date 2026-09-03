@@ -65,15 +65,20 @@ aprobado.
 
 No contiene funcionalidades relacionadas con un monitor de transparencia.
 
-## Cambios visibles en la versión 0.6.0
+## Cambios visibles en la versión 0.7.0
 
 | Módulo | Mejora |
 |---|---|
-| Calidad | Auditoría de cobertura por capas y snapshot verificable de la página oficial |
-| Evaluación | Banco CSV reproducible y comparación textual/híbrida/semántica con métricas |
-| Fichas | Numeral, fecha de sesión, tipo de solicitud, identidad estable y revisión humana |
-| Comparación | Matriz lado a lado, cronologías, CSV y reporte HTML imprimible a PDF |
-| Índice | Migración aditiva al esquema 5 sin descargar nuevamente los PDF existentes |
+| Fuente | El esquema 6 inventaría cada página física; conserva el texto original o, si falla, el error, además del origen PDF/OCR, calidad y versión del extractor |
+| Extracción | Extractor regulatorio v4 para numerales históricos, composición, IFA, DCI, principio activo y combinaciones |
+| Evidencia | Cada campo automático muestra valor literal, normalizado y canónico, página, fragmento, método y confianza |
+| Correcciones | Un único valor vigente se aplica en filtros, búsqueda, fichas, comparación, cronología y exportaciones |
+| Cronología | Combina datos verificados, estructurados, inferidos y menciones textuales sin confundirlos |
+| Publicación | Una base candidata se diagnostica y valida; inventario, identidades, seis campos regulatorios, paquetes y banco humano pueden bloquear el reemplazo |
+
+La 0.7.0 no añade funciones de IA. Su objetivo es que el corpus histórico y
+las fichas que utilizará una versión posterior sean completos, trazables y
+reproducibles.
 
 `LLM_PROVIDER = "prompt_only"` puede mantenerse sin cambios. Ese ajuste solo
 controla la generación de respuestas; la búsqueda semántica de esta versión se
@@ -132,6 +137,8 @@ todo el histórico visible desde 2013; el año inicial se configura con
 │   ├── pdf_reader.py
 │   ├── pdf_viewer.py
 │   ├── regulatory.py
+│   ├── ingredients.py
+│   ├── effective_records.py
 │   ├── reviews.py
 │   ├── comparison.py
 │   ├── retrieval.py
@@ -144,6 +151,7 @@ todo el histórico visible desde 2013; el año inicial se configura con
 ├── build_index.py
 ├── check_index_pending.py
 ├── evaluate_search.py
+├── reprocess_corpus.py
 ├── evaluation_cases.csv
 ├── package_index.py
 ├── packages.txt
@@ -180,7 +188,9 @@ hacerse desde GitHub Actions:
    **Catálogo** e **Integridad** de la aplicación.
 
 El workflow **Construir índice** sigue disponible para una ejecución manual,
-pero ya no es necesario lanzarlo cada vez que aparece un acta nueva.
+pero ya no es necesario lanzarlo cada vez que aparece un acta nueva. Se usa
+para actualizaciones incrementales normales. La reconstrucción histórica de la
+0.7 se realiza con el workflow separado **Reprocesar estructura y fichas**.
 
 El flujo de construcción del índice:
 
@@ -213,14 +223,17 @@ horas y aumentar considerablemente el tamaño de la base. El workflow dispone de
 un máximo de seis horas, conserva los PDF descargados en caché y deja los
 documentos fallidos pendientes para reintentarlos sin perder los correctos.
 
-La primera ejecución de la versión 0.6.0 migra los esquemas anteriores al
-esquema 5 sobre una copia verificada de la base, completa los metadatos estables
-del catálogo y vuelve a extraer las fichas desde los fragmentos existentes. No
-vuelve a descargar los PDF ya indexados. Después, las ejecuciones
-normales son incrementales. Selecciona `full_rebuild` únicamente cuando necesites
-volver a procesar todos los documentos, por ejemplo para aplicar OCR
-retroactivamente. No lo selecciones para instalar esta actualización ni para
-incorporar publicaciones nuevas.
+La primera instalación de la 0.7 migra de forma compatible al esquema 6, pero
+el texto fuente histórico solo queda completo después del reprocesamiento
+controlado. Abre **Actions → Reprocesar estructura y fichas**: primero ejecuta
+el modo `diagnostic` y luego el modo `publish` cuando el banco humano y todos
+los controles estén aprobados. Ese flujo trabaja sobre una candidata separada,
+permite continuar una ejecución y nunca reemplaza la base publicada durante el
+diagnóstico. Después, las actualizaciones normales vuelven a ser incrementales.
+
+Ya no existe una casilla `full_rebuild` en el workflow normal. Esto evita que
+una reconstrucción total pueda iniciarse accidentalmente desde la acción
+destinada a incorporar actas nuevas.
 
 ## Configuración segura de IA
 
@@ -252,8 +265,11 @@ los usuarios podrían contener contexto corporativo.
 3. Crear una aplicación en Streamlit Community Cloud usando `home.py`.
 4. Configurar los secretos desde el panel de Streamlit, nunca en GitHub.
 5. Ejecutar **Actions → Actualizar catálogo desde INVIMA → Run workflow**.
-6. Ejecutar una vez **Actions → Construir índice → Run workflow**.
-7. Esperar el nuevo despliegue automático de Streamlit.
+6. Para una actualización normal, ejecutar una vez **Actions → Construir índice
+   → Run workflow**.
+7. Para habilitar íntegramente el extractor 0.7 sobre el histórico, seguir
+   `INSTRUCCIONES_ACTUALIZACION.md` y usar **Reprocesar estructura y fichas**.
+8. Esperar el nuevo despliegue automático de Streamlit.
 
 El sistema de archivos de una aplicación alojada no debe considerarse una base
 de datos permanente. Para el piloto, la acción versiona el índice comprimido y
@@ -294,8 +310,8 @@ intenta obtenerlos del título.
 
 La edición manual se reserva para corregir un enlace roto o registrar una copia
 histórica verificada. Después ejecuta `python sync_catalog.py --bootstrap-only`
-para trasladar el cambio al catálogo y luego **Construir índice** sin activar
-`full_rebuild`.
+para trasladar el cambio al catálogo y luego **Construir índice**. Esa acción
+incremental no muestra ni necesita una opción de reconstrucción total.
 
 ## Integridad y tamaño del índice
 
@@ -318,8 +334,9 @@ La página **Integridad** muestra:
 - estado de construcción del índice semántico local;
 - tamaño de la base compactada.
 
-El esquema compacto evita guardar el texto completo en páginas, fragmentos,
-texto normalizado y contenido FTS al mismo tiempo. El paquete
+El esquema 6 conserva una copia comprimida del texto fuente por página para
+permitir reextracciones auditables, además de los fragmentos necesarios para
+buscar. El paquete
 `data/actas.db.package.json` registra tamaño y SHA-256 de la base y de cada
 fragmento, y la aplicación los valida antes de usar el índice. El índice
 semántico se distribuye del mismo modo mediante
@@ -345,8 +362,9 @@ pueden descargar un CSV compatible con Excel y un reporte HTML que el navegador
 permite guardar como PDF.
 
 La página **Revisión de fichas** guarda eventos separados del índice automático:
-una reconstrucción no sobrescribe las correcciones, pero la aplicación marca
-una revisión como desactualizada si cambia el PDF o la extracción. En el piloto,
+una reconstrucción no sobrescribe las correcciones. Si cambia el PDF o el valor
+extraído que sustentaba una revisión, la aplicación exige reconfirmarla; una
+coincidencia huérfana o ambigua bloquea la publicación. En el piloto,
 el archivo escrito por Streamlit es temporal; tras revisar, descarga
 `regulatory-review-log.csv` y haz commit en `data/` para conservar el historial.
 Para producción se debe sustituir este mecanismo por una base persistente y SSO.
@@ -370,7 +388,7 @@ Antes de publicar una versión se debe comprobar:
 
 El flujo `.github/workflows/tests.yml` repite automáticamente la compilación y
 las pruebas con Python 3.12 después de cada cambio enviado a GitHub. La versión
-0.6.0 usa directamente la API `pymupdf`, sin depender del nombre heredado
+0.7.0 usa directamente la API `pymupdf`, sin depender del nombre heredado
 `fitz`, y Tesseract se instala dentro del runner de GitHub. La búsqueda
 semántica también es local y usa únicamente la biblioteca estándar de Python.
 No requiere instalar herramientas de desarrollo en el computador corporativo.

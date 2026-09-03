@@ -12,6 +12,7 @@ from services.database import (
     database_stats,
     is_current_schema,
     search_chunks,
+    source_pages_for_document,
     sync_regulatory_extractions,
 )
 from services.downloader import DownloadedPdf
@@ -22,9 +23,100 @@ from services.indexing import (
     update_index,
     write_indexing_report,
 )
+from services.integrity import build_integrity_report
 
 
 class IndexingTests(unittest.TestCase):
+    def test_rebuild_preserves_native_and_ocr_source_text(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = root / "manifest.csv"
+            database_path = root / "actas.db"
+            cache_path = root / "cache"
+            pdf_path = root / "sample.pdf"
+            pdf_path.write_bytes(b"%PDF-test")
+            url = "https://www.invima.gov.co/biblioteca/download/source"
+            manifest_path.write_text(
+                f"title,url\nActa No 01 de 2026 SEMPB,{url}\n",
+                encoding="utf-8",
+            )
+            extracted = (
+                [
+                    {
+                        "page": 1,
+                        "text": "Línea nativa 1\nLínea nativa 2",
+                        "ocr_used": False,
+                        "text_quality": 0.9,
+                    },
+                    {
+                        "page": 2,
+                        "text": "Línea OCR 1\nLínea OCR 2",
+                        "ocr_used": True,
+                        "text_quality": 0.75,
+                    },
+                    {
+                        "page": 3,
+                        "text": None,
+                        "ocr_used": False,
+                        "text_source": None,
+                        "text_quality": 0.0,
+                        "extraction_error": "OCR falló: tiempo agotado",
+                        "text_extractor_version": (
+                            "pymupdf-text-v1+tesseract-ocr-v1"
+                        ),
+                    },
+                ],
+                [3],
+            )
+            with patch(
+                "services.indexing.download_pdf_resource",
+                return_value=DownloadedPdf(pdf_path, url),
+            ), patch(
+                "services.indexing.extract_pdf_pages", return_value=extracted
+            ):
+                report = rebuild_index(
+                    manifest_path, database_path, cache_path
+                )
+
+            with connect(database_path) as connection:
+                document_id = connection.execute("SELECT id FROM documents").fetchone()[0]
+                stored_document = connection.execute(
+                    """
+                    SELECT pdf_page_count, indexed_page_count,
+                           page_inventory_complete
+                    FROM documents WHERE id = ?
+                    """,
+                    (document_id,),
+                ).fetchone()
+                stored_pages = connection.execute(
+                    """
+                    SELECT page_number, raw_text_compressed, extraction_error
+                    FROM pages WHERE document_id = ? ORDER BY page_number
+                    """,
+                    (document_id,),
+                ).fetchall()
+            pages = source_pages_for_document(database_path, document_id)
+            integrity = build_integrity_report(
+                database_path,
+                manifest_path,
+                ("www.invima.gov.co",),
+            )
+
+        self.assertEqual(report.pages_indexed, 2)
+        self.assertEqual(report.ocr_pages_indexed, 1)
+        self.assertEqual(pages[0]["text"], "Línea nativa 1\nLínea nativa 2")
+        self.assertEqual(pages[0]["text_source"], "native_pdf")
+        self.assertEqual(pages[1]["text"], "Línea OCR 1\nLínea OCR 2")
+        self.assertEqual(pages[1]["text_source"], "ocr")
+        self.assertEqual(pages[1]["text_quality"], 0.75)
+        self.assertEqual(tuple(stored_document), (3, 2, 1))
+        self.assertEqual([row["page_number"] for row in stored_pages], [1, 2, 3])
+        self.assertIsNone(stored_pages[2]["raw_text_compressed"])
+        self.assertIn("tiempo agotado", stored_pages[2]["extraction_error"])
+        self.assertEqual(integrity["pages_recorded"], 3)
+        self.assertEqual(integrity["pages_accounted"], 3)
+        self.assertEqual(integrity["pages_unaccounted"], 0)
+
     def test_backfills_catalog_id_without_download_and_keeps_uid_after_url_change(
         self,
     ) -> None:
@@ -113,7 +205,9 @@ class IndexingTests(unittest.TestCase):
                     "SELECT decision_uid FROM regulatory_records"
                 ).fetchone()[0]
 
-        self.assertNotEqual(uid_before_backfill, uid_from_catalog)
+        # El catalog_id mejora la identidad documental, pero no debe invalidar
+        # una revisión humana que ya apunte al UID de esta misma decisión.
+        self.assertEqual(uid_before_backfill, uid_from_catalog)
         self.assertEqual(uid_from_catalog, uid_after_url_change)
 
     def test_migrates_legacy_index_without_downloading_pdfs(self) -> None:
@@ -173,6 +267,11 @@ class IndexingTests(unittest.TestCase):
             self.assertEqual(downloader.call_count, 0)
             self.assertTrue(is_current_schema(database_path))
             self.assertEqual(len(search_chunks(database_path, "semaglutida")), 1)
+            with connect(database_path) as connection:
+                document_id = connection.execute("SELECT id FROM documents").fetchone()[0]
+            migrated_source = source_pages_for_document(database_path, document_id)
+            self.assertEqual(migrated_source[0]["text"], "Texto completo")
+            self.assertEqual(migrated_source[0]["text_source"], "native_pdf")
 
     def test_incremental_update_downloads_only_new_document(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -13,6 +13,8 @@ import re
 from typing import Any, Mapping, Sequence
 import unicodedata
 
+from services.ingredients import parse_active_ingredients
+
 
 RESULT_APPROVED = "aprobado"
 RESULT_DENIED = "negado"
@@ -22,6 +24,35 @@ RESULT_ARCHIVED = "archivado"
 RESULT_FAVORABLE = "favorable"
 RESULT_UNFAVORABLE = "no_favorable"
 RESULT_UNCLASSIFIED = "sin_clasificar"
+
+
+@dataclass(frozen=True)
+class FieldEvidence:
+    """Procedencia auditable de un valor extraido.
+
+    ``valor_canonico`` es solamente una forma estable de presentacion. Para
+    ingredientes no equipara sales, derivados ni nombres comerciales.
+    """
+
+    campo: str
+    valor_literal: str | None
+    valor_normalizado: str | None
+    valor_canonico: str | None
+    pagina: int
+    pagina_final: int
+    fragmento: str
+    metodo: str
+    confianza: float
+    ordinal: int = 1
+
+
+@dataclass(frozen=True)
+class _CapturedPart:
+    value: str
+    page: int
+    fragment: str
+    method: str
+    page_final: int | None = None
 
 
 @dataclass(frozen=True)
@@ -43,6 +74,10 @@ class RegulatoryRecord:
     fecha_sesion: str | None = None
     fecha_sesion_original: str | None = None
     tipo_solicitud: str | None = None
+    principios_activos: tuple[str, ...] = ()
+    principios_activos_normalizados: tuple[str, ...] = ()
+    principios_activos_canonicos: tuple[str, ...] = ()
+    evidencias_campos: tuple[FieldEvidence, ...] = ()
 
     @property
     def page(self) -> int:
@@ -55,13 +90,21 @@ class RegulatoryRecord:
 
         return asdict(self)
 
+    def evidence_for(self, field: str) -> tuple[FieldEvidence, ...]:
+        """Devuelve las evidencias de un campo en el orden publicado."""
+
+        return tuple(item for item in self.evidencias_campos if item.campo == field)
+
 
 # Los patrones se aplican a una copia sin acentos del texto. El orden importa:
 # los rotulos mas especificos deben evaluarse antes que los cortos.
 _FIELD_PATTERNS: tuple[tuple[str, str], ...] = (
     (
         "principio_activo",
-        r"(?:principio|ingrediente)s?\s+activo(?:s)?",
+        r"(?:principio|ingrediente)s?\s+activo(?:s)?|"
+        r"(?:denominacion\s+comun\s+internacional|d\.?\s*c\.?\s*i\.?|"
+        r"i\.?\s*f\.?\s*a\.?)|"
+        r"composicion(?:\s+(?:cualitativa|cuantitativa|del\s+producto))?",
     ),
     (
         "producto",
@@ -94,7 +137,7 @@ _FIELD_PATTERNS: tuple[tuple[str, str], ...] = (
 _STOP_PATTERNS: tuple[str, ...] = (
     r"(?:forma\s+farmaceutica|concentracion|via\s+de\s+administracion)",
     r"(?:fabricante|importador|acondicionador|pais\s+de\s+origen)",
-    r"(?:indicacion(?:es)?|contraindicacion(?:es)?|composicion)",
+    r"(?:indicacion(?:es)?|contraindicacion(?:es)?)",
     r"(?:fecha(?:\s+de\s+radicacion)?|asunto|antecedentes?)",
     r"(?:registro\s+sanitario|modalidad|grupo\s+farmacologico)",
 )
@@ -118,9 +161,47 @@ _BARE_LABEL_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _SECTION_HEADING_RE = re.compile(
-    r"^\s*(?P<numeral>\d+(?:\.\d+){1,7})\.?\s*"
-    r"(?P<title>[A-ZÁÉÍÓÚÑ][^:]{0,160})?$"
+    r"^\s*(?:numeral\s+)?"
+    r"(?P<numeral>(?:\d{1,3}(?:\.\d{1,3}){0,7}|[IVXLCDM]{1,8}))"
+    r"(?:[.)]\s*[-–—]?|\s*[-–—])?\s*"
+    r"(?P<title>[A-ZÁÉÍÓÚÜÑ][^:]{1,180})?$",
+    flags=re.IGNORECASE,
 )
+_HEADING_WITH_CONTENT_RE = re.compile(
+    r"^\s*(?:numeral\s+)?"
+    r"(?P<numeral>(?:\d{1,3}(?:\.\d{1,3}){0,7}|[IVXLCDM]{1,8}))"
+    r"(?:[.)]\s*[-–—]?|\s*[-–—])?\s+"
+    r"(?P<content>(?:producto|medicamento|nombre\s+(?:comercial\s+)?del\s+"
+    r"(?:producto|medicamento))\s*[:;\-–—].+)$",
+    flags=re.IGNORECASE,
+)
+# En actas historicas el recipiente incluye forma y calificadores (por ejemplo,
+# ``Cada tableta recubierta contiene`` o ``Cada 1 mL de solucion contiene``).
+# La lista sigue siendo cerrada y excluye de forma explicita negaciones para no
+# convertir frases narrativas como ``no contiene`` en una composicion.
+_DOSAGE_CONTAINER_PATTERN = (
+    r"(?:tableta|comprimido|capsula|ampolla|vial|frasco|jeringa|dosis|ml|"
+    r"mililitro|gramo|g|sobre|parche|unidad)\w*"
+)
+_DOSAGE_QUALIFIER_PATTERN = (
+    r"(?:\s+(?!(?:contiene|no|sin|que)\b)[a-z][a-z0-9-]*){0,3}"
+)
+_DOSAGE_STATEMENT_RE = re.compile(
+    r"^\s*(?P<label>cada\s+(?:\d+(?:[.,]\d+)?\s*)?"
+    + _DOSAGE_CONTAINER_PATTERN
+    + _DOSAGE_QUALIFIER_PATTERN
+    + r"\s+contiene)"
+    r"\s*(?::|;|[\-–—])?\s*(?P<value>.+)$",
+    flags=re.IGNORECASE,
+)
+_NEGATED_DOSAGE_STATEMENT_RE = re.compile(
+    r"^\s*cada\s+(?:\d+(?:[.,]\d+)?\s*)?"
+    + _DOSAGE_CONTAINER_PATTERN
+    + _DOSAGE_QUALIFIER_PATTERN
+    + r"\s+(?:no\s+contiene|sin\b).*$",
+    flags=re.IGNORECASE,
+)
+_ACTIVE_LIST_ITEM_RE = re.compile(r"^\s*(?:[-*•·]|\(?\d+[.)](?!\d))\s*")
 _PAGE_NOISE_RE = re.compile(
     r"^(?:pagina\s+)?\d+\s+(?:de|/\s*)\s*\d+$|^pagina\s+\d+$",
     flags=re.IGNORECASE,
@@ -128,7 +209,8 @@ _PAGE_NOISE_RE = re.compile(
 _DOCUMENT_HEADER_RE = re.compile(
     r"^(?:acta\s+(?:no\.?|n[°º]?)?\s*\d+|"
     r"instituto\s+nacional\s+de\s+vigilancia\s+de\s+medicamentos\s+y\s+alimentos|"
-    r"comision\s+revisora|sala\s+especializada\s+de\s+medicamentos)",
+    r"comision\s+revisora|sala\s+especializada\s+de\s+medicamentos|"
+    r"ministerio\s+de\s+salud|republica\s+de\s+colombia)",
     flags=re.IGNORECASE,
 )
 
@@ -221,18 +303,24 @@ def normalize_request_type(request_text: str | None) -> str | None:
     return "otra_solicitud"
 
 
-def extract_session_date(
+def _extract_session_date_capture(
     pages: Sequence[Mapping[str, object]],
     *,
     maximum_pages: int = 8,
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, str | None, _CapturedPart | None]:
     """Extrae una fecha únicamente cuando está rotulada como sesión/reunión.
 
     No usa fechas aisladas para evitar confundir la fecha de publicación, un
     radicado o un antecedente con la fecha de la sesión del acta.
     """
 
-    for page_data in list(pages)[: max(1, maximum_pages)]:
+    for page_index, page_data in enumerate(
+        list(pages)[: max(1, maximum_pages)], start=1
+    ):
+        try:
+            page_number = int(page_data.get("page", page_index))
+        except (TypeError, ValueError):
+            page_number = page_index
         raw_text = page_data.get("text", "")
         text = raw_text if isinstance(raw_text, str) else str(raw_text or "")
         comparable = _without_accents(text)
@@ -255,8 +343,35 @@ def extract_session_date(
             except (KeyError, TypeError, ValueError):
                 continue
             original = " ".join(text[match.start() : match.end()].split())
-            return normalized_date, original
-    return None, None
+            line_start = text.rfind("\n", 0, match.start()) + 1
+            line_end = text.find("\n", match.end())
+            if line_end < 0:
+                line_end = len(text)
+            fragment = _clean_value(text[line_start:line_end]) or original
+            return (
+                normalized_date,
+                original,
+                _CapturedPart(
+                    value=original,
+                    page=max(1, page_number),
+                    fragment=fragment[:1000],
+                    method="session_date_label",
+                ),
+            )
+    return None, None, None
+
+
+def extract_session_date(
+    pages: Sequence[Mapping[str, object]],
+    *,
+    maximum_pages: int = 8,
+) -> tuple[str | None, str | None]:
+    """Extrae fecha normalizada y su texto literal rotulado."""
+
+    normalized, original, _capture = _extract_session_date_capture(
+        pages, maximum_pages=maximum_pages
+    )
+    return normalized, original
 
 
 def _field_from_match(match: re.Match[str]) -> str | None:
@@ -266,34 +381,157 @@ def _field_from_match(match: re.Match[str]) -> str | None:
     return None
 
 
-def _labeled_segments(line: str) -> tuple[str, list[tuple[str | None, str]]]:
+def _method_from_match(match: re.Match[str]) -> str:
+    label = _normalized(match.group(0))
+    if "composicion" in label:
+        return "composition_label"
+    return "explicit_label"
+
+
+def _labeled_segments(
+    line: str,
+) -> tuple[str, list[tuple[str | None, str, str]]]:
     """Separa el prefijo libre y los pares (campo, valor) de una linea."""
 
     comparable = _without_accents(line)
     matches = list(_LABEL_RE.finditer(comparable))
     if not matches:
+        if _NEGATED_DOSAGE_STATEMENT_RE.fullmatch(comparable):
+            # Es información de ausencia/excipientes, no un ingrediente activo
+            # y tampoco debe prolongar una captura de composición anterior.
+            return "", [(None, "", "explicit_stop")]
+        dosage_match = _DOSAGE_STATEMENT_RE.fullmatch(comparable)
+        if dosage_match:
+            return "", [
+                (
+                    "principio_activo",
+                    line[dosage_match.start("value") : dosage_match.end("value")],
+                    "dosage_statement",
+                )
+            ]
         bare_match = _BARE_LABEL_RE.fullmatch(comparable.strip())
         if bare_match:
-            return "", [(_field_from_match(bare_match), "")]
+            return "", [
+                (
+                    _field_from_match(bare_match),
+                    "",
+                    _method_from_match(bare_match),
+                )
+            ]
         return line, []
 
     prefix = line[: matches[0].start()]
-    segments: list[tuple[str | None, str]] = []
+    segments: list[tuple[str | None, str, str]] = []
     for index, match in enumerate(matches):
         value_end = matches[index + 1].start() if index + 1 < len(matches) else len(line)
-        segments.append((_field_from_match(match), line[match.end() : value_end]))
+        segments.append(
+            (
+                _field_from_match(match),
+                line[match.end() : value_end],
+                _method_from_match(match),
+            )
+        )
     return prefix, segments
 
 
-def _is_noise(line: str) -> bool:
+def _field_from_fragment(fragment: str) -> str | None:
+    comparable = _without_accents(fragment)
+    match = _LABEL_RE.search(comparable)
+    if match:
+        return _field_from_match(match)
+    if _DOSAGE_STATEMENT_RE.fullmatch(comparable):
+        return "principio_activo"
+    return None
+
+
+def _is_noise(line: str, repeated_margins: set[str] | None = None) -> bool:
     comparable = _without_accents(_clean_value(line))
     if not comparable:
+        return True
+    if repeated_margins and _normalized(comparable) in repeated_margins:
         return True
     if _PAGE_NOISE_RE.fullmatch(comparable):
         return True
     if _DOCUMENT_HEADER_RE.match(comparable) and ":" not in comparable:
         return True
     return comparable.startswith(("www.invima.gov.co", "codigo:", "direccion:"))
+
+
+def _detect_repeated_margins(
+    pages: Sequence[Mapping[str, object]],
+) -> set[str]:
+    """Detecta encabezados/pies repetidos sin eliminar rotulos regulatorios."""
+
+    if len(pages) < 3:
+        return set()
+    occurrences: dict[str, set[int]] = {}
+    for page_index, page_data in enumerate(pages):
+        raw_text = page_data.get("text", "")
+        text = raw_text if isinstance(raw_text, str) else str(raw_text or "")
+        lines = [_clean_value(line) for line in text.splitlines()]
+        lines = [line for line in lines if line]
+        margins = [*lines[:3], *lines[-3:]]
+        for line in margins:
+            comparable = _without_accents(line)
+            if _LABEL_RE.search(comparable) or _DOSAGE_STATEMENT_RE.fullmatch(comparable):
+                continue
+            key = _normalized(line)
+            if len(key) < 8:
+                continue
+            occurrences.setdefault(key, set()).add(page_index)
+    threshold = max(3, (len(pages) + 1) // 2)
+    return {
+        line
+        for line, page_indexes in occurrences.items()
+        if len(page_indexes) >= threshold
+    }
+
+
+def _is_heading_title(title: str | None, *, explicit_numeral: bool) -> bool:
+    if not title:
+        return explicit_numeral
+    normalized = _normalized(title)
+    if any(
+        token in normalized
+        for token in (
+            "evaluacion",
+            "medicamento",
+            "producto",
+            "solicitud",
+            "registro sanitario",
+            "concepto",
+            "recurso",
+        )
+    ):
+        return True
+    letters = [character for character in title if character.isalpha()]
+    uppercase = [character for character in letters if character.isupper()]
+    return bool(letters) and len(uppercase) / len(letters) >= 0.75
+
+
+def _section_heading(
+    line: str,
+    *,
+    has_active_record: bool,
+) -> tuple[str, str | None] | None:
+    match = _SECTION_HEADING_RE.fullmatch(line)
+    if not match:
+        return None
+    explicit_numeral = _normalized(line).startswith("numeral ")
+    numeral = match.group("numeral").rstrip(".)")
+    title = _clean_value(match.group("title") or "") or None
+    if title is None and not explicit_numeral:
+        if has_active_record or "." not in numeral:
+            return None
+    elif not _is_heading_title(title, explicit_numeral=explicit_numeral):
+        return None
+    # Dentro de un concepto, "1. Presentar..." es una instruccion enumerada,
+    # no una nueva decision. Los numerales de un solo nivel solo son seguros si
+    # son explicitos o su titulo luce como un encabezado en mayusculas.
+    if has_active_record and "." not in numeral and not explicit_numeral:
+        if not title or not _is_heading_title(title, explicit_numeral=False):
+            return None
+    return numeral, title
 
 
 def _append_value(values: dict[str, str], field: str, value: str) -> None:
@@ -317,6 +555,356 @@ def _append_value(values: dict[str, str], field: str, value: str) -> None:
         values[field] = clean
         return
     values[field] = f"{previous} {clean}"
+
+
+_METHOD_CONFIDENCE = {
+    "explicit_label": 0.98,
+    "composition_label": 0.82,
+    "dosage_statement": 0.78,
+    "numbered_heading": 0.95,
+    "numbered_heading_product": 0.90,
+    "session_date_label": 0.98,
+    "request_type_inference": 0.85,
+    "outcome_inference": 0.85,
+    "page_span": 1.0,
+}
+
+
+def _product_candidate_from_heading(
+    numeral: str | None,
+    title: str | None,
+) -> str | None:
+    """Usa titulos de numerales hoja solo cuando no parecen categorias."""
+
+    if not numeral or not title or not numeral[0].isdigit():
+        return None
+    if len(numeral.split(".")) < 3:
+        return None
+    comparable = _normalized(title)
+    category_tokens = (
+        "evaluacion",
+        "solicitud",
+        "concepto",
+        "registro sanitario",
+        "modificacion",
+        "informacion para prescribir",
+        "indicaciones",
+        "recursos",
+        "temas varios",
+    )
+    if not comparable or any(token in comparable for token in category_tokens):
+        return None
+    return _clean_value(title) or None
+
+
+def _capture_part(
+    captures: dict[str, list[_CapturedPart]],
+    *,
+    field: str,
+    value: str,
+    page: int,
+    fragment: str,
+    method: str,
+) -> None:
+    clean = _clean_value(value)
+    if not clean:
+        return
+    normalized = _normalized(clean)
+    if any(
+        item.page == page and _normalized(item.value) == normalized
+        for item in captures.get(field, ())
+    ):
+        return
+    captures.setdefault(field, []).append(
+        _CapturedPart(
+            value=clean,
+            page=max(1, int(page)),
+            fragment=_clean_value(fragment)[:1000],
+            method=method,
+        )
+    )
+
+
+def _canonical_field_value(value: str | None) -> str | None:
+    if not value:
+        return None
+    clean = unicodedata.normalize("NFKC", value)
+    clean = " ".join(clean.split()).strip(" ;,.-")
+    return clean or None
+
+
+def _active_ingredients_from_captures(
+    value: str | None,
+    captures: Mapping[str, Sequence[_CapturedPart]],
+) -> tuple[tuple[str, str, str, _CapturedPart | None], ...]:
+    result: list[tuple[str, str, str, _CapturedPart | None]] = []
+    seen: set[str] = set()
+    source_parts = list(captures.get("principio_activo", ()))
+    if not value:
+        return ()
+    if source_parts:
+        methods = {part.method for part in source_parts}
+        method = (
+            "composition_label"
+            if "composition_label" in methods
+            else "dosage_statement"
+            if "dosage_statement" in methods
+            else "numbered_heading_product"
+            if "numbered_heading_product" in methods
+            else "explicit_label"
+        )
+        combined_part = _CapturedPart(
+            value=value,
+            page=min(part.page for part in source_parts),
+            fragment="\n".join(
+                dict.fromkeys(part.fragment for part in source_parts if part.fragment)
+            )[:2000],
+            method=method,
+            page_final=max(part.page for part in source_parts),
+        )
+    else:
+        combined_part = _CapturedPart(
+            value=value,
+            page=1,
+            fragment=value,
+            method="explicit_label",
+        )
+    bullet_parts = [
+        part for part in source_parts if _ACTIVE_LIST_ITEM_RE.match(part.value)
+    ]
+    explicitly_labeled_parts = [
+        part
+        for part in source_parts
+        if _field_from_fragment(part.fragment) == "principio_activo"
+    ]
+    if len(bullet_parts) >= 2:
+        parse_sources = [(part.value, part) for part in bullet_parts]
+    elif len(explicitly_labeled_parts) >= 2:
+        parse_sources = [(part.value, part) for part in explicitly_labeled_parts]
+    else:
+        parse_sources = [(value, combined_part)]
+
+    for source_value, source_part in parse_sources:
+        for ingredient in parse_active_ingredients(source_value):
+            if ingredient.normalized in seen:
+                continue
+            seen.add(ingredient.normalized)
+            result.append(
+                (
+                    ingredient.literal,
+                    ingredient.normalized,
+                    ingredient.canonical,
+                    source_part,
+                )
+            )
+    return tuple(result)
+
+
+def _build_field_evidence(
+    *,
+    cleaned: Mapping[str, str | None],
+    captures: Mapping[str, Sequence[_CapturedPart]],
+    active_ingredients: Sequence[tuple[str, str, str, _CapturedPart | None]],
+    numeral: str | None,
+    numeral_title: str | None,
+    numeral_page: int | None,
+    numeral_fragment: str | None,
+    session_date: str | None,
+    session_date_raw: str | None,
+    session_date_part: _CapturedPart | None,
+    request_type: str | None,
+    outcome: str,
+    page: int,
+    end_page: int,
+) -> tuple[FieldEvidence, ...]:
+    evidences: list[FieldEvidence] = []
+    for field in _FIELDS:
+        if field == "principio_activo":
+            continue
+        literal = cleaned.get(field)
+        field_parts = list(captures.get(field, ()))
+        if not literal or not field_parts:
+            continue
+        methods = {part.method for part in field_parts}
+        method = (
+            "composition_label"
+            if "composition_label" in methods
+            else "dosage_statement"
+            if "dosage_statement" in methods
+            else "numbered_heading_product"
+            if "numbered_heading_product" in methods
+            else "explicit_label"
+        )
+        evidences.append(
+            FieldEvidence(
+                campo=field,
+                valor_literal=literal,
+                valor_normalizado=_normalized(literal) or None,
+                valor_canonico=_canonical_field_value(literal),
+                pagina=min(part.page for part in field_parts),
+                pagina_final=max(part.page for part in field_parts),
+                fragmento="\n".join(
+                    dict.fromkeys(part.fragment for part in field_parts if part.fragment)
+                )[:2000],
+                metodo=method,
+                confianza=_METHOD_CONFIDENCE[method],
+            )
+        )
+
+    for ordinal, (literal, normalized, canonical, part) in enumerate(
+        active_ingredients,
+        start=1,
+    ):
+        method = part.method if part else "explicit_label"
+        evidence_page = part.page if part else page
+        evidences.append(
+            FieldEvidence(
+                campo="principio_activo",
+                valor_literal=literal,
+                valor_normalizado=normalized,
+                valor_canonico=canonical,
+                pagina=evidence_page,
+                pagina_final=(part.page_final or evidence_page) if part else evidence_page,
+                fragmento=(part.fragment if part else literal)[:1000],
+                metodo=method,
+                confianza=_METHOD_CONFIDENCE.get(method, 0.75),
+                ordinal=ordinal,
+            )
+        )
+
+    if numeral:
+        evidences.append(
+            FieldEvidence(
+                campo="numeral",
+                valor_literal=numeral,
+                valor_normalizado=_normalized(numeral) or None,
+                valor_canonico=numeral,
+                pagina=numeral_page or page,
+                pagina_final=numeral_page or page,
+                fragmento=(numeral_fragment or " ".join(
+                    item for item in (numeral, numeral_title) if item
+                ))[:1000],
+                metodo="numbered_heading",
+                confianza=_METHOD_CONFIDENCE["numbered_heading"],
+            )
+        )
+    if numeral_title:
+        evidences.append(
+            FieldEvidence(
+                campo="titulo_numeral",
+                valor_literal=numeral_title,
+                valor_normalizado=_normalized(numeral_title) or None,
+                valor_canonico=_canonical_field_value(numeral_title),
+                pagina=numeral_page or page,
+                pagina_final=numeral_page or page,
+                fragmento=(
+                    numeral_fragment
+                    or " ".join(item for item in (numeral, numeral_title) if item)
+                )[:1000],
+                metodo="numbered_heading",
+                confianza=_METHOD_CONFIDENCE["numbered_heading"],
+            )
+        )
+
+    if session_date and session_date_raw:
+        date_part = session_date_part or _CapturedPart(
+            value=session_date_raw,
+            page=page,
+            fragment=session_date_raw,
+            method="session_date_label",
+        )
+        evidences.extend(
+            (
+                FieldEvidence(
+                    campo="fecha_sesion",
+                    valor_literal=session_date_raw,
+                    valor_normalizado=session_date,
+                    valor_canonico=session_date,
+                    pagina=date_part.page,
+                    pagina_final=date_part.page_final or date_part.page,
+                    fragmento=date_part.fragment[:1000],
+                    metodo="session_date_label",
+                    confianza=_METHOD_CONFIDENCE["session_date_label"],
+                ),
+                FieldEvidence(
+                    campo="fecha_sesion_original",
+                    valor_literal=session_date_raw,
+                    valor_normalizado=_normalized(session_date_raw) or None,
+                    valor_canonico=_canonical_field_value(session_date_raw),
+                    pagina=date_part.page,
+                    pagina_final=date_part.page_final or date_part.page,
+                    fragmento=date_part.fragment[:1000],
+                    metodo="session_date_label",
+                    confianza=_METHOD_CONFIDENCE["session_date_label"],
+                ),
+            )
+        )
+
+    request_parts = list(captures.get("solicitud", ()))
+    if request_type and cleaned.get("solicitud") and request_parts:
+        request_confidence = (
+            _METHOD_CONFIDENCE["request_type_inference"]
+            if request_type != "otra_solicitud"
+            else 0.45
+        )
+        evidences.append(
+            FieldEvidence(
+                campo="tipo_solicitud",
+                valor_literal=cleaned["solicitud"],
+                valor_normalizado=request_type,
+                valor_canonico=request_type,
+                pagina=min(part.page for part in request_parts),
+                pagina_final=max(part.page for part in request_parts),
+                fragmento="\n".join(
+                    dict.fromkeys(
+                        part.fragment for part in request_parts if part.fragment
+                    )
+                )[:2000],
+                metodo="request_type_inference",
+                confianza=request_confidence,
+            )
+        )
+
+    concept_parts = list(captures.get("concepto", ()))
+    if cleaned.get("concepto") and concept_parts:
+        outcome_confidence = (
+            _METHOD_CONFIDENCE["outcome_inference"]
+            if outcome != RESULT_UNCLASSIFIED
+            else 0.40
+        )
+        evidences.append(
+            FieldEvidence(
+                campo="resultado_normalizado",
+                valor_literal=cleaned["concepto"],
+                valor_normalizado=outcome,
+                valor_canonico=outcome,
+                pagina=min(part.page for part in concept_parts),
+                pagina_final=max(part.page for part in concept_parts),
+                fragmento="\n".join(
+                    dict.fromkeys(
+                        part.fragment for part in concept_parts if part.fragment
+                    )
+                )[:2000],
+                metodo="outcome_inference",
+                confianza=outcome_confidence,
+            )
+        )
+
+    range_literal = str(page) if page == end_page else f"{page}-{end_page}"
+    evidences.append(
+        FieldEvidence(
+            campo="rango_paginas",
+            valor_literal=range_literal,
+            valor_normalizado=range_literal,
+            valor_canonico=range_literal,
+            pagina=page,
+            pagina_final=end_page,
+            fragmento=f"Paginas {range_literal}",
+            metodo="page_span",
+            confianza=_METHOD_CONFIDENCE["page_span"],
+        )
+    )
+    return tuple(evidences)
 
 
 def normalize_regulatory_result(concept: str | None) -> str:
@@ -384,14 +972,63 @@ def _build_decision(
     page: int,
     end_page: int,
     *,
+    captures: Mapping[str, Sequence[_CapturedPart]] | None = None,
     numeral: str | None = None,
     numeral_title: str | None = None,
+    numeral_page: int | None = None,
+    numeral_fragment: str | None = None,
+    heading_product: str | None = None,
     session_date: str | None = None,
     session_date_raw: str | None = None,
+    session_date_part: _CapturedPart | None = None,
 ) -> RegulatoryRecord | None:
-    if not _has_enough_evidence(values):
+    working_values = dict(values)
+    working_captures = {
+        field: list(parts) for field, parts in (captures or {}).items()
+    }
+    if heading_product and not working_values.get("producto"):
+        working_values["producto"] = heading_product
+        working_captures.setdefault("producto", []).append(
+            _CapturedPart(
+                value=heading_product,
+                page=numeral_page or page,
+                fragment=numeral_fragment or heading_product,
+                method="numbered_heading_product",
+            )
+        )
+    if not _has_enough_evidence(working_values):
         return None
-    cleaned = {field: _clean_value(values.get(field, "")) or None for field in _FIELDS}
+    cleaned = {
+        field: _clean_value(working_values.get(field, "")) or None
+        for field in _FIELDS
+    }
+    captures = working_captures
+    active_ingredients = _active_ingredients_from_captures(
+        cleaned["principio_activo"],
+        captures,
+    )
+    if active_ingredients:
+        cleaned["principio_activo"] = "; ".join(
+            ingredient[2] for ingredient in active_ingredients
+        )
+    request_type = normalize_request_type(cleaned["solicitud"])
+    outcome = normalize_regulatory_result(cleaned["concepto"])
+    evidences = _build_field_evidence(
+        cleaned=cleaned,
+        captures=captures,
+        active_ingredients=active_ingredients,
+        numeral=numeral,
+        numeral_title=numeral_title,
+        numeral_page=numeral_page,
+        numeral_fragment=numeral_fragment,
+        session_date=session_date,
+        session_date_raw=session_date_raw,
+        session_date_part=session_date_part,
+        request_type=request_type,
+        outcome=outcome,
+        page=max(1, int(page)),
+        end_page=max(int(page), int(end_page)),
+    )
     return RegulatoryRecord(
         producto=cleaned["producto"],
         principio_activo=cleaned["principio_activo"],
@@ -400,14 +1037,18 @@ def _build_decision(
         radicado=cleaned["radicado"],
         solicitud=cleaned["solicitud"],
         concepto=cleaned["concepto"],
-        resultado_normalizado=normalize_regulatory_result(cleaned["concepto"]),
+        resultado_normalizado=outcome,
         pagina=max(1, int(page)),
         pagina_final=max(int(page), int(end_page)),
         numeral=numeral,
         titulo_numeral=numeral_title,
         fecha_sesion=session_date,
         fecha_sesion_original=session_date_raw,
-        tipo_solicitud=normalize_request_type(cleaned["solicitud"]),
+        tipo_solicitud=request_type,
+        principios_activos=tuple(item[0] for item in active_ingredients),
+        principios_activos_normalizados=tuple(item[1] for item in active_ingredients),
+        principios_activos_canonicos=tuple(item[2] for item in active_ingredients),
+        evidencias_campos=evidences,
     )
 
 
@@ -464,6 +1105,37 @@ def _merge_duplicate(first: RegulatoryRecord, second: RegulatoryRecord) -> Regul
             merged[field] = left
         else:
             merged[field] = right if len(right) > len(left) else left
+    active_items: list[tuple[str, str, str]] = []
+    active_seen: set[str] = set()
+    for literal, normalized, canonical in (
+        *zip(
+            first.principios_activos,
+            first.principios_activos_normalizados,
+            first.principios_activos_canonicos,
+        ),
+        *zip(
+            second.principios_activos,
+            second.principios_activos_normalizados,
+            second.principios_activos_canonicos,
+        ),
+    ):
+        if normalized in active_seen:
+            continue
+        active_seen.add(normalized)
+        active_items.append((literal, normalized, canonical))
+
+    evidence_by_key: dict[tuple[str, str | None, int, str], FieldEvidence] = {}
+    for evidence in (*first.evidencias_campos, *second.evidencias_campos):
+        key = (
+            evidence.campo,
+            evidence.valor_normalizado,
+            evidence.ordinal,
+            evidence.metodo,
+        )
+        current = evidence_by_key.get(key)
+        if current is None or evidence.confianza > current.confianza:
+            evidence_by_key[key] = evidence
+
     return RegulatoryRecord(
         producto=merged["producto"],
         principio_activo=merged["principio_activo"],
@@ -489,6 +1161,10 @@ def _merge_duplicate(first: RegulatoryRecord, second: RegulatoryRecord) -> Regul
             if first.tipo_solicitud not in {None, "otra_solicitud"}
             else second.tipo_solicitud
         ),
+        principios_activos=tuple(item[0] for item in active_items),
+        principios_activos_normalizados=tuple(item[1] for item in active_items),
+        principios_activos_canonicos=tuple(item[2] for item in active_items),
+        evidencias_campos=tuple(evidence_by_key.values()),
     )
 
 
@@ -527,33 +1203,56 @@ def extract_regulatory_records(
 
     decisions: list[RegulatoryRecord] = []
     values: dict[str, str] = {}
+    captures: dict[str, list[_CapturedPart]] = {}
     active_field: str | None = None
+    active_method = "explicit_label"
     start_page = 1
     record_end_page = 1
     current_numeral: str | None = None
     current_numeral_title: str | None = None
+    current_numeral_page: int | None = None
+    current_numeral_fragment: str | None = None
     record_numeral: str | None = None
     record_numeral_title: str | None = None
-    session_date, session_date_raw = extract_session_date(pages)
+    record_numeral_page: int | None = None
+    record_numeral_fragment: str | None = None
+    session_date, session_date_raw, session_date_part = _extract_session_date_capture(
+        pages
+    )
+    repeated_margins = _detect_repeated_margins(pages)
 
     def flush() -> None:
-        nonlocal values, active_field, start_page, record_end_page
+        nonlocal values, captures, active_field, active_method
+        nonlocal start_page, record_end_page
         nonlocal record_numeral, record_numeral_title
+        nonlocal record_numeral_page, record_numeral_fragment
         decision = _build_decision(
             values,
             start_page,
             record_end_page,
+            captures=captures,
             numeral=record_numeral,
             numeral_title=record_numeral_title,
+            numeral_page=record_numeral_page,
+            numeral_fragment=record_numeral_fragment,
+            heading_product=_product_candidate_from_heading(
+                record_numeral,
+                record_numeral_title,
+            ),
             session_date=session_date,
             session_date_raw=session_date_raw,
+            session_date_part=session_date_part,
         )
         if decision is not None:
             decisions.append(decision)
         values = {}
+        captures = {}
         active_field = None
+        active_method = "explicit_label"
         record_numeral = current_numeral
         record_numeral_title = current_numeral_title
+        record_numeral_page = current_numeral_page
+        record_numeral_fragment = current_numeral_fragment
 
     for page_index, page_data in enumerate(pages, start=1):
         try:
@@ -565,35 +1264,71 @@ def extract_regulatory_records(
 
         for raw_line in text.splitlines():
             line = _clean_value(raw_line)
-            if _is_noise(line):
+            if _is_noise(line, repeated_margins):
                 continue
-            section_match = _SECTION_HEADING_RE.fullmatch(line)
-            if section_match and (section_match.group("title") or not values):
+
+            comparable_line = _without_accents(line)
+            heading_with_content = _HEADING_WITH_CONTENT_RE.fullmatch(comparable_line)
+            if heading_with_content:
                 if values:
                     flush()
-                current_numeral = section_match.group("numeral")
-                current_numeral_title = _clean_value(
-                    section_match.group("title") or ""
-                ) or None
+                current_numeral = heading_with_content.group("numeral").rstrip(".)")
+                current_numeral_title = None
+                current_numeral_page = page_number
+                current_numeral_fragment = line
                 record_numeral = current_numeral
                 record_numeral_title = current_numeral_title
+                record_numeral_page = current_numeral_page
+                record_numeral_fragment = current_numeral_fragment
                 start_page = page_number
-                continue
+                content_start = heading_with_content.start("content")
+                line = line[content_start:]
+            else:
+                section = _section_heading(line, has_active_record=bool(values))
+                if section:
+                    if values:
+                        flush()
+                    current_numeral, current_numeral_title = section
+                    current_numeral_page = page_number
+                    current_numeral_fragment = line
+                    record_numeral = current_numeral
+                    record_numeral_title = current_numeral_title
+                    record_numeral_page = current_numeral_page
+                    record_numeral_fragment = current_numeral_fragment
+                    start_page = page_number
+                    continue
 
             prefix, segments = _labeled_segments(line)
             if not segments:
                 if active_field:
                     _append_value(values, active_field, line)
+                    _capture_part(
+                        captures,
+                        field=active_field,
+                        value=line,
+                        page=page_number,
+                        fragment=line,
+                        method=active_method,
+                    )
                     record_end_page = page_number
                 continue
 
             if active_field and _clean_value(prefix):
                 _append_value(values, active_field, prefix)
+                _capture_part(
+                    captures,
+                    field=active_field,
+                    value=prefix,
+                    page=page_number,
+                    fragment=line,
+                    method=active_method,
+                )
                 record_end_page = page_number
 
-            for field, value in segments:
+            for field, value, method in segments:
                 if field is None:
                     active_field = None
+                    active_method = "explicit_label"
                     continue
 
                 if _should_start_new_record(values, field, value):
@@ -605,10 +1340,21 @@ def extract_regulatory_records(
                     record_end_page = page_number
                     record_numeral = current_numeral
                     record_numeral_title = current_numeral_title
+                    record_numeral_page = current_numeral_page
+                    record_numeral_fragment = current_numeral_fragment
 
                 active_field = field
+                active_method = method
                 _append_value(values, field, value)
                 if _clean_value(value):
+                    _capture_part(
+                        captures,
+                        field=field,
+                        value=value,
+                        page=page_number,
+                        fragment=line,
+                        method=method,
+                    )
                     record_end_page = page_number
 
     flush()

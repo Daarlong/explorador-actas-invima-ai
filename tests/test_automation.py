@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from check_index_pending import build_pending_status
 from services.automation import pending_index_items
 
 
@@ -46,6 +47,82 @@ class AutomationTests(unittest.TestCase):
                 encoding="utf-8",
             )
             status = pending_index_items(path)
+
+        self.assertFalse(status["needs_update"])
+        self.assertEqual(status["reason"], "complete")
+
+    def test_combined_status_detects_extractor_semantic_and_package_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            integrity = root / "integrity.json"
+            indexing = root / "indexing.json"
+            semantic = root / "semantic.json"
+            integrity.write_text(
+                json.dumps(
+                    {
+                        "missing_documents": [],
+                        "documents_without_pages": [],
+                        "documents_without_chunks": [],
+                        "regulatory_extraction_pending": ["Acta 01"],
+                        "regulatory_extraction_errors": [],
+                        "page_inventory_pending": [],
+                        "schema_version": 7,
+                        "expected_schema_version": 7,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            indexing.write_text(json.dumps({"documents_failed": 0}), encoding="utf-8")
+            semantic.write_text(json.dumps({"status": "error"}), encoding="utf-8")
+
+            status = build_pending_status(
+                integrity,
+                indexing,
+                semantic,
+                root / "actas.db",
+                root / "semantic.db",
+                semantic_enabled=True,
+            )
+
+        self.assertTrue(status["needs_update"])
+        self.assertIn("regulatory_extraction_pending", status["reasons"])
+        self.assertIn("semantic_index_stale", status["reasons"])
+        self.assertIn("database_package_missing_or_incomplete", status["reasons"])
+
+    def test_combined_status_accepts_complete_raw_databases(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            integrity = root / "integrity.json"
+            indexing = root / "indexing.json"
+            semantic = root / "semantic.json"
+            integrity.write_text(
+                json.dumps(
+                    {
+                        "missing_documents": [],
+                        "documents_without_pages": [],
+                        "documents_without_chunks": [],
+                        "regulatory_extraction_pending": [],
+                        "regulatory_extraction_errors": [],
+                        "page_inventory_pending": [],
+                        "schema_version": 7,
+                        "expected_schema_version": 7,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            indexing.write_text(json.dumps({"documents_failed": 0}), encoding="utf-8")
+            semantic.write_text(json.dumps({"status": "built"}), encoding="utf-8")
+            (root / "actas.db").write_bytes(b"database")
+            (root / "semantic.db").write_bytes(b"semantic")
+
+            status = build_pending_status(
+                integrity,
+                indexing,
+                semantic,
+                root / "actas.db",
+                root / "semantic.db",
+                semantic_enabled=True,
+            )
 
         self.assertFalse(status["needs_update"])
         self.assertEqual(status["reason"], "complete")

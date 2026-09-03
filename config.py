@@ -52,6 +52,15 @@ EVALUATION_CASES_PATH = Path(
 EVALUATION_REPORT_PATH = Path(
     os.getenv("ACTAS_EVALUATION_REPORT_PATH", DATA_DIR / "evaluation-report.json")
 )
+REPROCESS_ROOT = Path(
+    os.getenv("ACTAS_REPROCESS_ROOT", ROOT_DIR / ".reprocess")
+)
+REPROCESS_REPORT_PATH = Path(
+    os.getenv(
+        "ACTAS_REPROCESS_REPORT_PATH",
+        REPROCESS_ROOT / "reprocess-report.json",
+    )
+)
 
 CHUNK_SIZE = int(os.getenv("ACTAS_CHUNK_SIZE", "1200"))
 CHUNK_OVERLAP = int(os.getenv("ACTAS_CHUNK_OVERLAP", "180"))
@@ -80,6 +89,11 @@ SEMANTIC_LEXICAL_DIMENSION = int(
 )
 SEMANTIC_DISTRIBUTIONAL_DIMENSION = int(
     os.getenv("ACTAS_SEMANTIC_DISTRIBUTIONAL_DIMENSION", "48")
+)
+REPROCESS_BATCH_SIZE = max(1, int(os.getenv("ACTAS_REPROCESS_BATCH_SIZE", "50")))
+REPROCESS_MIN_FREE_MIB = max(
+    512,
+    int(os.getenv("ACTAS_REPROCESS_MIN_FREE_MIB", "4096")),
 )
 
 ALLOWED_DOCUMENT_HOSTS = tuple(

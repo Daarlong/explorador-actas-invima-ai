@@ -91,6 +91,14 @@ def parse_args() -> argparse.Namespace:
             "para la siguiente ejecución"
         ),
     )
+    parser.add_argument(
+        "--fail-on-semantic-error",
+        action="store_true",
+        help=(
+            "Falla si el índice semántico no puede construirse; se usa para "
+            "validar una base candidata antes de publicarla"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -214,4 +222,11 @@ if __name__ == "__main__":
             f"ADVERTENCIA: {report.documents_failed} documento(s) quedaron "
             "pendientes y se reintentarán en la siguiente ejecución.",
             flush=True,
+        )
+    if arguments.fail_on_semantic_error and semantic_report.get("status") not in {
+        "built",
+        "reused",
+    }:
+        raise SystemExit(
+            "La candidata requiere un índice semántico vigente antes de publicarse"
         )

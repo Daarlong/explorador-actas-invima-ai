@@ -4,6 +4,8 @@ import gzip
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -89,6 +91,61 @@ class DatabasePackageTests(unittest.TestCase):
             database_path.unlink()
             with self.assertRaisesRegex(ValueError, "Tamaño incorrecto"):
                 materialize_database_package(database_path, database_path)
+
+    def test_verify_command_restores_and_checks_sqlite_integrity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database_path = root / "actas.db"
+            target = root / "smoke" / "actas.db"
+            with sqlite3.connect(database_path) as connection:
+                connection.execute("CREATE TABLE sample (value TEXT)")
+                connection.execute("INSERT INTO sample VALUES ('ok')")
+            create_database_package(database_path, part_size_bytes=1024)
+
+            process = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve().parents[1] / "package_index.py"),
+                    "verify",
+                    "--database",
+                    str(database_path),
+                    "--target",
+                    str(target),
+                ],
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+
+            self.assertEqual(process.returncode, 0, process.stderr)
+            self.assertIn('"sqlite_integrity": "ok"', process.stdout)
+            self.assertTrue(target.exists())
+
+    def test_verify_never_accepts_a_preexisting_target_without_package(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database_path = root / "missing-package.db"
+            target = root / "old-target.db"
+            with sqlite3.connect(target) as connection:
+                connection.execute("CREATE TABLE unrelated (value TEXT)")
+
+            process = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve().parents[1] / "package_index.py"),
+                    "verify",
+                    "--database",
+                    str(database_path),
+                    "--target",
+                    str(target),
+                ],
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+
+            self.assertNotEqual(process.returncode, 0)
+            self.assertIn("No existe un paquete", process.stderr)
 
 
 if __name__ == "__main__":

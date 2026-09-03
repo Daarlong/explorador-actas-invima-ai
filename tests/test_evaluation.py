@@ -11,10 +11,16 @@ from pathlib import Path
 from services.database import initialize_database, insert_document
 from services.evaluation import (
     EvaluationCase,
+    EvaluationResult,
     audit_corpus_reports,
+    build_quality_gate,
+    compare_extractor_quality,
+    compare_retrieval_summaries,
     evaluate_cases,
+    evaluation_bank_profile,
     evaluation_cases_to_csv,
     evaluation_results_to_csv,
+    evaluation_template_csv,
     parse_evaluation_cases_csv,
     parse_expected_reference,
     summarize_evaluation,
@@ -70,6 +76,16 @@ class EvaluationBankTests(unittest.TestCase):
         self.assertEqual(reference.year, 2024)
         self.assertEqual(reference.acta_number, "1")
         self.assertEqual(reference.section, "sempb")
+
+    def test_template_includes_disabled_semaglutida_case_without_fake_gold(self) -> None:
+        cases, errors = parse_evaluation_cases_csv(evaluation_template_csv())
+
+        self.assertEqual(errors, [])
+        semaglutida = next(case for case in cases if case.case_id == "semaglutida-2017")
+        self.assertEqual(semaglutida.query, "Semaglutida")
+        self.assertFalse(semaglutida.enabled)
+        self.assertEqual(semaglutida.expected_refs, ("acta:2017:14:SEMPB",))
+        self.assertFalse(evaluation_bank_profile(cases)["has_semaglutida_case"])
 
 
 class RetrievalEvaluationTests(unittest.TestCase):
@@ -222,6 +238,166 @@ class RetrievalEvaluationTests(unittest.TestCase):
         row = next(csv.DictReader(io.StringIO(exported)))
 
         self.assertTrue(row["consulta"].startswith("'="))
+
+
+class QualityGateTests(unittest.TestCase):
+    @staticmethod
+    def _quality(percent: float) -> dict:
+        keys = (
+            "numeral",
+            "product",
+            "active_ingredient",
+            "interested_party",
+            "expediente",
+            "radicado",
+        )
+        return {
+            "status": "available",
+            "records": 100,
+            "fields": [
+                {
+                    "key": key,
+                    "label": key,
+                    "available": True,
+                    "present": int(percent),
+                    "missing": 100 - int(percent),
+                    "coverage_percent": percent,
+                }
+                for key in keys
+            ],
+        }
+
+    @staticmethod
+    def _cases() -> list[EvaluationCase]:
+        cases: list[EvaluationCase] = []
+        for index in range(15):
+            query = "Semaglutida" if index == 0 else f"consulta {index}"
+            cases.append(
+                EvaluationCase(
+                    case_id=f"case-{index}",
+                    query=query,
+                    expected_refs=(
+                        f"title:Acta esperada {index}-a",
+                        f"title:Acta esperada {index}-b",
+                    ),
+                    filters={},
+                )
+            )
+        return cases
+
+    @staticmethod
+    def _results(cases: list[EvaluationCase]) -> list[EvaluationResult]:
+        return [
+            EvaluationResult(
+                case_id=case.case_id,
+                query=case.query,
+                requested_mode=mode,
+                used_mode=mode,
+                k=case.k,
+                expected_count=2,
+                matched_count=2,
+                retrieved_documents=2,
+                relevant_documents=2,
+                hit_at_k=1.0,
+                precision_at_k=0.2,
+                recall_at_k=1.0,
+                reciprocal_rank=1.0,
+                first_relevant_rank=1,
+                duration_ms=1.0,
+                matched_refs=case.expected_refs,
+                top_documents=(),
+                semantic_available=True,
+                semantic_message="",
+            )
+            for case in cases
+            for mode in ("textual", "hybrid", "semantic")
+        ]
+
+    def test_extractor_comparison_reports_field_decline(self) -> None:
+        comparison = compare_extractor_quality(
+            self._quality(79.0),
+            {"extractor_quality": self._quality(80.0)},
+        )
+
+        fields = {item["key"]: item for item in comparison["fields"]}
+        self.assertEqual(comparison["status"], "comparable")
+        self.assertEqual(fields["active_ingredient"]["delta_percentage_points"], -1.0)
+
+    def test_release_gate_blocks_decline_but_advisory_does_not(self) -> None:
+        cases = self._cases()
+        results = self._results(cases)
+        extractor_comparison = compare_extractor_quality(
+            self._quality(79.0),
+            self._quality(80.0),
+        )
+        current_summary = summarize_evaluation(results)
+        retrieval_comparison = compare_retrieval_summaries(
+            current_summary,
+            current_summary,
+        )
+        common = {
+            "cases": cases,
+            "results": results,
+            "extractor_quality": self._quality(79.0),
+            "extractor_comparison": extractor_comparison,
+            "retrieval_comparison": retrieval_comparison,
+            "integrity_report": {"status": "ok"},
+        }
+
+        release = build_quality_gate(release_mode=True, **common)
+        advisory = build_quality_gate(release_mode=False, **common)
+
+        self.assertEqual(release["status"], "fail")
+        self.assertFalse(release["can_publish"])
+        self.assertEqual(advisory["status"], "advisory")
+        self.assertTrue(advisory["can_publish"])
+        failed = {
+            item["key"] for item in release["checks"] if not item["passed"]
+        }
+        self.assertIn("completeness_active_ingredient", failed)
+
+    def test_release_gate_passes_synthetic_complete_baseline(self) -> None:
+        cases = self._cases()
+        results = self._results(cases)
+        quality = self._quality(80.0)
+        summary = summarize_evaluation(results)
+        gate = build_quality_gate(
+            release_mode=True,
+            cases=cases,
+            results=results,
+            extractor_quality=quality,
+            extractor_comparison=compare_extractor_quality(quality, quality),
+            retrieval_comparison=compare_retrieval_summaries(summary, summary),
+            integrity_report={"status": "warning"},
+        )
+
+        self.assertEqual(gate["status"], "pass")
+        self.assertTrue(gate["can_publish"])
+
+    def test_retrieval_baseline_must_use_same_bank(self) -> None:
+        comparison = compare_retrieval_summaries(
+            [{"mode": "textual", "hit_at_k": 1, "recall_at_k": 1, "mrr": 1}],
+            [{"mode": "textual", "hit_at_k": 1, "recall_at_k": 1, "mrr": 1}],
+            current_bank_signature="current",
+            baseline_bank_signature="other",
+        )
+
+        self.assertEqual(comparison["status"], "unavailable")
+        self.assertIn("otro banco", comparison["reason"])
+
+    def test_empty_bank_never_passes_release(self) -> None:
+        gate = build_quality_gate(
+            release_mode=True,
+            cases=[],
+            results=[],
+            extractor_quality=None,
+            extractor_comparison=None,
+            retrieval_comparison=None,
+            integrity_report=None,
+        )
+
+        self.assertEqual(gate["status"], "fail")
+        self.assertFalse(gate["can_publish"])
 
 
 class CorpusAuditTests(unittest.TestCase):

@@ -241,6 +241,334 @@ class RegulatoryExtractionTests(unittest.TestCase):
         )
         self.assertEqual(normalize_request_type("texto no categorizado"), "otra_solicitud")
 
+    def test_extracts_semaglutide_from_multiline_historical_composition(self) -> None:
+        # Caso minimo inspirado en una publicacion historica; el texto se
+        # parafrasea y conserva solo los rotulos necesarios para la regresion.
+        records = extract_regulatory_records(
+            [
+                {
+                    "page": 2,
+                    "text": (
+                        "3.1.1.1 OZEMPIC®\n"
+                        "Expediente: 20125116\n"
+                        "Radicado: 2017041330\n"
+                        "Interesado: Novo Nordisk Colombia S.A.S.\n"
+                        "Composición:\nCada mL contiene 1.34mg de\nSemaglutida\n"
+                        "Solicitud: Evaluación farmacológica.\n"
+                        "Concepto: La Sala emite concepto favorable."
+                    ),
+                }
+            ]
+        )
+
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(record.numeral, "3.1.1.1")
+        self.assertEqual(record.titulo_numeral, "OZEMPIC®")
+        self.assertEqual(record.producto, "OZEMPIC®")
+        self.assertEqual(record.principio_activo, "Semaglutida")
+        self.assertEqual(record.principios_activos_canonicos, ("Semaglutida",))
+        active_evidence = record.evidence_for("principio_activo")
+        self.assertEqual(len(active_evidence), 1)
+        self.assertEqual(active_evidence[0].metodo, "dosage_statement")
+        self.assertIn("Semaglutida", active_evidence[0].fragmento)
+        self.assertEqual(
+            record.evidence_for("producto")[0].metodo,
+            "numbered_heading_product",
+        )
+
+    def test_historical_dosage_containers_do_not_pollute_ingredient(self) -> None:
+        variants = {
+            "Cada tableta recubierta contiene Semaglutida 14 mg": "Semaglutida",
+            "Cada frasco contiene Liraglutida 6 mg/mL": "Liraglutida",
+            "Cada gramo contiene Dapagliflozina 5 mg": "Dapagliflozina",
+            "Cada 1 mL de solución contiene Empagliflozina 10 mg": "Empagliflozina",
+        }
+        for statement, expected in variants.items():
+            with self.subTest(statement=statement):
+                record = extract_regulatory_records(
+                    [
+                        {
+                            "page": 12,
+                            "text": (
+                                "3.1.1 PRODUCTO HISTÓRICO\nProducto: PRUEBA\n"
+                                f"{statement}\nExpediente: 12345\n"
+                                "Solicitud: Evaluación farmacológica.\n"
+                                "Concepto: Se aprueba la solicitud."
+                            ),
+                        }
+                    ]
+                )[0]
+
+                self.assertEqual(record.principio_activo, expected)
+                evidence = record.evidence_for("principio_activo")[0]
+                self.assertEqual(evidence.metodo, "dosage_statement")
+                self.assertNotIn("Cada", evidence.valor_literal or "")
+                self.assertNotIn("contiene", evidence.valor_literal or "")
+
+        record = extract_regulatory_records(
+            [
+                {
+                    "page": 12,
+                    "text": (
+                        "3.1.2 PRODUCTO SIN EXCIPIENTE\nProducto: PRUEBA\n"
+                        "Principio activo: Semaglutida\n"
+                        "Cada tableta no contiene lactosa\nExpediente: 12346\n"
+                        "Solicitud: Evaluación farmacológica.\n"
+                        "Concepto: Se aprueba la solicitud."
+                    ),
+                }
+            ]
+        )[0]
+        self.assertEqual(record.principio_activo, "Semaglutida")
+
+    def test_complete_evidence_for_context_and_derived_fields(self) -> None:
+        record = extract_regulatory_records(
+            [
+                {
+                    "page": 1,
+                    "text": "Fecha de la sesión: 18 de junio de 2018",
+                },
+                {
+                    "page": 7,
+                    "text": (
+                        "3.1.1 OZEMPIC\nProducto: OZEMPIC\n"
+                        "Cada frasco contiene Semaglutida 2 mg\n"
+                        "Expediente: 20125116\n"
+                        "Solicitud: Evaluación farmacológica.\n"
+                        "Concepto: La Sala aprueba la solicitud."
+                    ),
+                },
+            ]
+        )[0]
+
+        expected_fields = {
+            "titulo_numeral",
+            "fecha_sesion",
+            "fecha_sesion_original",
+            "tipo_solicitud",
+            "resultado_normalizado",
+            "rango_paginas",
+        }
+        self.assertTrue(expected_fields.issubset({
+            item.campo for item in record.evidencias_campos
+        }))
+        title = record.evidence_for("titulo_numeral")[0]
+        self.assertEqual(title.valor_literal, "OZEMPIC")
+        self.assertEqual(title.valor_normalizado, "ozempic")
+        self.assertEqual(title.pagina, 7)
+        session = record.evidence_for("fecha_sesion")[0]
+        self.assertEqual(session.valor_normalizado, "2018-06-18")
+        self.assertEqual(session.valor_canonico, "2018-06-18")
+        self.assertEqual(session.pagina, 1)
+        self.assertIn("Fecha de la sesión", session.fragmento)
+        original = record.evidence_for("fecha_sesion_original")[0]
+        self.assertEqual(original.valor_literal, "Fecha de la sesión: 18 de junio de 2018")
+        request_type = record.evidence_for("tipo_solicitud")[0]
+        self.assertEqual(request_type.valor_canonico, "evaluacion_farmacologica")
+        self.assertEqual(request_type.metodo, "request_type_inference")
+        outcome = record.evidence_for("resultado_normalizado")[0]
+        self.assertEqual(outcome.valor_canonico, RESULT_APPROVED)
+        self.assertEqual(outcome.metodo, "outcome_inference")
+        page_range = record.evidence_for("rango_paginas")[0]
+        self.assertEqual((page_range.pagina, page_range.pagina_final), (7, 7))
+        for field in expected_fields:
+            for evidence in record.evidence_for(field):
+                self.assertTrue(evidence.fragmento)
+                self.assertTrue(evidence.metodo)
+                self.assertGreaterEqual(evidence.confianza, 0.0)
+                self.assertLessEqual(evidence.confianza, 1.0)
+
+    def test_supports_multiple_active_ingredients_without_alias_inference(self) -> None:
+        records = extract_regulatory_records(
+            [
+                {
+                    "page": 12,
+                    "text": (
+                        "4.2.1 COMBINACIONES\n"
+                        "Producto: COMBINADO X\n"
+                        "Composición cualitativa: Insulina degludec 100 U/mL + "
+                        "liraglutida 3,6 mg/mL\n"
+                        "Expediente: 808080\n"
+                        "Solicitud: Modificación del registro sanitario.\n"
+                        "Concepto: Se acepta lo solicitado."
+                    ),
+                }
+            ]
+        )
+
+        record = records[0]
+        self.assertEqual(
+            record.principios_activos_canonicos,
+            ("Insulina degludec", "liraglutida"),
+        )
+        self.assertEqual(
+            record.principio_activo,
+            "Insulina degludec; liraglutida",
+        )
+        self.assertEqual(
+            [item.ordinal for item in record.evidence_for("principio_activo")],
+            [1, 2],
+        )
+        # El extractor no inventa una relacion usando solo el nombre comercial.
+        unrelated = extract_regulatory_records(
+            [
+                {
+                    "page": 13,
+                    "text": (
+                        "Producto: COMBINADO X\nExpediente: 909090\n"
+                        "Solicitud: Renovación del registro sanitario.\n"
+                        "Concepto: La solicitud es favorable."
+                    ),
+                }
+            ]
+        )[0]
+        self.assertIsNone(unrelated.principio_activo)
+        self.assertEqual(unrelated.principios_activos, ())
+
+    def test_supports_multiline_bulleted_active_ingredients(self) -> None:
+        record = extract_regulatory_records(
+            [
+                {
+                    "page": 14,
+                    "text": (
+                        "4.2.2 COMBINACIÓN DOS\nProducto: COMBINADO Y\n"
+                        "Principios activos:\n1. semaglutida 1 mg\n"
+                        "2. cagrilintida 2 mg\nExpediente: 1414\n"
+                        "Solicitud: Evaluación farmacológica.\n"
+                        "Concepto: Se requiere información adicional."
+                    ),
+                }
+            ]
+        )[0]
+
+        self.assertEqual(
+            tuple(item.casefold() for item in record.principios_activos_canonicos),
+            ("semaglutida", "cagrilintida"),
+        )
+
+    def test_recognizes_dci_ifa_and_historical_numbering(self) -> None:
+        pages = [
+            {
+                "page": 20,
+                "text": (
+                    "NUMERAL 7.3 - MEDICAMENTOS DE SÍNTESIS\n"
+                    "Producto: MEDICAMENTO D\nD.C.I.: dapagliflozina\n"
+                    "Expediente: 7001\nSolicitud: Nueva indicación.\n"
+                    "Concepto: Se aprueba la indicación."
+                ),
+            },
+            {
+                "page": 21,
+                "text": (
+                    "IV. EVALUACIONES FARMACOLÓGICAS\n"
+                    "Producto: MEDICAMENTO E\nI.F.A.: empagliflozina\n"
+                    "Expediente: 7002\nSolicitud: Evaluación farmacológica.\n"
+                    "Concepto: Se requiere información adicional."
+                ),
+            },
+        ]
+
+        records = extract_regulatory_records(pages)
+
+        self.assertEqual([record.numeral for record in records], ["7.3", "IV"])
+        self.assertEqual(
+            [record.principio_activo for record in records],
+            ["dapagliflozina", "empagliflozina"],
+        )
+        self.assertTrue(all(record.evidence_for("numeral") for record in records))
+
+    def test_reads_leaf_numeral_and_product_label_on_the_same_line(self) -> None:
+        record = extract_regulatory_records(
+            [
+                {
+                    "page": 22,
+                    "text": (
+                        "3.1.8.2.- Producto: MEDICAMENTO EN LÍNEA\n"
+                        "Ingrediente activo: semaglutida\nExpediente: 8182\n"
+                        "Solicitud: Evaluación farmacológica.\n"
+                        "Concepto: Se aprueba la solicitud."
+                    ),
+                }
+            ]
+        )[0]
+
+        self.assertEqual(record.numeral, "3.1.8.2")
+        self.assertEqual(record.producto, "MEDICAMENTO EN LÍNEA")
+
+    def test_repeated_headers_and_footers_do_not_pollute_continuations(self) -> None:
+        header = "SALA ESPECIALIZADA DE MEDICAMENTOS - ACTA HISTÓRICA"
+        footer = "Instituto Nacional de Vigilancia de Medicamentos y Alimentos"
+        pages = [
+            {
+                "page": 30,
+                "text": (
+                    f"{header}\n3.4.5 PRODUCTO BIOLÓGICO\nProducto: BIO X\n"
+                    "Ingrediente activo: anticuerpo alfa\nExpediente: 3030\n"
+                    "Solicitud: Modificación de indicaciones que continúa\n"
+                    f"{footer}"
+                ),
+            },
+            {
+                "page": 31,
+                "text": (
+                    f"{header}\nen la página siguiente.\nConcepto: La Sala requiere\n"
+                    f"información complementaria.\n{footer}"
+                ),
+            },
+            {"page": 32, "text": f"{header}\nPágina 32 de 40\n{footer}"},
+        ]
+
+        record = extract_regulatory_records(pages)[0]
+
+        self.assertNotIn("Instituto Nacional", record.solicitud or "")
+        self.assertNotIn("SALA ESPECIALIZADA", record.solicitud or "")
+        self.assertIn("página siguiente", record.solicitud or "")
+        self.assertEqual(record.pagina_final, 31)
+        page_range = record.evidence_for("rango_paginas")[0]
+        self.assertEqual((page_range.pagina, page_range.pagina_final), (30, 31))
+
+    def test_numbered_requirements_are_not_mistaken_for_new_records(self) -> None:
+        record = extract_regulatory_records(
+            [
+                {
+                    "page": 4,
+                    "text": (
+                        "3.2.1 EVALUACIÓN\nProducto: FÁRMACO A\nExpediente: 44\n"
+                        "Solicitud: Modificación.\nConcepto: La Sala requiere:\n"
+                        "1. Presentar el estudio de estabilidad.\n"
+                        "2. Aclarar la concentración."
+                    ),
+                }
+            ]
+        )[0]
+
+        self.assertEqual(record.numeral, "3.2.1")
+        self.assertIn("Presentar el estudio", record.concepto or "")
+        self.assertIn("Aclarar la concentración", record.concepto or "")
+
+    def test_field_evidence_is_serializable_and_bounded(self) -> None:
+        record = extract_regulatory_records(
+            [
+                {
+                    "page": 6,
+                    "text": (
+                        "5.1 PRODUCTOS\nProducto: MEDICAMENTO P\n"
+                        "Principio activo: semaglutida\nExpediente: 123\n"
+                        "Solicitud: Registro sanitario.\nConcepto: Se aprueba."
+                    ),
+                }
+            ]
+        )[0]
+
+        serialized = record.as_dict()
+        json.dumps(serialized, ensure_ascii=False)
+        product = record.evidence_for("producto")[0]
+        self.assertEqual(product.valor_literal, "MEDICAMENTO P")
+        self.assertEqual(product.metodo, "explicit_label")
+        self.assertGreaterEqual(product.confianza, 0.0)
+        self.assertLessEqual(product.confianza, 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

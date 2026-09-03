@@ -182,22 +182,28 @@ def _index_documents(
                 ocr_min_chars=OCR_MIN_CHARS,
             )
             if not pages:
-                raise ValueError("No se extrajo texto; el documento podría requerir OCR")
+                raise ValueError("El PDF no contiene páginas físicas")
 
             indexed_pages: list[dict] = []
             for page in pages:
-                chunks = chunk_text(
-                    page["text"],
-                    chunk_size=CHUNK_SIZE,
-                    overlap=CHUNK_OVERLAP,
+                text = page.get("text")
+                chunks = (
+                    chunk_text(
+                        str(text),
+                        chunk_size=CHUNK_SIZE,
+                        overlap=CHUNK_OVERLAP,
+                    )
+                    if text
+                    else []
                 )
-                if not chunks:
-                    continue
                 indexed_pages.append({**page, "chunks": chunks})
                 report.chunks_indexed += len(chunks)
 
-            if not indexed_pages:
-                raise ValueError("El PDF no produjo fragmentos consultables")
+            page_numbers = {int(page["page"]) for page in indexed_pages}
+            pdf_page_count = max(page_numbers, default=0)
+            page_inventory_complete = page_numbers == set(
+                range(1, pdf_page_count + 1)
+            )
 
             insert_document(
                 database_path,
@@ -205,11 +211,14 @@ def _index_documents(
                 file_sha256(downloaded.path),
                 indexed_pages,
                 manifest_url=metadata.url,
-                pdf_page_count=len(pages) + len(possible_scans),
+                pdf_page_count=pdf_page_count,
                 possible_scans=possible_scans,
+                page_inventory_complete=page_inventory_complete,
             )
             report.documents_indexed += 1
-            report.pages_indexed += len(indexed_pages)
+            report.pages_indexed += sum(
+                bool(page.get("chunks")) for page in indexed_pages
+            )
             report.ocr_pages_indexed += sum(
                 bool(page.get("ocr_used")) for page in indexed_pages
             )
@@ -272,9 +281,14 @@ def _migrate_legacy_index(
             for position, row in enumerate(legacy_documents, start=1):
                 if progress_callback:
                     progress_callback(position, len(legacy_documents), row["title"])
+                legacy_page_columns = {
+                    column[1]
+                    for column in source.execute("PRAGMA table_info(pages)").fetchall()
+                }
+                legacy_text_select = ", text" if "text" in legacy_page_columns else ""
                 page_rows = source.execute(
-                    """
-                    SELECT id, page_number
+                    f"""
+                    SELECT id, page_number{legacy_text_select}
                     FROM pages
                     WHERE document_id = ?
                     ORDER BY page_number
@@ -285,6 +299,15 @@ def _migrate_legacy_index(
                     int(page["id"]): {
                         "page": int(page["page_number"]),
                         "chunks": [],
+                        **(
+                            {
+                                "text": str(page["text"]),
+                                "text_source": "native_pdf",
+                                "text_extractor_version": "legacy-page-text-v1",
+                            }
+                            if "text" in legacy_page_columns and page["text"] is not None
+                            else {}
+                        ),
                     }
                     for page in page_rows
                 }

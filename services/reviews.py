@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Mapping
 
+from services.effective_records import EFFECTIVE_FIELDS
+
 
 REVIEW_STATUSES = ("reviewed", "approved", "reopened")
 OUTCOME_CODES = (
@@ -36,22 +38,7 @@ REQUEST_TYPE_CODES = (
     "cancelacion",
     "otra_solicitud",
 )
-REVIEW_FIELDS = (
-    "numeral",
-    "numeral_title",
-    "session_date",
-    "request_type_code",
-    "product_name",
-    "active_ingredient",
-    "interested_party",
-    "expediente",
-    "radicado",
-    "request_text",
-    "concept_text",
-    "outcome_code",
-    "page_number",
-    "end_page_number",
-)
+REVIEW_FIELDS = EFFECTIVE_FIELDS
 CSV_FIELDS = (
     "event_id",
     "decision_uid",
@@ -313,43 +300,18 @@ def effective_record(
     record: Mapping[str, object],
     event: ReviewEvent | None,
 ) -> dict[str, object]:
-    result = dict(record)
-    result["review_status"] = "automatic"
-    result["reviewer"] = ""
-    result["reviewed_at"] = ""
-    result["review_notes"] = ""
-    result["review_stale"] = False
-    result["automatic_values"] = {
-        field: record.get(field) for field in REVIEW_FIELDS
-    }
-    if event is None:
-        return result
-    stale = bool(
-        (
-            event.source_document_hash
-            and event.source_document_hash != str(record.get("document_hash") or "")
-        )
-        or (
-            event.source_record_key
-            and event.source_record_key != str(record.get("record_key") or "")
-        )
-    )
-    result["review_stale"] = stale
-    result["review_status"] = "stale" if stale else event.status
-    result["reviewer"] = event.reviewer
-    result["reviewed_at"] = event.reviewed_at
-    result["review_notes"] = event.notes
-    if not stale and event.status != "reopened":
-        result.update(event.corrections)
-    return result
+    # Importación local para conservar la API histórica y evitar que el módulo
+    # de valores vigentes dependa del formato CSV de revisiones.
+    from services.effective_records import effective_record as resolve_record
+
+    return resolve_record(record, event)
 
 
 def apply_latest_reviews(
     records: Iterable[Mapping[str, object]],
     events: Iterable[ReviewEvent],
 ) -> list[dict[str, object]]:
+    from services.effective_records import apply_effective_records
+
     current = latest_reviews(events)
-    return [
-        effective_record(record, current.get(str(record.get("decision_uid") or "")))
-        for record in records
-    ]
+    return apply_effective_records(records, current)

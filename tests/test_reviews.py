@@ -45,7 +45,7 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(effective["review_status"], "reviewed")
         self.assertEqual(effective["automatic_values"]["product_name"], "Producto automático")
 
-    def test_marks_review_stale_when_extraction_or_pdf_changes(self) -> None:
+    def test_reextraction_preserves_review_and_pdf_change_marks_it_stale(self) -> None:
         event = new_review_event(
             self.record,
             status="approved",
@@ -57,9 +57,16 @@ class ReviewTests(unittest.TestCase):
         changed = dict(self.record, record_key="new-record-hash")
         effective = effective_record(changed, event)
 
-        self.assertTrue(effective["review_stale"])
-        self.assertEqual(effective["review_status"], "stale")
-        self.assertEqual(effective["product_name"], "Producto automático")
+        self.assertFalse(effective["review_stale"])
+        self.assertTrue(effective["review_needs_reconfirmation"])
+        self.assertEqual(effective["review_status"], "approved")
+        self.assertEqual(effective["product_name"], "Corregido")
+
+        changed_pdf = dict(changed, document_hash="new-document-hash")
+        stale = effective_record(changed_pdf, event)
+        self.assertTrue(stale["review_stale"])
+        self.assertEqual(stale["review_status"], "stale")
+        self.assertEqual(stale["product_name"], "Producto automático")
 
     def test_latest_review_is_ordered_by_utc_instant(self) -> None:
         older_with_later_wall_clock = ReviewEvent(

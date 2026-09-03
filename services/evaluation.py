@@ -15,6 +15,7 @@ evita premiar a un modo por devolver varias páginas de una misma acta.
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import re
@@ -26,6 +27,7 @@ from typing import Iterable, Mapping, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
 from services.database import connect
+from services.integrity import REGULATORY_COMPLETENESS_FIELDS
 from services.models import SearchResult
 from services.search import SEARCH_MODES, search_corpus
 from services.text_utils import normalize_text
@@ -57,6 +59,16 @@ ALLOWED_FILTERS = frozenset(
 )
 MAX_CASES = 250
 MAX_TOP_K = 50
+RELEASE_MIN_ENABLED_CASES = 15
+RELEASE_MIN_EXPECTED_DECISIONS = 30
+RELEASE_COMPLETENESS_FIELDS = (
+    "numeral",
+    "product",
+    "active_ingredient",
+    "interested_party",
+    "expediente",
+    "radicado",
+)
 _CASE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 _DANGEROUS_CSV_PREFIXES = ("=", "+", "-", "@")
 
@@ -353,17 +365,31 @@ def evaluation_cases_to_csv(cases: Iterable[EvaluationCase]) -> str:
 
 
 def evaluation_template_csv() -> str:
-    """Plantilla segura: el ejemplo está deshabilitado hasta ser validado."""
-    example = EvaluationCase(
-        case_id="ejemplo-001",
-        query="producto o concepto que deseas recuperar",
-        expected_refs=("acta:2026:01:SEMPB",),
-        filters={"years": [2026]},
-        k=10,
-        notes="Reemplaza este ejemplo por una consulta validada por un revisor.",
-        enabled=False,
-    )
-    return evaluation_cases_to_csv([example])
+    """Plantilla segura: ningún caso se habilita sin validación humana."""
+    examples = [
+        EvaluationCase(
+            case_id="ejemplo-001",
+            query="producto o concepto que deseas recuperar",
+            expected_refs=("title:REEMPLAZA POR EL TÍTULO OFICIAL VALIDADO",),
+            filters={},
+            k=10,
+            notes="Completa la fuente esperada y habilita solo después de revisarla.",
+            enabled=False,
+        ),
+        EvaluationCase(
+            case_id="semaglutida-2017",
+            query="Semaglutida",
+            expected_refs=("acta:2017:14:SEMPB",),
+            filters={"years": [2017]},
+            k=10,
+            notes=(
+                "Caso obligatorio 0.7: comprueba la fuente oficial y cambia enabled "
+                "a true solo después de la revisión humana."
+            ),
+            enabled=False,
+        ),
+    ]
+    return evaluation_cases_to_csv(examples)
 
 
 def _result_matches(
@@ -626,6 +652,431 @@ def summarize_evaluation(
     return [row for row in summary if row["cases"]]
 
 
+def evaluation_bank_profile(cases: Iterable[EvaluationCase]) -> dict:
+    """Describe si el banco cumple el mínimo acordado sin inventar casos oro."""
+    rows = list(cases)
+    enabled = [case for case in rows if case.enabled]
+    placeholder_refs = sorted(
+        {
+            reference.strip()
+            for case in enabled
+            for reference in case.expected_refs
+            if any(
+                marker in normalize_text(reference)
+                for marker in ("reemplaza", "placeholder", "por validar")
+            )
+        }
+    )
+    expected_refs = {
+        reference.strip()
+        for case in enabled
+        for reference in case.expected_refs
+        if reference.strip()
+        and reference.strip() not in placeholder_refs
+    }
+    semaglutida_cases = [
+        case.case_id
+        for case in enabled
+        if "semaglutida" in normalize_text(f"{case.query} {case.notes}")
+        and not any(reference in placeholder_refs for reference in case.expected_refs)
+    ]
+    return {
+        "cases_total": len(rows),
+        "cases_enabled": len(enabled),
+        "unique_expected_refs": len(expected_refs),
+        "placeholder_refs": placeholder_refs,
+        "semaglutida_case_ids": semaglutida_cases,
+        "has_semaglutida_case": bool(semaglutida_cases),
+        "minimum_enabled_cases": RELEASE_MIN_ENABLED_CASES,
+        "minimum_expected_decisions": RELEASE_MIN_EXPECTED_DECISIONS,
+        "signature": evaluation_bank_signature(rows),
+    }
+
+
+def evaluation_bank_signature(cases: Iterable[EvaluationCase]) -> str:
+    enabled = [case for case in cases if case.enabled]
+    payload = evaluation_cases_to_csv(enabled).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _quality_payload(value: Mapping | None) -> Mapping | None:
+    if not value:
+        return None
+    nested = value.get("extractor_quality")
+    if isinstance(nested, Mapping):
+        return nested
+    nested = value.get("regulatory_quality_snapshot")
+    if isinstance(nested, Mapping):
+        return nested
+    return value if "fields" in value and "records" in value else None
+
+
+def compare_extractor_quality(
+    current: Mapping | None,
+    baseline: Mapping | None,
+) -> dict:
+    """Compara cobertura automática; precisión requiere anotación humana aparte."""
+    current_quality = _quality_payload(current)
+    baseline_quality = _quality_payload(baseline)
+    if not current_quality or not baseline_quality:
+        return {
+            "status": "unavailable",
+            "reason": "No existe una línea base comparable de extracción.",
+            "record_delta": None,
+            "fields": [],
+        }
+    if (
+        current_quality.get("status") != "available"
+        or baseline_quality.get("status") != "available"
+    ):
+        return {
+            "status": "unavailable",
+            "reason": "La extracción actual o la línea base no está disponible.",
+            "record_delta": None,
+            "fields": [],
+        }
+
+    def by_key(payload: Mapping) -> dict[str, Mapping]:
+        return {
+            str(item.get("key")): item
+            for item in payload.get("fields") or []
+            if isinstance(item, Mapping) and item.get("key")
+        }
+
+    current_fields = by_key(current_quality)
+    baseline_fields = by_key(baseline_quality)
+    ordered_keys = list(
+        dict.fromkeys(
+            [item[0] for item in REGULATORY_COMPLETENESS_FIELDS]
+            + list(baseline_fields)
+            + list(current_fields)
+        )
+    )
+    comparisons: list[dict] = []
+    for key in ordered_keys:
+        before = baseline_fields.get(key)
+        after = current_fields.get(key)
+        before_percent = (
+            _safe_float(before.get("coverage_percent"))
+            if before and before.get("coverage_percent") is not None
+            else None
+        )
+        after_percent = (
+            _safe_float(after.get("coverage_percent"))
+            if after and after.get("coverage_percent") is not None
+            else None
+        )
+        comparable = bool(
+            before
+            and after
+            and before.get("available")
+            and after.get("available")
+            and before_percent is not None
+            and after_percent is not None
+        )
+        comparisons.append(
+            {
+                "key": key,
+                "label": str(
+                    (after or before or {}).get("label") or key.replace("_", " ")
+                ),
+                "comparable": comparable,
+                "baseline_present": _safe_int((before or {}).get("present")),
+                "current_present": _safe_int((after or {}).get("present")),
+                "present_delta": (
+                    _safe_int((after or {}).get("present"))
+                    - _safe_int((before or {}).get("present"))
+                    if comparable
+                    else None
+                ),
+                "baseline_percent": before_percent,
+                "current_percent": after_percent,
+                "delta_percentage_points": round(after_percent - before_percent, 4)
+                if comparable
+                else None,
+            }
+        )
+    return {
+        "status": "comparable",
+        "reason": "",
+        "baseline_records": _safe_int(baseline_quality.get("records")),
+        "current_records": _safe_int(current_quality.get("records")),
+        "record_delta": _safe_int(current_quality.get("records"))
+        - _safe_int(baseline_quality.get("records")),
+        "fields": comparisons,
+        "note": (
+            "La comparación mide completitud automática. No estima precisión sin "
+            "un patrón oro de campos revisados."
+        ),
+    }
+
+
+def compare_retrieval_summaries(
+    current: Sequence[Mapping],
+    baseline: Sequence[Mapping] | None,
+    *,
+    current_bank_signature: str | None = None,
+    baseline_bank_signature: str | None = None,
+) -> dict:
+    if (
+        current_bank_signature is not None
+        and baseline_bank_signature != current_bank_signature
+    ):
+        return {
+            "status": "unavailable",
+            "reason": "La línea base corresponde a otro banco de consultas.",
+            "rows": [],
+        }
+    if not baseline:
+        return {
+            "status": "unavailable",
+            "reason": "No existe una línea base comparable de recuperación.",
+            "rows": [],
+        }
+    before_by_mode = {
+        str(row.get("mode")): row for row in baseline if isinstance(row, Mapping)
+    }
+    after_by_mode = {
+        str(row.get("mode")): row for row in current if isinstance(row, Mapping)
+    }
+    rows: list[dict] = []
+    for mode in SEARCH_MODES:
+        before = before_by_mode.get(mode)
+        after = after_by_mode.get(mode)
+        if not before or not after:
+            rows.append({"mode": mode, "comparable": False})
+            continue
+        row: dict[str, object] = {"mode": mode, "comparable": True}
+        for metric in ("hit_at_k", "recall_at_k", "mrr"):
+            before_value = _safe_float(before.get(metric))
+            after_value = _safe_float(after.get(metric))
+            row[f"baseline_{metric}"] = before_value
+            row[f"current_{metric}"] = after_value
+            row[f"delta_{metric}"] = round(after_value - before_value, 6)
+        rows.append(row)
+    return {
+        "status": "comparable"
+        if rows and all(row.get("comparable") for row in rows)
+        else "incomplete",
+        "reason": "",
+        "rows": rows,
+    }
+
+
+def build_quality_gate(
+    *,
+    release_mode: bool,
+    cases: Iterable[EvaluationCase],
+    results: Iterable[EvaluationResult],
+    extractor_quality: Mapping | None,
+    extractor_comparison: Mapping | None,
+    retrieval_comparison: Mapping | None,
+    integrity_report: Mapping | None,
+    bank_errors: Sequence[str] = (),
+    minimum_enabled_cases: int = RELEASE_MIN_ENABLED_CASES,
+    minimum_expected_decisions: int = RELEASE_MIN_EXPECTED_DECISIONS,
+    max_retrieval_drop: float = 0.0,
+    max_completeness_drop_pp: float = 0.0,
+) -> dict:
+    """Construye un gate auditable; solo ``release_mode`` bloquea publicación."""
+    case_rows = list(cases)
+    result_rows = list(results)
+    profile = evaluation_bank_profile(case_rows)
+    checks: list[dict[str, object]] = []
+
+    def check(key: str, label: str, passed: bool, detail: str) -> None:
+        checks.append(
+            {
+                "key": key,
+                "label": label,
+                "passed": bool(passed),
+                "blocking": bool(release_mode and not passed),
+                "detail": detail,
+            }
+        )
+
+    check(
+        "valid_bank",
+        "Banco sin errores",
+        not bank_errors and not profile["placeholder_refs"],
+        "Sin errores de formato."
+        if not bank_errors and not profile["placeholder_refs"]
+        else (
+            f"{len(bank_errors)} error(es) y "
+            f"{len(profile['placeholder_refs'])} referencia(s) de plantilla."
+        ),
+    )
+    check(
+        "minimum_cases",
+        "Mínimo de consultas verificadas",
+        profile["cases_enabled"] >= minimum_enabled_cases,
+        f"{profile['cases_enabled']} habilitadas; mínimo {minimum_enabled_cases}.",
+    )
+    check(
+        "minimum_decisions",
+        "Mínimo de decisiones esperadas",
+        profile["unique_expected_refs"] >= minimum_expected_decisions,
+        f"{profile['unique_expected_refs']} referencias únicas; mínimo "
+        f"{minimum_expected_decisions}.",
+    )
+    check(
+        "semaglutida_case",
+        "Caso verificable de semaglutida",
+        bool(profile["has_semaglutida_case"]),
+        "Caso(s): " + ", ".join(profile["semaglutida_case_ids"])
+        if profile["has_semaglutida_case"]
+        else "No hay un caso habilitado; la plantilla incluye uno por completar.",
+    )
+
+    enabled_count = int(profile["cases_enabled"])
+    expected_runs = enabled_count * len(SEARCH_MODES)
+    check(
+        "evaluation_completed",
+        "Evaluación completa de los tres modos",
+        len(result_rows) == expected_runs and expected_runs > 0,
+        f"{len(result_rows)} ejecuciones de {expected_runs} esperadas.",
+    )
+    result_errors = sum(bool(result.error) for result in result_rows)
+    check(
+        "evaluation_errors",
+        "Consultas ejecutadas sin error",
+        result_errors == 0 and bool(result_rows),
+        f"{result_errors} ejecución(es) con error.",
+    )
+    fallbacks = sum(
+        result.used_mode != result.requested_mode and not result.error
+        for result in result_rows
+    )
+    check(
+        "search_modes_available",
+        "Modos evaluados sin fallback",
+        fallbacks == 0 and bool(result_rows),
+        f"{fallbacks} ejecución(es) usaron otro modo.",
+    )
+    semaglutida_ids = set(profile["semaglutida_case_ids"])
+    semaglutida_hybrid = [
+        result
+        for result in result_rows
+        if result.case_id in semaglutida_ids and result.requested_mode == "hybrid"
+    ]
+    check(
+        "semaglutida_recovered",
+        "Semaglutida recuperada en modo híbrido",
+        bool(semaglutida_hybrid)
+        and all(result.hit_at_k == 1.0 and not result.error for result in semaglutida_hybrid),
+        "La fuente esperada apareció en Hit@K."
+        if semaglutida_hybrid
+        and all(result.hit_at_k == 1.0 and not result.error for result in semaglutida_hybrid)
+        else "El caso falta o no recuperó su fuente esperada.",
+    )
+
+    integrity_ok = bool(integrity_report) and str(
+        (integrity_report or {}).get("status")
+    ) in {"ok", "warning"}
+    check(
+        "integrity",
+        "Integridad técnica del candidato",
+        integrity_ok,
+        "Informe disponible sin errores."
+        if integrity_ok
+        else "Falta el informe o reporta errores.",
+    )
+
+    quality = _quality_payload(extractor_quality)
+    quality_available = bool(quality and quality.get("status") == "available")
+    check(
+        "extractor_metrics",
+        "Métricas del extractor disponibles",
+        quality_available and _safe_int((quality or {}).get("records")) > 0,
+        f"{_safe_int((quality or {}).get('records'))} fichas medidas.",
+    )
+
+    extractor_comparable = bool(
+        extractor_comparison
+        and extractor_comparison.get("status") == "comparable"
+    )
+    check(
+        "extractor_baseline",
+        "Línea base del extractor comparable",
+        extractor_comparable,
+        "Comparación antes/después disponible."
+        if extractor_comparable
+        else "No hay línea base comparable.",
+    )
+    field_rows = {
+        str(row.get("key")): row
+        for row in (extractor_comparison or {}).get("fields") or []
+        if isinstance(row, Mapping)
+    }
+    for field in RELEASE_COMPLETENESS_FIELDS:
+        row = field_rows.get(field)
+        delta = row.get("delta_percentage_points") if row else None
+        passed = bool(
+            row
+            and row.get("comparable")
+            and delta is not None
+            and float(delta) >= -abs(max_completeness_drop_pp)
+        )
+        label = str((row or {}).get("label") or field.replace("_", " "))
+        detail = (
+            f"Cambio: {float(delta):+.2f} puntos porcentuales; caída máxima "
+            f"permitida: {abs(max_completeness_drop_pp):.2f}."
+            if delta is not None
+            else "Campo no comparable con la línea base."
+        )
+        check(f"completeness_{field}", f"Completitud: {label}", passed, detail)
+
+    retrieval_comparable = bool(
+        retrieval_comparison
+        and retrieval_comparison.get("status") == "comparable"
+    )
+    check(
+        "retrieval_baseline",
+        "Línea base de recuperación comparable",
+        retrieval_comparable,
+        "Comparación antes/después disponible."
+        if retrieval_comparable
+        else "No hay línea base comparable para los tres modos.",
+    )
+    retrieval_rows = (retrieval_comparison or {}).get("rows") or []
+    regressions = [
+        (str(row.get("mode")), metric, float(row.get(f"delta_{metric}") or 0.0))
+        for row in retrieval_rows
+        if row.get("comparable")
+        for metric in ("hit_at_k", "recall_at_k", "mrr")
+        if float(row.get(f"delta_{metric}") or 0.0) < -abs(max_retrieval_drop)
+    ]
+    check(
+        "retrieval_regression",
+        "Sin regresiones de recuperación",
+        retrieval_comparable and not regressions,
+        "Sin caídas sobre el umbral."
+        if retrieval_comparable and not regressions
+        else (
+            f"{len(regressions)} caída(s) superan {abs(max_retrieval_drop):.3f}."
+            if retrieval_comparable
+            else "No fue posible comparar recuperación."
+        ),
+    )
+
+    failed = [item for item in checks if not item["passed"]]
+    return {
+        "mode": "release" if release_mode else "advisory",
+        "status": "pass" if not failed else ("fail" if release_mode else "advisory"),
+        "can_publish": not failed if release_mode else True,
+        "checks_passed": len(checks) - len(failed),
+        "checks_total": len(checks),
+        "blocking_failures": sum(bool(item["blocking"]) for item in checks),
+        "thresholds": {
+            "minimum_enabled_cases": minimum_enabled_cases,
+            "minimum_expected_decisions": minimum_expected_decisions,
+            "max_retrieval_drop": abs(max_retrieval_drop),
+            "max_completeness_drop_pp": abs(max_completeness_drop_pp),
+        },
+        "checks": checks,
+    }
+
+
 def _safe_csv_value(value: object) -> object:
     if not isinstance(value, str):
         return value
@@ -655,6 +1106,11 @@ def _load_json_report(path: Path) -> dict | None:
     except (OSError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def load_evaluation_report(path: Path) -> dict | None:
+    """Carga de forma segura un reporte previo para la comparación de release."""
+    return _load_json_report(path)
 
 
 def _parse_report_time(value: object) -> datetime | None:

@@ -1,7 +1,32 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import Any, Literal
+
+
+PageTextSource = Literal["native_pdf", "ocr"]
+
+
+@dataclass(frozen=True)
+class PageSourceText:
+    """Texto fuente preservado antes de dividirlo para búsqueda."""
+
+    page_number: int
+    text: str
+    source: PageTextSource
+    extractor_version: str
+    quality: float | None = None
+    error: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.page_number < 1:
+            raise ValueError("El número de página debe ser positivo")
+        if self.source not in {"native_pdf", "ocr"}:
+            raise ValueError("La fuente del texto debe ser native_pdf u ocr")
+        if self.quality is not None and not 0 <= self.quality <= 1:
+            raise ValueError("La calidad del texto debe estar entre 0 y 1")
+        if not self.extractor_version.strip():
+            raise ValueError("La versión del extractor de texto es obligatoria")
 
 
 @dataclass(frozen=True)

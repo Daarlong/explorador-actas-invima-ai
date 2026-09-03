@@ -8,6 +8,7 @@ from config import (
     CATALOG_REPORT_PATH,
     DATABASE_PATH,
     EVALUATION_CASES_PATH,
+    EVALUATION_REPORT_PATH,
     INDEXING_REPORT_PATH,
     INTEGRITY_REPORT_PATH,
     SEMANTIC_INDEX_PATH,
@@ -18,13 +19,16 @@ from services.evaluation import (
     MAX_CASES,
     audit_corpus_reports,
     evaluate_cases,
+    evaluation_bank_profile,
     evaluation_cases_to_csv,
     evaluation_results_to_csv,
     evaluation_template_csv,
+    load_evaluation_report,
     load_evaluation_cases,
     parse_evaluation_cases_csv,
     summarize_evaluation,
 )
+from services.integrity import load_integrity_report
 
 
 st.set_page_config(page_title="Evaluación", page_icon="📊", layout="wide")
@@ -172,7 +176,94 @@ if missing_documents:
             st.write(f"- {title}")
 
 st.divider()
-st.subheader("2. Banco de consultas regulatorias")
+st.subheader("2. Calidad de la extracción regulatoria")
+stored_evaluation_report = load_evaluation_report(EVALUATION_REPORT_PATH) or {}
+integrity_payload = load_integrity_report(INTEGRITY_REPORT_PATH) or {}
+extractor_quality = (
+    stored_evaluation_report.get("extractor_quality")
+    or integrity_payload.get("regulatory_quality_snapshot")
+    or {}
+)
+quality_fields = extractor_quality.get("fields") or []
+if extractor_quality.get("status") == "available" and quality_fields:
+    st.caption(
+        "La completitud indica si existe un valor automático. No equivale a "
+        "precisión; esa medición necesita fichas verificadas por una persona."
+    )
+    st.dataframe(
+        [
+            {
+                "Campo": item.get("label"),
+                "Con valor": item.get("present", 0),
+                "Sin extraer": item.get("missing", 0),
+                "Cobertura": _metric_percent(item.get("coverage_percent")),
+            }
+            for item in quality_fields
+        ],
+        hide_index=True,
+        use_container_width=True,
+    )
+else:
+    st.info(
+        "Todavía no hay métricas de extracción disponibles. Se generarán al "
+        "construir o reprocesar la base."
+    )
+
+comparison = stored_evaluation_report.get("extractor_comparison") or {}
+if comparison.get("status") == "comparable":
+    with st.expander("Comparación antes/después del extractor", expanded=True):
+        st.dataframe(
+            [
+                {
+                    "Campo": item.get("label"),
+                    "Antes": _metric_percent(item.get("baseline_percent")),
+                    "Después": _metric_percent(item.get("current_percent")),
+                    "Cambio": (
+                        f"{float(item['delta_percentage_points']):+.2f} pp"
+                        if item.get("delta_percentage_points") is not None
+                        else "No comparable"
+                    ),
+                }
+                for item in comparison.get("fields") or []
+            ],
+            hide_index=True,
+            use_container_width=True,
+        )
+        st.caption(comparison.get("note") or "")
+
+quality_gate = stored_evaluation_report.get("quality_gate") or {}
+if quality_gate:
+    gate_status = quality_gate.get("status")
+    if gate_status == "pass":
+        st.success("El último control de calidad permite publicar esta base.")
+    elif gate_status == "fail":
+        st.error("El último control de calidad bloqueó la publicación.")
+    else:
+        st.warning(
+            "El último control fue informativo: sus pendientes no bloquearon "
+            "la base porque no se ejecutó en modo release."
+        )
+    with st.expander(
+        f"Controles del gate ({quality_gate.get('checks_passed', 0)}/"
+        f"{quality_gate.get('checks_total', 0)})",
+        expanded=gate_status == "fail",
+    ):
+        st.dataframe(
+            [
+                {
+                    "Estado": "Cumple" if item.get("passed") else "Pendiente",
+                    "Control": item.get("label"),
+                    "Detalle": item.get("detail"),
+                    "Bloquea": "Sí" if item.get("blocking") else "No",
+                }
+                for item in quality_gate.get("checks") or []
+            ],
+            hide_index=True,
+            use_container_width=True,
+        )
+
+st.divider()
+st.subheader("3. Banco de consultas regulatorias")
 st.write(
     "Cada caso indica una consulta y una o más actas que un revisor espera "
     "encontrar. El CSV puede guardarse en el repositorio para repetir exactamente "
@@ -214,13 +305,32 @@ if case_errors:
             st.write(f"- {error}")
 
 enabled_cases = [case for case in cases if case.enabled]
+bank_profile = evaluation_bank_profile(cases)
 current_bank_signature = hashlib.sha256(
     evaluation_cases_to_csv(enabled_cases).encode("utf-8")
 ).hexdigest()
-bank_col1, bank_col2, bank_col3 = st.columns(3)
+bank_col1, bank_col2, bank_col3, bank_col4 = st.columns(4)
 bank_col1.metric("Casos cargados", len(cases))
 bank_col2.metric("Casos habilitados", len(enabled_cases))
-bank_col3.metric("Fuente", bank_source)
+bank_col3.metric(
+    "Decisiones esperadas únicas", bank_profile.get("unique_expected_refs", 0)
+)
+bank_col4.metric(
+    "Caso semaglutida",
+    "Sí" if bank_profile.get("has_semaglutida_case") else "Pendiente",
+)
+st.caption(f"Fuente del banco: {bank_source}")
+if (
+    len(enabled_cases) < bank_profile.get("minimum_enabled_cases", 15)
+    or bank_profile.get("unique_expected_refs", 0)
+    < bank_profile.get("minimum_expected_decisions", 30)
+    or not bank_profile.get("has_semaglutida_case")
+):
+    st.warning(
+        "El banco todavía sirve para pruebas manuales, pero no cumple el mínimo "
+        "del gate de publicación: 15 consultas, 30 decisiones esperadas únicas y "
+        "un caso de semaglutida verificado."
+    )
 
 if cases:
     st.dataframe(
@@ -263,7 +373,7 @@ st.caption(
 )
 
 st.divider()
-st.subheader("3. Comparar modos de búsqueda")
+st.subheader("4. Comparar modos de búsqueda")
 mode_labels = {
     "Textual": "textual",
     "Híbrida": "hybrid",
