@@ -254,8 +254,9 @@ class RegulatoryExtractionTests(unittest.TestCase):
                         "Radicado: 2017041330\n"
                         "Interesado: Novo Nordisk Colombia S.A.S.\n"
                         "Composición:\nCada mL contiene 1.34mg de\nSemaglutida\n"
-                        "Solicitud: Evaluación farmacológica.\n"
-                        "Concepto: La Sala emite concepto favorable."
+                        "SOLICITUD DEL PETICIONARIO: Evaluación farmacológica.\n"
+                        "CONCEPTO SALA ESPECIALIZADA: La Sala emite concepto "
+                        "favorable."
                     ),
                 }
             ]
@@ -426,6 +427,47 @@ class RegulatoryExtractionTests(unittest.TestCase):
         self.assertIsNone(unrelated.principio_activo)
         self.assertEqual(unrelated.principios_activos, ())
 
+    def test_merged_historical_blocks_get_unique_evidence_ordinals(self) -> None:
+        pages = [
+            {
+                "page": 77,
+                "text": (
+                    "3.1.1 MEDICAMENTO X\n"
+                    "Producto: MEDICAMENTO X\n"
+                    "Principio activo: semaglutida 1 mg\n"
+                    "Expediente: 12345\n"
+                    "Solicitud: Registro sanitario\n"
+                    "Concepto: Se aprueba.\n"
+                    "3.1.2 MEDICAMENTO X\n"
+                    "Producto: MEDICAMENTO X\n"
+                    "Principios activos: semaglutida 1 mg + cagrilintida 2 mg\n"
+                    "Expediente: 12345\n"
+                    "Solicitud: Registro sanitario del producto\n"
+                    "Concepto: Se aprueba. Se autoriza la comercialización."
+                ),
+            }
+        ]
+
+        first = extract_regulatory_records(pages)
+        second = extract_regulatory_records(pages)
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(first[0].as_dict(), second[0].as_dict())
+        evidence_keys = [
+            (item.campo, item.ordinal) for item in first[0].evidencias_campos
+        ]
+        self.assertEqual(len(evidence_keys), len(set(evidence_keys)))
+        self.assertEqual(
+            [item.ordinal for item in first[0].evidence_for("solicitud")],
+            [1, 2],
+        )
+        active_evidence = first[0].evidence_for("principio_activo")
+        self.assertEqual([item.ordinal for item in active_evidence], [1, 2, 3])
+        self.assertEqual(
+            {item.valor_canonico for item in active_evidence},
+            {"semaglutida", "cagrilintida"},
+        )
+
     def test_supports_multiline_bulleted_active_ingredients(self) -> None:
         record = extract_regulatory_records(
             [
@@ -546,6 +588,116 @@ class RegulatoryExtractionTests(unittest.TestCase):
         self.assertEqual(record.numeral, "3.2.1")
         self.assertIn("Presentar el estudio", record.concepto or "")
         self.assertIn("Aclarar la concentración", record.concepto or "")
+
+    def test_uppercase_numbered_requirements_remain_inside_concept(self) -> None:
+        record = extract_regulatory_records(
+            [
+                {
+                    "page": 44,
+                    "text": (
+                        "3.2.8 MEDICAMENTO HISTÓRICO\nInteresado: LABORATORIO A\n"
+                        "Expediente: 19990001\nRadicado: 20130000001\n"
+                        "Solicitud: Modificación de indicaciones.\n"
+                        "Concepto: Se requiere:\n"
+                        "1. PRESENTAR INFORMACIÓN DEL PRODUCTO\n"
+                        "2. ACLARAR LOS RESULTADOS DEL ESTUDIO"
+                    ),
+                }
+            ]
+        )[0]
+
+        self.assertEqual(record.numeral, "3.2.8")
+        self.assertIn("PRESENTAR INFORMACIÓN", record.concepto or "")
+        self.assertIn("ACLARAR LOS RESULTADOS", record.concepto or "")
+        self.assertEqual(record.resultado_normalizado, RESULT_REQUIRED)
+
+    def test_roman_initial_words_do_not_split_historical_blocks(self) -> None:
+        records = extract_regulatory_records(
+            [
+                {
+                    "page": 61,
+                    "text": (
+                        "3.13.20 MEDICAMENTO A\nInteresado:\n"
+                        "LABORATORIOS EJEMPLO S.A.S.\nExpediente:\n20052699\n"
+                        "Radicado:\n2013076092\nSolicitud:\n"
+                        "Modificación del registro sanitario.\nConcepto:\n"
+                        "La Sala Especializada de Medicamentos considera que la "
+                        "solicitud es procedente.\n"
+                        "De acuerdo con la evaluación, se aprueba lo solicitado."
+                    ),
+                }
+            ]
+        )
+
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(record.numeral, "3.13.20")
+        self.assertEqual(record.interesado, "LABORATORIOS EJEMPLO S.A.S.")
+        self.assertEqual(record.expediente, "20052699")
+        self.assertEqual(record.radicado, "2013076092")
+        self.assertIn("La Sala Especializada", record.concepto or "")
+        self.assertIn("De acuerdo", record.concepto or "")
+        self.assertEqual(record.resultado_normalizado, RESULT_APPROVED)
+
+    def test_strips_closed_list_of_footer_text_from_identifiers(self) -> None:
+        record = extract_regulatory_records(
+            [
+                {
+                    "page": 29,
+                    "text": (
+                        "3.13.25 MEDICAMENTO B\nInteresado: LAB B\n"
+                        "Expediente: 19943627\n"
+                        "Radicado: 2013078759 Carrera 68 D 17-11 PBX 2948700 "
+                        "Bogotá Colombia\nSolicitud: Nueva indicación.\n"
+                        "Concepto: Se aprueba la indicación."
+                    ),
+                }
+            ]
+        )[0]
+
+        self.assertEqual(record.radicado, "2013078759")
+        evidence = record.evidence_for("radicado")[0]
+        self.assertEqual(evidence.valor_literal, "2013078759")
+
+        compact = extract_regulatory_records(
+            [
+                {
+                    "page": 30,
+                    "text": (
+                        "3.13.26 MEDICAMENTO B2\nInteresado: LAB B\n"
+                        "Expediente: 19943628\n"
+                        "Radicado: 2013078760ELFORMATOIMPRESODEESTEDOCUMENTOESUNA"
+                        "COPIANOCONTROLADA F07-PM05\n"
+                        "Solicitud: Nueva indicación.\n"
+                        "Concepto: Se aprueba la indicación."
+                    ),
+                }
+            ]
+        )[0]
+        self.assertEqual(compact.radicado, "2013078760")
+
+    def test_accepts_conservative_historical_identity_label_variants(self) -> None:
+        record = extract_regulatory_records(
+            [
+                {
+                    "page": 9,
+                    "text": (
+                        "NUMERAL 3.1.9 MEDICAMENTO C\n"
+                        "INTERESADO(S): LABORATORIOS C\n"
+                        "EXPEDIENTE(S) No.: 20001234\n"
+                        "NÚMERO DE RADICACIÓN: 20131234567\n"
+                        "Solicitud: Evaluación farmacológica.\n"
+                        "Concepto: La Sala emite concepto favorable."
+                    ),
+                }
+            ]
+        )[0]
+
+        self.assertEqual(record.interesado, "LABORATORIOS C")
+        self.assertEqual(record.expediente, "20001234")
+        self.assertEqual(record.radicado, "20131234567")
+        self.assertEqual(record.tipo_solicitud, "evaluacion_farmacologica")
+        self.assertEqual(record.resultado_normalizado, "favorable")
 
     def test_field_evidence_is_serializable_and_bounded(self) -> None:
         record = extract_regulatory_records(

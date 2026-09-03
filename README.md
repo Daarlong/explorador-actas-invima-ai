@@ -65,18 +65,18 @@ aprobado.
 
 No contiene funcionalidades relacionadas con un monitor de transparencia.
 
-## Cambios visibles en la versión 0.7.0
+## Cambios visibles en la versión 0.7.1
 
 | Módulo | Mejora |
 |---|---|
 | Fuente | El esquema 6 inventaría cada página física; conserva el texto original o, si falla, el error, además del origen PDF/OCR, calidad y versión del extractor |
-| Extracción | Extractor regulatorio v4 para numerales históricos, composición, IFA, DCI, principio activo y combinaciones |
+| Extracción | Extractor regulatorio v5: corrige falsos numerales dentro de conceptos, variantes históricas de rótulos, pies concatenados y colisiones de evidencia |
 | Evidencia | Cada campo automático muestra valor literal, normalizado y canónico, página, fragmento, método y confianza |
 | Correcciones | Un único valor vigente se aplica en filtros, búsqueda, fichas, comparación, cronología y exportaciones |
 | Cronología | Combina datos verificados, estructurados, inferidos y menciones textuales sin confundirlos |
-| Publicación | Una base candidata se diagnostica y valida; inventario, identidades, seis campos regulatorios, paquetes y banco humano pueden bloquear el reemplazo |
+| Publicación | Una base candidata se diagnostica y valida; inventario, identidades, diez métricas regulatorias, paquetes y banco humano pueden bloquear el reemplazo |
 
-La 0.7.0 no añade funciones de IA. Su objetivo es que el corpus histórico y
+La 0.7.1 no añade funciones de IA. Su objetivo es que el corpus histórico y
 las fichas que utilizará una versión posterior sean completos, trazables y
 reproducibles.
 
@@ -231,6 +231,14 @@ los controles estén aprobados. Ese flujo trabaja sobre una candidata separada,
 permite continuar una ejecución y nunca reemplaza la base publicada durante el
 diagnóstico. Después, las actualizaciones normales vuelven a ser incrementales.
 
+Los puntos de continuación están vinculados al código de extracción, al entorno
+y a la huella de la base publicada. Después de cambiar cualquiera de ellos se
+debe iniciar con `resume_run_id` vacío; la caché separada de PDF evita volver a
+descargar normalmente los documentos. El resumen de GitHub distingue entre un
+workflow que terminó y una candidata realmente aprobada, y los artefactos usan
+los nombres `candidate-evaluation-report.json` y
+`baseline-evaluation-report.json` para no mezclar ambas mediciones.
+
 Ya no existe una casilla `full_rebuild` en el workflow normal. Esto evita que
 una reconstrucción total pueda iniciarse accidentalmente desde la acción
 destinada a incorporar actas nuevas.
@@ -363,8 +371,11 @@ permite guardar como PDF.
 
 La página **Revisión de fichas** guarda eventos separados del índice automático:
 una reconstrucción no sobrescribe las correcciones. Si cambia el PDF o el valor
-extraído que sustentaba una revisión, la aplicación exige reconfirmarla; una
-coincidencia huérfana o ambigua bloquea la publicación. En el piloto,
+extraído que sustentaba una revisión, la aplicación exige reconfirmarla. La
+reconciliación combina identificadores, página, texto, campos y orden, siempre
+uno-a-uno. Cuando no hay correspondencia segura ni revisión involucrada conserva
+el caso en el informe como `not_inherited` y crea un UID nuevo; si una duda deja
+una revisión huérfana o ambigua, la publicación se bloquea. En el piloto,
 el archivo escrito por Streamlit es temporal; tras revisar, descarga
 `regulatory-review-log.csv` y haz commit en `data/` para conservar el historial.
 Para producción se debe sustituir este mecanismo por una base persistente y SSO.
@@ -388,7 +399,7 @@ Antes de publicar una versión se debe comprobar:
 
 El flujo `.github/workflows/tests.yml` repite automáticamente la compilación y
 las pruebas con Python 3.12 después de cada cambio enviado a GitHub. La versión
-0.7.0 usa directamente la API `pymupdf`, sin depender del nombre heredado
+0.7.1 usa directamente la API `pymupdf`, sin depender del nombre heredado
 `fitz`, y Tesseract se instala dentro del runner de GitHub. La búsqueda
 semántica también es local y usa únicamente la biblioteca estándar de Python.
 No requiere instalar herramientas de desarrollo en el computador corporativo.

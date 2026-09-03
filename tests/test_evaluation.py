@@ -250,6 +250,9 @@ class QualityGateTests(unittest.TestCase):
             "interested_party",
             "expediente",
             "radicado",
+            "identifiers",
+            "concept",
+            "outcome",
         )
         return {
             "status": "available",
@@ -356,6 +359,43 @@ class QualityGateTests(unittest.TestCase):
         }
         self.assertIn("completeness_active_ingredient", failed)
 
+    def test_release_gate_blocks_identifier_concept_and_outcome_declines(self) -> None:
+        cases = self._cases()
+        results = self._results(cases)
+        baseline = self._quality(80.0)
+        candidate = self._quality(80.0)
+        for field in candidate["fields"]:
+            if field["key"] in {"identifiers", "concept", "outcome"}:
+                field.update(
+                    {
+                        "present": 70,
+                        "missing": 30,
+                        "coverage_percent": 70.0,
+                    }
+                )
+        summary = summarize_evaluation(results)
+
+        gate = build_quality_gate(
+            release_mode=True,
+            cases=cases,
+            results=results,
+            extractor_quality=candidate,
+            extractor_comparison=compare_extractor_quality(candidate, baseline),
+            retrieval_comparison=compare_retrieval_summaries(summary, summary),
+            integrity_report={"status": "ok"},
+        )
+
+        failed = {
+            item["key"] for item in gate["checks"] if not item["passed"]
+        }
+        self.assertTrue(
+            {
+                "completeness_identifiers",
+                "completeness_concept",
+                "completeness_outcome",
+            }.issubset(failed)
+        )
+
     def test_release_gate_passes_synthetic_complete_baseline(self) -> None:
         cases = self._cases()
         results = self._results(cases)
@@ -373,6 +413,38 @@ class QualityGateTests(unittest.TestCase):
 
         self.assertEqual(gate["status"], "pass")
         self.assertTrue(gate["can_publish"])
+
+    def test_integrity_warning_with_regulatory_errors_never_passes(self) -> None:
+        cases = self._cases()
+        results = self._results(cases)
+        quality = self._quality(80.0)
+        summary = summarize_evaluation(results)
+        gate = build_quality_gate(
+            release_mode=True,
+            cases=cases,
+            results=results,
+            extractor_quality=quality,
+            extractor_comparison=compare_extractor_quality(quality, quality),
+            retrieval_comparison=compare_retrieval_summaries(summary, summary),
+            integrity_report={
+                "status": "warning",
+                "regulatory_extraction_errors": [
+                    {"title": f"Acta {number}", "error": "ordinal duplicado"}
+                    for number in range(17)
+                ],
+            },
+        )
+
+        integrity_check = next(
+            item for item in gate["checks"] if item["key"] == "integrity"
+        )
+        self.assertFalse(integrity_check["passed"])
+        self.assertIn(
+            "regulatory_extraction_errors=17",
+            integrity_check["detail"],
+        )
+        self.assertEqual(gate["status"], "fail")
+        self.assertFalse(gate["can_publish"])
 
     def test_retrieval_baseline_must_use_same_bank(self) -> None:
         comparison = compare_retrieval_summaries(

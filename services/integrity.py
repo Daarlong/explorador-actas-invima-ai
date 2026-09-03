@@ -827,6 +827,7 @@ def build_integrity_report(
             foreign_key_errors,
             fts_rowid_mismatches,
             bool(page_inventory["page_inventory_errors"]),
+            bool(regulatory_errors),
         )
     )
     status = (
@@ -839,7 +840,6 @@ def build_integrity_report(
                 or page_inventory_pending
                 or page_inventory["page_extraction_errors"]
                 or regulatory_pending
-                or regulatory_errors
             )
             else "ok"
         )

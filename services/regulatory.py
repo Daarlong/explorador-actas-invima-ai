@@ -8,7 +8,7 @@ el resultado general de la decision.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import re
 from typing import Any, Mapping, Sequence
 import unicodedata
@@ -96,6 +96,49 @@ class RegulatoryRecord:
         return tuple(item for item in self.evidencias_campos if item.campo == field)
 
 
+def normalize_field_evidence_ordinals(
+    evidences: Sequence[FieldEvidence],
+) -> tuple[FieldEvidence, ...]:
+    """Deduplica fuentes identicas y asigna ordinales unicos por campo.
+
+    Cada registro permite varias evidencias para un mismo campo (por ejemplo,
+    varios principios activos o dos fragmentos del acta que sustentan el mismo
+    valor). Los ordinales que produce cada bloque empiezan en uno; al fusionar
+    bloques historicos esos ordinales pueden colisionar. Esta normalizacion
+    conserva todas las fuentes distintas, elimina solo duplicados exactos y
+    renumera en el orden determinista en que aparecen en el documento.
+    """
+
+    unique: list[FieldEvidence] = []
+    positions: dict[tuple[object, ...], int] = {}
+    for evidence in evidences:
+        source_key = (
+            evidence.campo,
+            evidence.valor_literal,
+            evidence.valor_normalizado,
+            evidence.valor_canonico,
+            int(evidence.pagina),
+            int(evidence.pagina_final),
+            evidence.fragmento,
+            evidence.metodo,
+        )
+        existing_position = positions.get(source_key)
+        if existing_position is None:
+            positions[source_key] = len(unique)
+            unique.append(evidence)
+            continue
+        if evidence.confianza > unique[existing_position].confianza:
+            unique[existing_position] = evidence
+
+    next_ordinal: dict[str, int] = {}
+    normalized: list[FieldEvidence] = []
+    for evidence in unique:
+        ordinal = next_ordinal.get(evidence.campo, 0) + 1
+        next_ordinal[evidence.campo] = ordinal
+        normalized.append(replace(evidence, ordinal=ordinal))
+    return tuple(normalized)
+
+
 # Los patrones se aplican a una copia sin acentos del texto. El orden importa:
 # los rotulos mas especificos deben evaluarse antes que los cortos.
 _FIELD_PATTERNS: tuple[tuple[str, str], ...] = (
@@ -112,23 +155,29 @@ _FIELD_PATTERNS: tuple[tuple[str, str], ...] = (
     ),
     (
         "interesado",
-        r"(?:interesado(?:s)?|solicitante|titular(?:\s+del\s+registro\s+sanitario)?)",
+        r"(?:interesad(?:o|a)(?:s|\(a?s\))?|solicitante(?:s)?|"
+        r"peticionari(?:o|a)(?:s)?|"
+        r"titular(?:es)?(?:\s+del\s+registro\s+sanitario)?)",
     ),
     (
         "expediente",
-        r"(?:(?:n\.?[°º]|n(?:\.?o|ro|umero)?\.?)\s*(?:de\s+)?)?expediente(?:s)?",
+        r"(?:(?:n\.?[°º]|n(?:\.?o|ro|umero)?\.?)\s*(?:de\s+)?)?"
+        r"expediente(?:s|\(s\))?"
+        r"(?:\s*(?:n\.?[°º]|n(?:\.?o|ro|umero)?\.?))?",
     ),
     (
         "radicado",
-        r"(?:(?:n\.?[°º]|n(?:\.?o|ro|umero)?\.?)\s*(?:de\s+)?)?radicado(?:s)?",
+        r"(?:(?:n\.?[°º]|n(?:\.?o|ro|umero)?\.?)\s*(?:de\s+)?)?"
+        r"radic(?:ado(?:s|\(s\))?|acion(?:es)?)"
+        r"(?:\s*(?:n\.?[°º]|n(?:\.?o|ro|umero)?\.?))?",
     ),
     (
         "solicitud",
-        r"(?:solicitud(?:\s+del\s+interesado)?|peticion)",
+        r"(?:solicitud(?:\s+(?:del?\s+)?(?:interesado|peticionario))?|peticion)",
     ),
     (
         "concepto",
-        r"(?:concepto(?:\s+(?:de|emitido\s+por)\s+la\s+"
+        r"(?:concepto(?:\s+(?:(?:de|emitido\s+por)\s+la\s+)?"
         r"(?:sala(?:\s+especializada)?|comision\s+revisora))?"
         r"|decision|conclusion|resultado)",
     ),
@@ -161,19 +210,21 @@ _BARE_LABEL_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _SECTION_HEADING_RE = re.compile(
-    r"^\s*(?:numeral\s+)?"
-    r"(?P<numeral>(?:\d{1,3}(?:\.\d{1,3}){0,7}|[IVXLCDM]{1,8}))"
+    r"^\s*(?:(?i:numeral)\s+)?"
+    # El look-ahead y las mayusculas del romano son deliberados: evitan partir
+    # frases como "La Sala" o "De acuerdo" como L/D + supuesto titulo.
+    r"(?P<numeral>(?:\d{1,3}(?:\.\d{1,3}){0,7}|"
+    r"[IVXLCDM]{1,8}(?=[.)\s\-–—])))"
     r"(?:[.)]\s*[-–—]?|\s*[-–—])?\s*"
     r"(?P<title>[A-ZÁÉÍÓÚÜÑ][^:]{1,180})?$",
-    flags=re.IGNORECASE,
 )
 _HEADING_WITH_CONTENT_RE = re.compile(
-    r"^\s*(?:numeral\s+)?"
-    r"(?P<numeral>(?:\d{1,3}(?:\.\d{1,3}){0,7}|[IVXLCDM]{1,8}))"
+    r"^\s*(?:(?i:numeral)\s+)?"
+    r"(?P<numeral>(?:\d{1,3}(?:\.\d{1,3}){0,7}|"
+    r"[IVXLCDM]{1,8}(?=[.)\s\-–—])))"
     r"(?:[.)]\s*[-–—]?|\s*[-–—])?\s+"
-    r"(?P<content>(?:producto|medicamento|nombre\s+(?:comercial\s+)?del\s+"
-    r"(?:producto|medicamento))\s*[:;\-–—].+)$",
-    flags=re.IGNORECASE,
+    r"(?P<content>(?i:(?:producto|medicamento|nombre\s+"
+    r"(?:comercial\s+)?del\s+(?:producto|medicamento))\s*[:;\-–—].+))$",
 )
 # En actas historicas el recipiente incluye forma y calificadores (por ejemplo,
 # ``Cada tableta recubierta contiene`` o ``Cada 1 mL de solucion contiene``).
@@ -211,6 +262,19 @@ _DOCUMENT_HEADER_RE = re.compile(
     r"instituto\s+nacional\s+de\s+vigilancia\s+de\s+medicamentos\s+y\s+alimentos|"
     r"comision\s+revisora|sala\s+especializada\s+de\s+medicamentos|"
     r"ministerio\s+de\s+salud|republica\s+de\s+colombia)",
+    flags=re.IGNORECASE,
+)
+_DOCUMENT_FOOTER_RE = re.compile(
+    r"^(?:el\s+formato\s+impreso\s+de\s+este\s+documento\s+es\s+una\s+"
+    r"copia\s+no\s+controlada|carrera\s+68\s*d|pbx\s*\(?57|"
+    r"avenida\s+carrera\s+\d+|linea\s+gratuita\s+nacional|"
+    r"f\d{2}\s*[-–—]?\s*p[mn]\d{2}\b|bogota\s*,?\s*d\.?\s*c\.?\b)",
+    flags=re.IGNORECASE,
+)
+_INLINE_DOCUMENT_FOOTER_RE = re.compile(
+    r"(?:\s+|(?<=\d))(?:el\s*formato\s*impreso\s*de\s*este\s*documento\s*"
+    r"es\s*una\s*copia\s*no\s*controlada|carrera\s*68\s*d\b|pbx\s*\(?57|"
+    r"www\.invima\.gov\.co\b|pagina\s+\d+\s+(?:de|/)\s*\d+\b)",
     flags=re.IGNORECASE,
 )
 
@@ -289,6 +353,23 @@ def _clean_value(text: str) -> str:
     value = re.sub(r"\s+", " ", text).strip()
     value = re.sub(r"^[\s:;,.\-–—]+", "", value)
     return value.strip()
+
+
+def _clean_field_value(field: str, text: str) -> str:
+    """Limpia un valor sin adivinar datos regulatorios ausentes.
+
+    Algunos PDF historicos unen el pie institucional a la ultima celda de una
+    tabla. Solo se recorta ese repertorio cerrado y solo en campos de identidad;
+    el texto narrativo de Solicitud/Concepto se conserva literalmente.
+    """
+
+    value = _clean_value(text)
+    if field not in {"interesado", "expediente", "radicado"} or not value:
+        return value
+    footer = _INLINE_DOCUMENT_FOOTER_RE.search(value)
+    if footer:
+        value = _clean_value(value[: footer.start()])
+    return value
 
 
 def normalize_request_type(request_text: str | None) -> str | None:
@@ -452,6 +533,8 @@ def _is_noise(line: str, repeated_margins: set[str] | None = None) -> bool:
         return True
     if _PAGE_NOISE_RE.fullmatch(comparable):
         return True
+    if _DOCUMENT_FOOTER_RE.match(comparable):
+        return True
     if _DOCUMENT_HEADER_RE.match(comparable) and ":" not in comparable:
         return True
     return comparable.startswith(("www.invima.gov.co", "codigo:", "direccion:"))
@@ -528,14 +611,13 @@ def _section_heading(
     # Dentro de un concepto, "1. Presentar..." es una instruccion enumerada,
     # no una nueva decision. Los numerales de un solo nivel solo son seguros si
     # son explicitos o su titulo luce como un encabezado en mayusculas.
-    if has_active_record and "." not in numeral and not explicit_numeral:
-        if not title or not _is_heading_title(title, explicit_numeral=False):
-            return None
+    if has_active_record and numeral.isdigit() and not explicit_numeral:
+        return None
     return numeral, title
 
 
 def _append_value(values: dict[str, str], field: str, value: str) -> None:
-    clean = _clean_value(value)
+    clean = _clean_field_value(field, value)
     if not clean:
         return
     previous = values.get(field)
@@ -606,7 +688,7 @@ def _capture_part(
     fragment: str,
     method: str,
 ) -> None:
-    clean = _clean_value(value)
+    clean = _clean_field_value(field, value)
     if not clean:
         return
     normalized = _normalized(clean)
@@ -904,7 +986,7 @@ def _build_field_evidence(
             confianza=_METHOD_CONFIDENCE["page_span"],
         )
     )
-    return tuple(evidences)
+    return normalize_field_evidence_ordinals(evidences)
 
 
 def normalize_regulatory_result(concept: str | None) -> str:
@@ -1124,17 +1206,9 @@ def _merge_duplicate(first: RegulatoryRecord, second: RegulatoryRecord) -> Regul
         active_seen.add(normalized)
         active_items.append((literal, normalized, canonical))
 
-    evidence_by_key: dict[tuple[str, str | None, int, str], FieldEvidence] = {}
-    for evidence in (*first.evidencias_campos, *second.evidencias_campos):
-        key = (
-            evidence.campo,
-            evidence.valor_normalizado,
-            evidence.ordinal,
-            evidence.metodo,
-        )
-        current = evidence_by_key.get(key)
-        if current is None or evidence.confianza > current.confianza:
-            evidence_by_key[key] = evidence
+    merged_evidences = normalize_field_evidence_ordinals(
+        (*first.evidencias_campos, *second.evidencias_campos)
+    )
 
     return RegulatoryRecord(
         producto=merged["producto"],
@@ -1164,7 +1238,7 @@ def _merge_duplicate(first: RegulatoryRecord, second: RegulatoryRecord) -> Regul
         principios_activos=tuple(item[0] for item in active_items),
         principios_activos_normalizados=tuple(item[1] for item in active_items),
         principios_activos_canonicos=tuple(item[2] for item in active_items),
-        evidencias_campos=tuple(evidence_by_key.values()),
+        evidencias_campos=merged_evidences,
     )
 
 

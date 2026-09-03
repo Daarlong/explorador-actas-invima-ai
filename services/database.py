@@ -12,13 +12,17 @@ from pathlib import Path
 from typing import Iterable
 
 from services.models import DocumentMetadata, SearchResult
-from services.regulatory import RegulatoryRecord, extract_regulatory_records
+from services.regulatory import (
+    RegulatoryRecord,
+    extract_regulatory_records,
+    normalize_field_evidence_ordinals,
+)
 from services.text_utils import normalize_text, tokenize_query
 
 
 DATABASE_SCHEMA_VERSION = 6
 
-REGULATORY_EXTRACTOR_VERSION = "4"
+REGULATORY_EXTRACTOR_VERSION = "5"
 PAGE_TEXT_CODEC = "zlib-utf8-v1"
 PAGE_TEXT_EXTRACTOR_VERSION = "pymupdf-text-v1"
 PAGE_TEXT_SOURCES = frozenset({"native_pdf", "ocr"})
@@ -1176,7 +1180,13 @@ def _store_regulatory_records(
             ),
         )
         record_id = int(connection.execute("SELECT last_insert_rowid()").fetchone()[0])
-        for evidence in getattr(record, "evidencias_campos", ()):
+        # Defensa adicional para registros construidos por importadores o
+        # pruebas externas: nunca delegamos a SQLite la resolucion de dos
+        # evidencias validas que llegaron con el mismo ordinal local.
+        field_evidences = normalize_field_evidence_ordinals(
+            getattr(record, "evidencias_campos", ())
+        )
+        for evidence in field_evidences:
             connection.execute(
                 """
                 INSERT INTO regulatory_field_evidence (
@@ -1408,6 +1418,8 @@ def _database_identity_records(
         """
         SELECT id, record_key, decision_uid, page_number, end_page_number,
                numeral, normalized_expediente, normalized_radicado,
+               normalized_product_name, normalized_active_ingredient,
+               normalized_interested_party, request_type_code, outcome_code,
                request_text, concept_text
         FROM regulatory_records
         WHERE document_id = ?
@@ -1415,22 +1427,65 @@ def _database_identity_records(
         """,
         (document_id,),
     ).fetchall()
-    return [
-        {
+    records: list[dict] = []
+    for ordinal, row in enumerate(rows):
+        expediente = str(row["normalized_expediente"] or "")
+        radicado = str(row["normalized_radicado"] or "")
+        page_number = int(row["page_number"])
+        end_page_number = int(row["end_page_number"])
+        radicado_prefix_match = re.match(r"^(?:19|20)\d{8}", radicado)
+        radicado_prefix = (
+            radicado_prefix_match.group(0) if radicado_prefix_match else ""
+        )
+        numeral = normalize_text(row["numeral"] or "")
+        stable_numeral = (
+            numeral if re.fullmatch(r"\d+(?:\.\d+)+", numeral) else ""
+        )
+        text_signature = _record_text_signature(
+            row["request_text"], row["concept_text"]
+        )
+        record = {
             "id": int(row["id"]),
             "record_key": str(row["record_key"]),
             "decision_uid": str(row["decision_uid"] or ""),
-            "page_number": int(row["page_number"]),
-            "end_page_number": int(row["end_page_number"]),
-            "numeral": normalize_text(row["numeral"] or ""),
-            "expediente": str(row["normalized_expediente"] or ""),
-            "radicado": str(row["normalized_radicado"] or ""),
-            "text_signature": _record_text_signature(
-                row["request_text"], row["concept_text"]
+            "page_number": page_number,
+            "end_page_number": end_page_number,
+            "page_span": (page_number, end_page_number),
+            "numeral": numeral,
+            "stable_numeral": stable_numeral,
+            "expediente": expediente,
+            "radicado": radicado,
+            # Algunos PDF históricos pegan el pie de página al radicado. Un
+            # prefijo de diez dígitos (año + consecutivo) permite compararlo
+            # sin modificar el valor regulatorio que ve el usuario.
+            "radicado_prefix": radicado_prefix,
+            "radicado_expediente": (
+                (radicado, expediente) if radicado and expediente else None
+            ),
+            "radicado_page": (
+                (radicado, page_number) if radicado else None
+            ),
+            "radicado_prefix_page": (
+                (radicado_prefix, page_number) if radicado_prefix else None
+            ),
+            "expediente_page": (
+                (expediente, page_number) if expediente else None
+            ),
+            "product": str(row["normalized_product_name"] or ""),
+            "active_ingredient": str(
+                row["normalized_active_ingredient"] or ""
+            ),
+            "interested_party": str(row["normalized_interested_party"] or ""),
+            "request_type": str(row["request_type_code"] or ""),
+            "outcome": str(row["outcome_code"] or ""),
+            "ordinal": ordinal,
+            "text_signature": text_signature,
+            "stable_text_signature": (
+                text_signature if len(text_signature) >= 80 else ""
             ),
         }
-        for row in rows
-    ]
+        records.append(record)
+    return records
 
 
 def _match_unique_groups(
@@ -1462,7 +1517,12 @@ def _record_match_has_evidence(candidate: dict, baseline: dict) -> bool:
     if any(
         candidate[field]
         and candidate[field] == baseline[field]
-        for field in ("radicado", "expediente", "numeral")
+        for field in (
+            "radicado",
+            "radicado_prefix",
+            "expediente",
+            "stable_numeral",
+        )
     ):
         return True
     overlaps = not (
@@ -1480,6 +1540,136 @@ def _record_match_has_evidence(candidate: dict, baseline: dict) -> bool:
         ).ratio()
         >= 0.85
     )
+
+
+def _page_ranges_overlap(candidate: dict, baseline: dict) -> bool:
+    return not (
+        candidate["end_page_number"] < baseline["page_number"]
+        or candidate["page_number"] > baseline["end_page_number"]
+    )
+
+
+def _record_link_score(candidate: dict, baseline: dict) -> float | None:
+    """Puntúa enlaces conservadores entre dos extracciones del mismo PDF.
+
+    La página o el orden nunca bastan por sí solos. Se exige además un
+    identificador coincidente, texto sustancialmente semejante o dos campos
+    regulatorios concordantes. Así se aprovecha la geometría estable del PDF
+    sin convertir la cercanía accidental en identidad.
+    """
+
+    page_overlap = _page_ranges_overlap(candidate, baseline)
+    page_distance = abs(candidate["page_number"] - baseline["page_number"])
+    same_span = candidate["page_span"] == baseline["page_span"]
+    close_pages = page_overlap or page_distance <= 1
+    if not close_pages:
+        return None
+    same_radicado = bool(
+        candidate["radicado"]
+        and candidate["radicado"] == baseline["radicado"]
+    )
+    same_radicado_prefix = bool(
+        candidate["radicado_prefix"]
+        and candidate["radicado_prefix"] == baseline["radicado_prefix"]
+    )
+    same_expediente = bool(
+        candidate["expediente"]
+        and candidate["expediente"] == baseline["expediente"]
+    )
+    same_numeral = bool(
+        candidate["stable_numeral"]
+        and candidate["stable_numeral"] == baseline["stable_numeral"]
+    )
+    matching_fields = sum(
+        bool(candidate[field] and candidate[field] == baseline[field])
+        for field in (
+            "product",
+            "active_ingredient",
+            "interested_party",
+        )
+    )
+
+    candidate_text = candidate["text_signature"]
+    baseline_text = baseline["text_signature"]
+    text_similarity = 0.0
+    text_containment = False
+    substantial_text = min(len(candidate_text), len(baseline_text)) >= 80
+    if substantial_text:
+        text_similarity = SequenceMatcher(
+            None, candidate_text, baseline_text, autojunk=False
+        ).ratio()
+        shorter, longer = sorted((candidate_text, baseline_text), key=len)
+        text_containment = len(shorter) >= 80 and shorter in longer
+
+    eligible = any(
+        (
+            close_pages
+            and (same_radicado or same_radicado_prefix or same_expediente),
+            close_pages and (text_similarity >= 0.85 or text_containment),
+            same_span and substantial_text and text_similarity >= 0.70,
+            close_pages and matching_fields >= 2,
+            close_pages and matching_fields >= 1 and text_similarity >= 0.55,
+            close_pages and same_numeral and matching_fields >= 1,
+        )
+    )
+    if not eligible:
+        return None
+
+    score = 0.0
+    score += 320.0 if same_radicado else 0.0
+    score += 260.0 if same_radicado_prefix and not same_radicado else 0.0
+    score += 250.0 if same_expediente else 0.0
+    score += 180.0 if same_numeral else 0.0
+    score += 110.0 if candidate["page_number"] == baseline["page_number"] else 0.0
+    score += 45.0 if same_span else 0.0
+    score += 65.0 if page_overlap else max(0.0, 25.0 - (page_distance * 10.0))
+    score += text_similarity * 180.0
+    score += 50.0 if text_containment else 0.0
+    score += matching_fields * 30.0
+    # El orden solo desempata evidencia ya suficiente; no habilita un enlace.
+    score += max(0.0, 12.0 - abs(candidate["ordinal"] - baseline["ordinal"]))
+    return score
+
+
+def _mutual_scored_matches(
+    candidate_records: list[dict],
+    baseline_records: list[dict],
+    candidate_unused: set[int],
+    baseline_unused: set[int],
+) -> list[tuple[int, int]]:
+    """Devuelve mejores coincidencias mutuas con margen inequívoco."""
+
+    candidate_by_id = {record["id"]: record for record in candidate_records}
+    baseline_by_id = {record["id"]: record for record in baseline_records}
+    pairs: list[tuple[float, int, int]] = []
+    for candidate_id in candidate_unused:
+        candidate = candidate_by_id[candidate_id]
+        for baseline_id in baseline_unused:
+            baseline = baseline_by_id[baseline_id]
+            score = _record_link_score(candidate, baseline)
+            if score is not None:
+                pairs.append((score, candidate_id, baseline_id))
+
+    by_candidate: dict[int, list[tuple[float, int]]] = {}
+    by_baseline: dict[int, list[tuple[float, int]]] = {}
+    for score, candidate_id, baseline_id in pairs:
+        by_candidate.setdefault(candidate_id, []).append((score, baseline_id))
+        by_baseline.setdefault(baseline_id, []).append((score, candidate_id))
+    for values in (*by_candidate.values(), *by_baseline.values()):
+        values.sort(reverse=True)
+
+    matches: list[tuple[float, int, int]] = []
+    for candidate_id, options in by_candidate.items():
+        score, baseline_id = options[0]
+        reverse = by_baseline.get(baseline_id, [])
+        if not reverse or reverse[0][1] != candidate_id:
+            continue
+        candidate_clear = len(options) == 1 or score - options[1][0] >= 35.0
+        baseline_clear = len(reverse) == 1 or score - reverse[1][0] >= 35.0
+        if candidate_clear and baseline_clear:
+            matches.append((score, candidate_id, baseline_id))
+    matches.sort(reverse=True)
+    return [(candidate_id, baseline_id) for _, candidate_id, baseline_id in matches]
 
 
 def _fresh_candidate_uid(
@@ -1502,12 +1692,21 @@ def _fresh_candidate_uid(
 def reconcile_database_decision_uids(
     baseline_path: Path,
     candidate_path: Path,
+    *,
+    protected_decision_uids: Iterable[str] | None = None,
 ) -> dict:
     """Reconcilia UID de una base reconstruida contra la última base publicada.
 
     Solo acepta correspondencias uno-a-uno. La actualización de la candidata es
     atómica y nunca modifica ``record_key``; su mapa permite que el gate detecte
     revisiones cuyo contenido fuente cambió aunque el UID permanezca estable.
+
+    Si ``protected_decision_uids`` se proporciona, una coincidencia dudosa solo
+    se conserva como ambigua cuando podría afectar uno de esos UID (por ejemplo,
+    una revisión humana). Las demás se resuelven explícitamente como identidad
+    nueva: es más seguro perder continuidad histórica no revisada que heredar el
+    UID de otra decisión. Omitir el argumento mantiene el modo estricto útil para
+    auditorías y compatibilidad con llamadas existentes.
     """
 
     baseline_path = Path(baseline_path)
@@ -1521,6 +1720,15 @@ def reconcile_database_decision_uids(
         if not path.exists() or not table_exists(path, "regulatory_records"):
             raise ValueError(f"La base {label} no contiene fichas regulatorias")
 
+    protected_uids = (
+        None
+        if protected_decision_uids is None
+        else {
+            str(value).strip()
+            for value in protected_decision_uids
+            if str(value).strip()
+        }
+    )
     baseline_uri = baseline_path.resolve().as_uri() + "?mode=ro"
     with sqlite3.connect(baseline_uri, uri=True) as baseline_connection:
         baseline_connection.row_factory = sqlite3.Row
@@ -1569,10 +1777,13 @@ def reconcile_database_decision_uids(
         baseline_by_id = {item["id"]: item for item in baseline_documents}
         candidate_by_id = {item["id"]: item for item in candidate_documents}
         ambiguous_document_ids: set[int] = set()
+        not_inherited_document_ids: set[int] = set()
         for candidate_id in candidate_doc_unused:
             candidate_document = candidate_by_id[candidate_id]
-            if any(
-                any(
+            possible_baseline_documents = [
+                baseline_id
+                for baseline_id in baseline_doc_unused
+                if any(
                     candidate_document[field]
                     and candidate_document[field] == baseline_by_id[baseline_id][field]
                     for field in (
@@ -1582,9 +1793,19 @@ def reconcile_database_decision_uids(
                         "signature",
                     )
                 )
-                for baseline_id in baseline_doc_unused
-            ):
+            ]
+            if not possible_baseline_documents:
+                continue
+            possible_uids = {
+                record["decision_uid"]
+                for baseline_id in possible_baseline_documents
+                for record in baseline_records_by_document[baseline_id]
+                if record["decision_uid"]
+            }
+            if protected_uids is None or possible_uids & protected_uids:
                 ambiguous_document_ids.add(candidate_id)
+            else:
+                not_inherited_document_ids.add(candidate_id)
 
         all_candidate_records = [
             record
@@ -1598,6 +1819,7 @@ def reconcile_database_decision_uids(
         ]
         successful_matches: dict[int, tuple[dict, str]] = {}
         ambiguous_candidate_records: set[int] = set()
+        not_inherited_candidate_records: set[int] = set()
         generated_candidate_records: set[int] = set()
         matched_baseline_record_ids: set[int] = set()
 
@@ -1611,9 +1833,14 @@ def reconcile_database_decision_uids(
 
             for field, match_kind in (
                 ("record_key", "exact"),
-                ("radicado", "reconciled"),
-                ("expediente", "reconciled"),
-                ("numeral", "reconciled"),
+                ("radicado_expediente", "composite"),
+                ("radicado_page", "composite"),
+                ("radicado_prefix_page", "composite"),
+                ("expediente_page", "composite"),
+                ("stable_text_signature", "text_exact"),
+                ("radicado", "identifier"),
+                ("expediente", "identifier"),
+                ("stable_numeral", "identifier"),
             ):
                 for candidate_id, baseline_id in _match_unique_groups(
                     candidate_records,
@@ -1632,63 +1859,62 @@ def reconcile_database_decision_uids(
                     baseline_unused.remove(baseline_id)
                     matched_baseline_record_ids.add(baseline_id)
 
-            similarity_pairs: list[tuple[float, int, int]] = []
-            for candidate_id in candidate_unused:
-                candidate_record = candidate_records_by_id[candidate_id]
-                for baseline_id in baseline_unused:
-                    baseline_record = baseline_records_by_id[baseline_id]
-                    if not _record_match_has_evidence(candidate_record, baseline_record):
-                        continue
-                    if not (
-                        candidate_record["text_signature"]
-                        and baseline_record["text_signature"]
+            # La primera ronda de claves únicas deja principalmente
+            # identificadores duplicados. Se resuelven con mejores enlaces
+            # mutuos: página + contenido/campos, usando el orden solo como
+            # desempate. Se repite porque una asignación segura puede volver
+            # inequívoca la siguiente dentro del mismo bloque.
+            while True:
+                scored = _mutual_scored_matches(
+                    candidate_records,
+                    baseline_records,
+                    candidate_unused,
+                    baseline_unused,
+                )
+                if not scored:
+                    break
+                accepted = 0
+                for candidate_id, baseline_id in scored:
+                    if (
+                        candidate_id not in candidate_unused
+                        or baseline_id not in baseline_unused
                     ):
                         continue
-                    score = SequenceMatcher(
-                        None,
-                        candidate_record["text_signature"],
-                        baseline_record["text_signature"],
-                        autojunk=False,
-                    ).ratio()
-                    similarity_pairs.append((score, candidate_id, baseline_id))
-
-            by_candidate: dict[int, list[tuple[float, int]]] = {}
-            by_baseline: dict[int, list[tuple[float, int]]] = {}
-            for score, candidate_id, baseline_id in similarity_pairs:
-                by_candidate.setdefault(candidate_id, []).append((score, baseline_id))
-                by_baseline.setdefault(baseline_id, []).append((score, candidate_id))
-            for values in (*by_candidate.values(), *by_baseline.values()):
-                values.sort(reverse=True)
-            for candidate_id in sorted(candidate_unused):
-                options = by_candidate.get(candidate_id, [])
-                if not options:
-                    continue
-                score, baseline_id = options[0]
-                reverse = by_baseline.get(baseline_id, [])
-                candidate_clear = len(options) == 1 or score - options[1][0] >= 0.08
-                baseline_clear = (
-                    len(reverse) == 1 or score - reverse[1][0] >= 0.08
-                )
-                if (
-                    candidate_clear
-                    and baseline_clear
-                    and baseline_id in baseline_unused
-                ):
                     successful_matches[candidate_id] = (
                         baseline_records_by_id[baseline_id],
-                        "reconciled",
+                        "scored",
                     )
                     candidate_unused.remove(candidate_id)
                     baseline_unused.remove(baseline_id)
                     matched_baseline_record_ids.add(baseline_id)
+                    accepted += 1
+                if not accepted:
+                    break
 
             for candidate_id in candidate_unused:
                 candidate_record = candidate_records_by_id[candidate_id]
-                if any(
-                    _record_match_has_evidence(candidate_record, baseline_record)
-                    for baseline_record in baseline_records
-                ):
-                    ambiguous_candidate_records.add(candidate_id)
+                # Solo los UID de referencia aún disponibles pueden estar en
+                # disputa. Comparar contra registros ya consumidos marcaba
+                # falsamente como ambigua una decisión nueva que reutilizaba
+                # expediente o radicado.
+                possible_baseline_ids = {
+                    baseline_id
+                    for baseline_id in baseline_unused
+                    if _record_match_has_evidence(
+                        candidate_record,
+                        baseline_records_by_id[baseline_id],
+                    )
+                }
+                if possible_baseline_ids:
+                    possible_uids = {
+                        baseline_records_by_id[baseline_id]["decision_uid"]
+                        for baseline_id in possible_baseline_ids
+                        if baseline_records_by_id[baseline_id]["decision_uid"]
+                    }
+                    if protected_uids is None or possible_uids & protected_uids:
+                        ambiguous_candidate_records.add(candidate_id)
+                    else:
+                        not_inherited_candidate_records.add(candidate_id)
                 else:
                     generated_candidate_records.add(candidate_id)
 
@@ -1699,6 +1925,8 @@ def reconcile_database_decision_uids(
             }
             if candidate_document_id in ambiguous_document_ids:
                 ambiguous_candidate_records.update(record_ids)
+            elif candidate_document_id in not_inherited_document_ids:
+                not_inherited_candidate_records.update(record_ids)
             else:
                 generated_candidate_records.update(record_ids)
 
@@ -1767,6 +1995,8 @@ def reconcile_database_decision_uids(
                 strategy = "baseline_" + successful_matches[candidate_id][1]
             elif candidate_id in ambiguous_candidate_records:
                 strategy = "reconciliation_ambiguous"
+            elif candidate_id in not_inherited_candidate_records:
+                strategy = "candidate_not_inherited_v6"
             else:
                 strategy = "candidate_generated_v6"
             candidate_connection.execute(
@@ -1785,9 +2015,12 @@ def reconcile_database_decision_uids(
             for record in all_baseline_records
         )
         exact = sum(kind == "exact" for _, kind in successful_matches.values())
-        reconciled = sum(
-            kind == "reconciled" for _, kind in successful_matches.values()
-        )
+        reconciled = len(successful_matches) - exact
+        reconciliation_strategies: dict[str, int] = {}
+        for _, kind in successful_matches.values():
+            reconciliation_strategies[kind] = (
+                reconciliation_strategies.get(kind, 0) + 1
+            )
         ambiguous_examples = []
         for candidate_id in sorted(ambiguous_candidate_records)[:25]:
             record = candidate_records_by_id[candidate_id]
@@ -1805,10 +2038,30 @@ def reconcile_database_decision_uids(
                     "radicado": record["radicado"],
                 }
             )
+        not_inherited_examples = []
+        for candidate_id in sorted(not_inherited_candidate_records)[:25]:
+            record = candidate_records_by_id[candidate_id]
+            document_id = candidate_document_for_record[candidate_id]
+            document = candidate_by_id[document_id]
+            not_inherited_examples.append(
+                {
+                    "decision_uid": final_uids[candidate_id],
+                    "record_key": record["record_key"],
+                    "document": document["title"],
+                    "document_hash": document["document_hash"],
+                    "page": record["page_number"],
+                    "numeral": record["numeral"],
+                    "expediente": record["expediente"],
+                    "radicado": record["radicado"],
+                    "resolution": "new_uid_not_inherited",
+                }
+            )
         report = {
             "exact": exact,
             "reconciled": reconciled,
+            "reconciliation_strategies": reconciliation_strategies,
             "generated": len(generated_candidate_records),
+            "not_inherited": len(not_inherited_candidate_records),
             "orphaned": int(orphaned),
             "ambiguous": len(ambiguous_candidate_records),
             "uid_map": uid_map,
@@ -1816,7 +2069,12 @@ def reconcile_database_decision_uids(
             "record_key_map": record_key_map,
             "documents_matched": len(document_matches),
             "documents_ambiguous": len(ambiguous_document_ids),
+            "documents_not_inherited": len(not_inherited_document_ids),
+            "protected_uids": (
+                None if protected_uids is None else len(protected_uids)
+            ),
             "ambiguous_examples": ambiguous_examples,
+            "not_inherited_examples": not_inherited_examples,
         }
     return report
 

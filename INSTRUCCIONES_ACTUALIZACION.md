@@ -1,6 +1,6 @@
-# Actualización a la versión 0.7.0
+# Actualización correctiva a la versión 0.7.1
 
-Esta actualización incorpora el extractor regulatorio v4 y el reprocesamiento
+Esta actualización incorpora el extractor regulatorio v5 y el reprocesamiento
 seguro del histórico. El ZIP no contiene ni reemplaza los archivos mutables:
 
 - `actas_catalog.csv`;
@@ -39,6 +39,13 @@ y trabaja sobre una base candidata aislada.
    - `max_batches`: deja `4` como opción segura.
 4. Pulsa el botón verde **Run workflow** y espera a que termine.
 
+Si acabas de instalar una corrección que modifica el extractor, el esquema o
+las dependencias, deja `resume_run_id` vacío aunque tengas un diagnóstico
+anterior completo. Cada checkpoint queda vinculado al código, al entorno de
+extracción y a la base publicada con los que fue creado. GitHub reutiliza la
+caché de PDF, de modo que la reconstrucción necesaria vuelve a procesar los
+documentos pero normalmente no los descarga otra vez.
+
 Cada lote procesa hasta 50 documentos. Con el valor predeterminado, una
 ejecución procesa como máximo 200 y guarda un punto de continuación. Esto evita
 perder varias horas de trabajo si GitHub interrumpe el runner.
@@ -60,12 +67,17 @@ ejecución, pero el valor `4` es más resistente a límites de tiempo.
 El modo `diagnostic`:
 
 - no modifica la base publicada;
-- conserva el texto fuente por página y aplica el extractor v4;
+- conserva el texto fuente por página y aplica el extractor v5;
 - compara cobertura antes y después;
 - comprueba identidades y revisiones humanas;
 - restaura los paquetes y realiza una búsqueda de prueba;
 - deja los artefactos `reprocess-report-...` y `reprocess-checkpoint-...` en el
   resumen de la ejecución.
+
+Una ejecución diagnóstica puede aparecer en verde aunque haya encontrado una
+candidata no publicable: verde significa que logró completar el diagnóstico.
+Lee siempre el recuadro **Resultado del reprocesamiento** en **Summary**. Si el
+estado es `rejected`, GitHub muestra advertencias y la causa exacta.
 
 ## 3. Completar el banco humano de publicación
 
@@ -104,16 +116,24 @@ identidad ambigua. Si todo pasa, GitHub hace un commit automático con las
 nuevas partes de las bases y los informes. El CSV de revisiones se comprueba
 por hash y nunca se sustituye como parte de esa publicación.
 
-Si el flujo falla, abre el artefacto `reprocess-report-...` y revisa
-`reprocess-report.json` y `evaluation-report.json`. Puedes corregir el banco o
-la revisión indicada y continuar usando el número de esa ejecución mientras el
-checkpoint siga disponible. Los checkpoints se conservan durante 7 días.
+Si el flujo falla, abre el artefacto `reprocess-report-...` y revisa:
+
+- `reprocess-report.json`: resultado consolidado y autoritativo;
+- `candidate-evaluation-report.json`: evaluación de la candidata;
+- `baseline-evaluation-report.json`: evaluación de la base publicada anterior.
+
+Los nombres distintos evitan confundir la candidata con la referencia. Puedes
+corregir el banco o la revisión indicada y continuar usando el número de esa
+ejecución mientras el checkpoint siga disponible y no hayan cambiado el
+código de extracción ni la base publicada. Los checkpoints se conservan
+durante 7 días y, cuando ya existe, incluyen también el índice semántico para
+evitar reconstruirlo innecesariamente durante la publicación.
 
 ## 5. Comprobar Streamlit
 
 1. Espera el redespliegue automático. Si después de unos minutos aún muestra la
    base anterior, abre el panel de Streamlit y pulsa **Reboot app**.
-2. En **Inicio**, confirma `versión 0.7.0`.
+2. En **Inicio**, confirma `versión 0.7.1`.
 3. En **Integridad**, confirma esquema `6`, texto fuente disponible y cero
    documentos pendientes.
 4. En **Explorador**, busca `Semaglutida`, abre la ficha de Ozempic y comprueba

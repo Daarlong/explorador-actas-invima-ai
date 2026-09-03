@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import json
+import shutil
 import sqlite3
 import tempfile
 import unittest
 from argparse import Namespace
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -21,6 +25,7 @@ from reprocess_corpus import (
     _source_text_inventory,
     _atomic_json,
     build_candidate_batches,
+    export_workflow_reports,
     main,
     prepare_workspace,
     publish_candidate,
@@ -69,6 +74,147 @@ class ReprocessCorpusTests(unittest.TestCase):
             self.assertTrue(state["review_log"]["exists"])
             self.assertFalse(state["resumed"])
 
+    def test_resume_restores_semantic_and_rejects_changed_baseline(self) -> None:
+        with self._project_temporary() as directory:
+            root = Path(directory)
+            published = root / "published"
+            published.mkdir()
+            initialize_database(published / "actas.db")
+            (published / "semantic.db").write_bytes(b"semantic-baseline")
+            manifest = root / "manifest.csv"
+            manifest.write_text(
+                "title,url,year,acta_number,section\n"
+                "Acta 01,https://www.invima.gov.co/biblioteca/download/1,"
+                "2026,01,SEMPB\n",
+                encoding="utf-8",
+            )
+            review = root / "reviews.csv"
+            review.write_text("", encoding="utf-8")
+            initial_workspace = root / "initial"
+            state = prepare_workspace(
+                initial_workspace,
+                published_data=published,
+                manifest_path=manifest,
+                review_log_path=review,
+                min_free_mib=1,
+            )
+
+            resume = root / "resume"
+            (resume / "candidate/data").mkdir(parents=True)
+            shutil.copy2(initial_workspace / "run-state.json", resume / "run-state.json")
+            initialize_database(resume / "candidate/data/actas.db")
+            (resume / "candidate/data/semantic.db").write_bytes(
+                b"semantic-candidate"
+            )
+            _atomic_json(
+                resume / "candidate/checkpoint.json",
+                {
+                    "format_version": state["format_version"],
+                    "source_fingerprint": state["source_fingerprint"],
+                    "baseline_fingerprint": state["baseline_fingerprint"],
+                    "manifest_documents": 1,
+                    "documents_completed": 0,
+                    "complete": False,
+                },
+            )
+
+            resumed_workspace = root / "resumed"
+            resumed = prepare_workspace(
+                resumed_workspace,
+                published_data=published,
+                manifest_path=manifest,
+                review_log_path=review,
+                min_free_mib=1,
+                resume_from=resume,
+            )
+            self.assertTrue(resumed["resumed"])
+            self.assertTrue(resumed["resumed_semantic"])
+            self.assertEqual(
+                (resumed_workspace / "candidate/data/semantic.db").read_bytes(),
+                b"semantic-candidate",
+            )
+
+            with sqlite3.connect(published / "actas.db") as connection:
+                connection.execute("CREATE TABLE baseline_changed (id INTEGER)")
+            with self.assertRaisesRegex(ValueError, "base publicada cambió"):
+                prepare_workspace(
+                    root / "changed-baseline",
+                    published_data=published,
+                    manifest_path=manifest,
+                    review_log_path=review,
+                    min_free_mib=1,
+                    resume_from=resume,
+                )
+
+    def test_workflow_reports_use_unambiguous_names_and_summary_warnings(self) -> None:
+        with self._project_temporary() as directory:
+            workspace = Path(directory) / "workflow-report"
+            (workspace / "candidate/data").mkdir(parents=True)
+            (workspace / "baseline/data").mkdir(parents=True)
+            _atomic_json(
+                workspace / "reprocess-report.json",
+                {
+                    "status": "rejected",
+                    "mode": "diagnostic",
+                    "candidate": {"documents": 638, "pages": 130809},
+                    "issues": [
+                        {
+                            "code": "candidate_integrity",
+                            "message": "La candidata no supera la integridad",
+                        }
+                    ],
+                    "quality_gate": {
+                        "checks": [
+                            {
+                                "key": "minimum_cases",
+                                "label": "Banco humano",
+                                "passed": False,
+                                "detail": "Faltan casos.",
+                            }
+                        ]
+                    },
+                },
+            )
+            _atomic_json(
+                workspace / "candidate/data/evaluation-report.json",
+                {"origin": "candidate"},
+            )
+            _atomic_json(
+                workspace / "baseline/data/evaluation-report.json",
+                {"origin": "baseline"},
+            )
+            summary = Path(directory) / "github-summary.md"
+            output = StringIO()
+            with redirect_stdout(output):
+                result = export_workflow_reports(
+                    workspace,
+                    github_summary_path=summary,
+                )
+
+            exported = workspace / "export"
+            self.assertEqual(
+                json.loads(
+                    (exported / "candidate-evaluation-report.json").read_text(
+                        encoding="utf-8"
+                    )
+                )["origin"],
+                "candidate",
+            )
+            self.assertEqual(
+                json.loads(
+                    (exported / "baseline-evaluation-report.json").read_text(
+                        encoding="utf-8"
+                    )
+                )["origin"],
+                "baseline",
+            )
+            self.assertIn("candidate-evaluation-report.json", result["files"])
+            self.assertIn("baseline-evaluation-report.json", result["files"])
+            self.assertIn("::warning title=La candidata no está aprobada", output.getvalue())
+            summary_text = summary.read_text(encoding="utf-8")
+            self.assertIn("No publiques esta candidata", summary_text)
+            self.assertIn("candidate_integrity", summary_text)
+
     def test_field_completeness_is_calculated_from_database(self) -> None:
         with self._project_temporary() as directory:
             database = Path(directory) / "actas.db"
@@ -110,9 +256,30 @@ class ReprocessCorpusTests(unittest.TestCase):
             self.assertEqual(metrics["interested_party"]["coverage_percent"], 100.0)
             self.assertEqual(metrics["expediente"]["coverage_percent"], 100.0)
             self.assertEqual(metrics["radicado"]["coverage_percent"], 0.0)
+            self.assertEqual(metrics["identifiers"]["coverage_percent"], 100.0)
             self.assertEqual(metrics["page_range"]["populated"], 1)
+            self.assertEqual(metrics["concept"]["coverage_percent"], 0.0)
+            self.assertEqual(metrics["outcome"]["coverage_percent"], 100.0)
 
-    def test_completeness_gate_covers_six_fields_and_page_range(self) -> None:
+            with sqlite3.connect(database) as connection:
+                connection.execute(
+                    """
+                    UPDATE regulatory_records
+                    SET expediente = NULL, radicado = 'RAD-1',
+                        concept_text = 'La Sala requiere información.',
+                        outcome_code = 'sin_clasificar'
+                    """
+                )
+
+            metrics = _database_field_completeness(database)
+
+            self.assertEqual(metrics["expediente"]["coverage_percent"], 0.0)
+            self.assertEqual(metrics["radicado"]["coverage_percent"], 100.0)
+            self.assertEqual(metrics["identifiers"]["coverage_percent"], 100.0)
+            self.assertEqual(metrics["concept"]["coverage_percent"], 100.0)
+            self.assertEqual(metrics["outcome"]["coverage_percent"], 0.0)
+
+    def test_completeness_gate_covers_release_fields_and_page_range(self) -> None:
         self.assertEqual(
             REQUIRED_COMPLETENESS_FIELDS,
             (
@@ -122,7 +289,10 @@ class ReprocessCorpusTests(unittest.TestCase):
                 "interested_party",
                 "expediente",
                 "radicado",
+                "identifiers",
                 "page_range",
+                "concept",
+                "outcome",
             ),
         )
         baseline = {
@@ -139,7 +309,13 @@ class ReprocessCorpusTests(unittest.TestCase):
             "interesado": {"coverage_percent": 80.0, "populated": 80},
             "expediente": {"coverage_percent": 90.0, "populated": 90},
             "radicado": {"coverage_percent": 70.0, "populated": 70},
+            "identificadores": {"coverage_percent": 85.0, "populated": 85},
             "rango_paginas": {"coverage_percent": 90.0, "populated": 90},
+            "concepto": {"coverage_percent": 80.0, "populated": 80},
+            "resultado_normalizado": {
+                "coverage_percent": 75.0,
+                "populated": 75,
+            },
         }
 
         summary, issues = _compare_required_field_completeness(
@@ -152,6 +328,9 @@ class ReprocessCorpusTests(unittest.TestCase):
             [
                 "La completitud de interested_party disminuyó",
                 "La completitud de radicado disminuyó",
+                "La completitud de identifiers disminuyó",
+                "La completitud de concept disminuyó",
+                "La completitud de outcome disminuyó",
             ],
         )
 
@@ -443,6 +622,10 @@ class ReprocessCorpusTests(unittest.TestCase):
         self.assertIn('[[ ! "$MODE" =~ ^(diagnostic|publish)$ ]]', workflow)
         self.assertNotIn('if [ "${{ inputs.mode }}"', workflow)
         self.assertIn("continue-on-error: true", workflow)
+        self.assertIn("python reprocess_corpus.py export-reports", workflow)
+        self.assertIn("--github-summary \"$GITHUB_STEP_SUMMARY\"", workflow)
+        self.assertIn("path: .reprocess/export/", workflow)
+        self.assertIn(".reprocess/candidate/data/semantic.db", workflow)
         self.assertEqual(
             workflow.count("python reprocess_corpus.py validate"),
             1,

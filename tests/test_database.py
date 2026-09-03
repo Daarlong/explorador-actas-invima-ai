@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from services.database import (
     DATABASE_SCHEMA_VERSION,
+    REGULATORY_EXTRACTOR_VERSION,
     _regulatory_record_key,
     connect,
     count_regulatory_records,
@@ -198,7 +199,9 @@ class DatabaseTests(unittest.TestCase):
             method = connection.execute(
                 "SELECT extractor_version, status FROM document_extractions"
             ).fetchone()
-        self.assertEqual(tuple(method), ("4", "complete"))
+        self.assertEqual(
+            tuple(method), (REGULATORY_EXTRACTOR_VERSION, "complete")
+        )
 
     def test_corrupt_source_text_degrades_to_legacy_chunks(self) -> None:
         with connect(self.database_path) as connection:
@@ -308,6 +311,69 @@ class DatabaseTests(unittest.TestCase):
                 "uids_ambiguous": 0,
                 "uids_orphaned": 0,
             },
+        )
+
+    def test_store_renumbers_colliding_evidence_without_losing_sources(self) -> None:
+        record = RegulatoryRecord(
+            producto="MEDICAMENTO HISTÓRICO",
+            principio_activo="Semaglutida; Cagrilintida",
+            interesado=None,
+            expediente="EXP-HIST-1",
+            radicado=None,
+            solicitud="Registro sanitario",
+            concepto="La Sala aprueba.",
+            resultado_normalizado="aprobado",
+            pagina=70,
+            evidencias_campos=(
+                FieldEvidence(
+                    campo="principio_activo",
+                    valor_literal="Semaglutida 1 mg",
+                    valor_normalizado="semaglutida 1 mg",
+                    valor_canonico="Semaglutida",
+                    pagina=70,
+                    pagina_final=70,
+                    fragmento="Cada tableta contiene Semaglutida 1 mg",
+                    metodo="dosage_statement",
+                    confianza=0.94,
+                    ordinal=1,
+                ),
+                FieldEvidence(
+                    campo="principio_activo",
+                    valor_literal="Cagrilintida 2 mg",
+                    valor_normalizado="cagrilintida 2 mg",
+                    valor_canonico="Cagrilintida",
+                    pagina=71,
+                    pagina_final=71,
+                    fragmento="Cada tableta contiene Cagrilintida 2 mg",
+                    metodo="dosage_statement",
+                    confianza=0.93,
+                    ordinal=1,
+                ),
+            ),
+        )
+
+        with patch(
+            "services.database.extract_regulatory_records", return_value=[record]
+        ):
+            summary = sync_regulatory_extractions(
+                self.database_path, extractor_version="4-colliding-evidence"
+            )
+
+        with connect(self.database_path) as connection:
+            rows = connection.execute(
+                """
+                SELECT field_name, ordinal, canonical_value, page_number
+                FROM regulatory_field_evidence
+                ORDER BY field_name, ordinal
+                """
+            ).fetchall()
+        self.assertEqual(summary["documents_failed"], 0)
+        self.assertEqual(
+            [tuple(row) for row in rows],
+            [
+                ("principio_activo", 1, "Semaglutida", 70),
+                ("principio_activo", 2, "Cagrilintida", 71),
+            ],
         )
 
     def test_record_key_ignores_v4_evidence_only_changes(self) -> None:
@@ -593,6 +659,373 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(
             report["ambiguous_examples"][0]["expediente"], "expdup"
         )
+
+    def test_reconciliation_uses_page_to_disambiguate_repeated_identifier(self) -> None:
+        baseline_path = Path(self.temp_dir.name) / "page-baseline.db"
+        candidate_path = Path(self.temp_dir.name) / "page-candidate.db"
+
+        def records(prefix: str) -> list[RegulatoryRecord]:
+            return [
+                RegulatoryRecord(
+                    producto=f"{prefix} A",
+                    principio_activo=None,
+                    interesado="Titular",
+                    expediente="EXP-DUP",
+                    radicado=None,
+                    solicitud=f"{prefix} solicitud A",
+                    concepto=f"{prefix} concepto A",
+                    resultado_normalizado="sin_clasificar",
+                    pagina=3,
+                ),
+                RegulatoryRecord(
+                    producto=f"{prefix} B",
+                    principio_activo=None,
+                    interesado="Titular",
+                    expediente="EXP-DUP",
+                    radicado=None,
+                    solicitud=f"{prefix} solicitud B",
+                    concepto=f"{prefix} concepto B",
+                    resultado_normalizado="sin_clasificar",
+                    pagina=4,
+                ),
+            ]
+
+        def prepare(path: Path, values: list[RegulatoryRecord]) -> None:
+            initialize_database(path)
+            insert_document(
+                path,
+                DocumentMetadata(
+                    title="Acta No 02 de 2019 SEMPB",
+                    url="https://www.invima.gov.co/biblioteca/download/pages",
+                    catalog_id="2019-sempb-02-completa",
+                ),
+                "hash",
+                [
+                    {"page": page, "text": "Texto", "chunks": ["Texto"]}
+                    for page in (3, 4)
+                ],
+            )
+            with patch(
+                "services.database.extract_regulatory_records",
+                return_value=values,
+            ):
+                sync_regulatory_extractions(path, extractor_version="fixture")
+
+        prepare(baseline_path, records("Anterior"))
+        prepare(candidate_path, records("Nuevo"))
+        with connect(baseline_path) as connection:
+            baseline_uids = {
+                int(row["page_number"]): str(row["decision_uid"])
+                for row in connection.execute(
+                    "SELECT page_number, decision_uid FROM regulatory_records"
+                )
+            }
+
+        report = reconcile_database_decision_uids(
+            baseline_path, candidate_path
+        )
+
+        with connect(candidate_path) as connection:
+            candidate_uids = {
+                int(row["page_number"]): str(row["decision_uid"])
+                for row in connection.execute(
+                    "SELECT page_number, decision_uid FROM regulatory_records"
+                )
+            }
+        self.assertEqual(candidate_uids, baseline_uids)
+        self.assertEqual(report["ambiguous"], 0)
+        self.assertEqual(report["reconciliation_strategies"]["composite"], 2)
+
+    def test_new_record_reusing_consumed_identifier_is_not_ambiguous(self) -> None:
+        baseline_path = Path(self.temp_dir.name) / "consumed-baseline.db"
+        candidate_path = Path(self.temp_dir.name) / "consumed-candidate.db"
+        original = RegulatoryRecord(
+            producto="ALFA",
+            principio_activo=None,
+            interesado=None,
+            expediente="EXP-SHARED",
+            radicado=None,
+            solicitud="Solicitud original",
+            concepto="Concepto original",
+            resultado_normalizado="aprobado",
+            pagina=2,
+        )
+        new_record = RegulatoryRecord(
+            producto="BETA",
+            principio_activo=None,
+            interesado=None,
+            expediente="EXP-SHARED",
+            radicado=None,
+            solicitud="Solicitud posterior distinta",
+            concepto="Concepto posterior distinto",
+            resultado_normalizado="sin_clasificar",
+            pagina=3,
+        )
+
+        def prepare(path: Path, values: list[RegulatoryRecord]) -> None:
+            initialize_database(path)
+            insert_document(
+                path,
+                DocumentMetadata(
+                    title="Acta No 03 de 2020 SEMPB",
+                    url="https://www.invima.gov.co/biblioteca/download/consumed",
+                    catalog_id="2020-sempb-03-completa",
+                ),
+                "hash",
+                [
+                    {"page": page, "text": "Texto", "chunks": ["Texto"]}
+                    for page in (2, 3)
+                ],
+            )
+            with patch(
+                "services.database.extract_regulatory_records",
+                return_value=values,
+            ):
+                sync_regulatory_extractions(path, extractor_version="fixture")
+
+        prepare(baseline_path, [original])
+        prepare(candidate_path, [original, new_record])
+
+        report = reconcile_database_decision_uids(
+            baseline_path, candidate_path
+        )
+
+        self.assertEqual(report["exact"], 1)
+        self.assertEqual(report["generated"], 1)
+        self.assertEqual(report["ambiguous"], 0)
+
+    def test_radicado_prefix_alone_never_inherits_an_identity(self) -> None:
+        baseline_path = Path(self.temp_dir.name) / "prefix-baseline.db"
+        candidate_path = Path(self.temp_dir.name) / "prefix-candidate.db"
+
+        def prepare(path: Path, record: RegulatoryRecord) -> str:
+            initialize_database(path)
+            insert_document(
+                path,
+                DocumentMetadata(
+                    title="Acta No 03 de 2021 SEMPB",
+                    url="https://www.invima.gov.co/biblioteca/download/prefix",
+                    catalog_id="2021-sempb-03-completa",
+                ),
+                "hash-prefix",
+                [
+                    {
+                        "page": record.pagina,
+                        "text": "Texto",
+                        "chunks": ["Texto"],
+                    }
+                ],
+            )
+            with patch(
+                "services.database.extract_regulatory_records",
+                return_value=[record],
+            ):
+                sync_regulatory_extractions(path, extractor_version="fixture")
+            with connect(path) as connection:
+                return str(
+                    connection.execute(
+                        "SELECT decision_uid FROM regulatory_records"
+                    ).fetchone()[0]
+                )
+
+        baseline_uid = prepare(
+            baseline_path,
+            RegulatoryRecord(
+                producto="ALFA",
+                principio_activo=None,
+                interesado=None,
+                expediente=None,
+                radicado="20130000001",
+                solicitud="Solicitud original",
+                concepto="Concepto original",
+                resultado_normalizado="sin_clasificar",
+                pagina=3,
+            ),
+        )
+        prepare(
+            candidate_path,
+            RegulatoryRecord(
+                producto="BETA",
+                principio_activo=None,
+                interesado=None,
+                expediente=None,
+                radicado="20130000002",
+                solicitud="Solicitud distinta",
+                concepto="Concepto distinto",
+                resultado_normalizado="sin_clasificar",
+                pagina=30,
+            ),
+        )
+
+        report = reconcile_database_decision_uids(
+            baseline_path,
+            candidate_path,
+            protected_decision_uids=set(),
+        )
+
+        with connect(candidate_path) as connection:
+            candidate_uid = str(
+                connection.execute(
+                    "SELECT decision_uid FROM regulatory_records"
+                ).fetchone()[0]
+            )
+        self.assertNotEqual(candidate_uid, baseline_uid)
+        self.assertEqual(report["reconciled"], 0)
+        self.assertEqual(report["not_inherited"], 1)
+
+    def test_unreviewed_ambiguity_gets_explicit_new_identity(self) -> None:
+        baseline_path = Path(self.temp_dir.name) / "unprotected-baseline.db"
+        candidate_path = Path(self.temp_dir.name) / "unprotected-candidate.db"
+
+        def prepare(path: Path, values: list[RegulatoryRecord]) -> None:
+            initialize_database(path)
+            insert_document(
+                path,
+                DocumentMetadata(
+                    title="Acta No 04 de 2020 SEMPB",
+                    url="https://www.invima.gov.co/biblioteca/download/unprotected",
+                    catalog_id="2020-sempb-04-completa",
+                ),
+                "hash",
+                [{"page": 1, "text": "Texto", "chunks": ["Texto"]}],
+            )
+            with patch(
+                "services.database.extract_regulatory_records",
+                return_value=values,
+            ):
+                sync_regulatory_extractions(path, extractor_version="fixture")
+
+        prepare(
+            baseline_path,
+            [
+                RegulatoryRecord(
+                    producto="A",
+                    principio_activo=None,
+                    interesado=None,
+                    expediente="EXP-DUP",
+                    radicado=None,
+                    solicitud="Primera",
+                    concepto="Concepto uno",
+                    resultado_normalizado="sin_clasificar",
+                    pagina=3,
+                ),
+                RegulatoryRecord(
+                    producto="B",
+                    principio_activo=None,
+                    interesado=None,
+                    expediente="EXP-DUP",
+                    radicado=None,
+                    solicitud="Segunda",
+                    concepto="Concepto dos",
+                    resultado_normalizado="sin_clasificar",
+                    pagina=4,
+                ),
+            ],
+        )
+        prepare(
+            candidate_path,
+            [
+                RegulatoryRecord(
+                    producto="C",
+                    principio_activo=None,
+                    interesado=None,
+                    expediente="EXP-DUP",
+                    radicado=None,
+                    solicitud="Distinta",
+                    concepto="Sin correspondencia inequívoca",
+                    resultado_normalizado="sin_clasificar",
+                    pagina=9,
+                )
+            ],
+        )
+
+        report = reconcile_database_decision_uids(
+            baseline_path,
+            candidate_path,
+            protected_decision_uids=set(),
+        )
+
+        with connect(candidate_path) as connection:
+            strategy = str(
+                connection.execute(
+                    "SELECT identity_strategy FROM regulatory_records"
+                ).fetchone()[0]
+            )
+        self.assertEqual(report["ambiguous"], 0)
+        self.assertEqual(report["not_inherited"], 1)
+        self.assertEqual(report["protected_uids"], 0)
+        self.assertEqual(strategy, "candidate_not_inherited_v6")
+
+    def test_reviewed_uid_keeps_unresolved_identity_blocking(self) -> None:
+        baseline_path = Path(self.temp_dir.name) / "protected-baseline.db"
+        candidate_path = Path(self.temp_dir.name) / "protected-candidate.db"
+
+        def prepare(path: Path, values: list[RegulatoryRecord]) -> None:
+            initialize_database(path)
+            insert_document(
+                path,
+                DocumentMetadata(
+                    title="Acta No 05 de 2020 SEMPB",
+                    url="https://www.invima.gov.co/biblioteca/download/protected",
+                    catalog_id="2020-sempb-05-completa",
+                ),
+                "hash",
+                [{"page": 1, "text": "Texto", "chunks": ["Texto"]}],
+            )
+            with patch(
+                "services.database.extract_regulatory_records",
+                return_value=values,
+            ):
+                sync_regulatory_extractions(path, extractor_version="fixture")
+
+        baseline_records = [
+            RegulatoryRecord(
+                producto=product,
+                principio_activo=None,
+                interesado=None,
+                expediente="EXP-DUP",
+                radicado=None,
+                solicitud=f"Solicitud {product}",
+                concepto=f"Concepto {product}",
+                resultado_normalizado="sin_clasificar",
+                pagina=page,
+            )
+            for product, page in (("A", 3), ("B", 4))
+        ]
+        prepare(baseline_path, baseline_records)
+        prepare(
+            candidate_path,
+            [
+                RegulatoryRecord(
+                    producto="C",
+                    principio_activo=None,
+                    interesado=None,
+                    expediente="EXP-DUP",
+                    radicado=None,
+                    solicitud="Distinta",
+                    concepto="Sin correspondencia inequívoca",
+                    resultado_normalizado="sin_clasificar",
+                    pagina=9,
+                )
+            ],
+        )
+        with connect(baseline_path) as connection:
+            protected_uid = str(
+                connection.execute(
+                    "SELECT decision_uid FROM regulatory_records "
+                    "ORDER BY page_number LIMIT 1"
+                ).fetchone()[0]
+            )
+
+        report = reconcile_database_decision_uids(
+            baseline_path,
+            candidate_path,
+            protected_decision_uids={protected_uid},
+        )
+
+        self.assertEqual(report["ambiguous"], 1)
+        self.assertEqual(report["not_inherited"], 0)
+        self.assertEqual(report["protected_uids"], 1)
 
     def test_reconciliation_matches_document_by_unique_pdf_hash(self) -> None:
         baseline_path = Path(self.temp_dir.name) / "hash-baseline.db"

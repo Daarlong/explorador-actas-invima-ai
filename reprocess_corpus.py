@@ -51,7 +51,7 @@ from services.reviews import latest_reviews, load_review_events
 from services.text_utils import normalize_text
 
 
-STATE_FORMAT_VERSION = 1
+STATE_FORMAT_VERSION = 2
 DEFAULT_WORKSPACE = ROOT_DIR / ".reprocess"
 DATABASE_NAMES = ("actas.db", "semantic.db")
 REPORT_NAMES = (
@@ -61,6 +61,21 @@ REPORT_NAMES = (
     "evaluation-report.json",
     "reconciliation-report.json",
 )
+WORKFLOW_REPORT_EXPORTS = (
+    ("run-state.json", "run-state.json"),
+    ("candidate/checkpoint.json", "checkpoint.json"),
+    ("reprocess-report.json", "reprocess-report.json"),
+    ("candidate/data/indexing-report.json", "candidate-indexing-report.json"),
+    ("candidate/data/integrity-report.json", "candidate-integrity-report.json"),
+    ("candidate/data/semantic-report.json", "candidate-semantic-report.json"),
+    ("candidate/data/evaluation-report.json", "candidate-evaluation-report.json"),
+    (
+        "candidate/data/reconciliation-report.json",
+        "candidate-reconciliation-report.json",
+    ),
+    ("baseline/data/integrity-report.json", "baseline-integrity-report.json"),
+    ("baseline/data/evaluation-report.json", "baseline-evaluation-report.json"),
+)
 REQUIRED_COMPLETENESS_FIELDS = (
     "product",
     "active_ingredient",
@@ -68,7 +83,10 @@ REQUIRED_COMPLETENESS_FIELDS = (
     "interested_party",
     "expediente",
     "radicado",
+    "identifiers",
     "page_range",
+    "concept",
+    "outcome",
 )
 _FIELD_ALIASES = {
     "product": ("product", "producto"),
@@ -87,7 +105,21 @@ _FIELD_ALIASES = {
     ),
     "expediente": ("expediente",),
     "radicado": ("radicado",),
+    "identifiers": (
+        "identifiers",
+        "identificadores",
+        "expediente_or_radicado",
+        "expediente_o_radicado",
+    ),
     "page_range": ("page_range", "pages", "rango_paginas", "paginas"),
+    "concept": ("concept", "concepto", "concept_text"),
+    "outcome": (
+        "outcome",
+        "outcomes",
+        "resultado",
+        "resultado_normalizado",
+        "outcome_code",
+    ),
 }
 _ACCEPTED_GATE_STATUSES = {"pass", "passed", "ok", "accepted", "aprobado"}
 _WORD_PATTERN = re.compile(r"\b[^\W\d_][\wáéíóúüñ-]{3,}\b", re.IGNORECASE)
@@ -155,6 +187,20 @@ def _file_snapshot(path: Path) -> dict[str, object]:
         "bytes": path.stat().st_size,
         "sha256": _sha256(path),
     }
+
+
+def _database_set_snapshot(data_dir: Path) -> dict[str, dict[str, object]]:
+    return {name: _file_snapshot(data_dir / name) for name in DATABASE_NAMES}
+
+
+def _snapshot_fingerprint(snapshot: dict[str, dict[str, object]]) -> str:
+    payload = json.dumps(
+        snapshot,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _package_database_bytes(database_path: Path) -> int:
@@ -330,13 +376,17 @@ def prepare_workspace(
         )
     if not baseline_restored["actas.db"]:
         raise ValueError("No fue posible restaurar la base publicada")
+    baseline_databases = _database_set_snapshot(baseline_data)
+    baseline_fingerprint = _snapshot_fingerprint(baseline_databases)
 
     resumed = False
+    resumed_semantic = False
     if resume_from:
         resume_root = resume_from.resolve()
         resume_state_path = resume_root / "run-state.json"
         resume_checkpoint_path = resume_root / "candidate" / "checkpoint.json"
         resume_database = resume_root / "candidate" / "data" / "actas.db"
+        resume_semantic = resume_root / "candidate" / "data" / "semantic.db"
         resume_state = _load_json(resume_state_path)
         resume_checkpoint = _load_json(resume_checkpoint_path)
         if (
@@ -346,11 +396,28 @@ def prepare_workspace(
             raise ValueError(
                 "El punto de continuación pertenece a otro catálogo o código"
             )
+        resume_baseline = str(resume_state.get("baseline_fingerprint") or "")
+        checkpoint_baseline = str(
+            resume_checkpoint.get("baseline_fingerprint") or ""
+        )
+        if not resume_baseline or checkpoint_baseline != resume_baseline:
+            raise ValueError(
+                "El punto de continuación no identifica de forma verificable "
+                "la base publicada de referencia"
+            )
+        if resume_baseline != baseline_fingerprint:
+            raise ValueError(
+                "La base publicada cambió desde el punto de continuación; "
+                "inicia un reprocesamiento nuevo"
+            )
         if int(resume_checkpoint.get("documents_completed", -1)) > len(manifest_rows):
             raise ValueError("El punto de continuación excede el manifiesto actual")
         if not resume_database.exists():
             raise ValueError("El punto de continuación no contiene actas.db")
         shutil.copy2(resume_database, candidate_data / "actas.db")
+        if resume_semantic.exists():
+            shutil.copy2(resume_semantic, candidate_data / "semantic.db")
+            resumed_semantic = True
         shutil.copy2(resume_checkpoint_path, candidate_dir / "checkpoint.json")
         resumed = True
 
@@ -370,7 +437,10 @@ def prepare_workspace(
             "published_database_bytes": database_bytes,
         },
         "baseline_restored": baseline_restored,
+        "baseline_databases": baseline_databases,
+        "baseline_fingerprint": baseline_fingerprint,
         "resumed": resumed,
+        "resumed_semantic": resumed_semantic,
     }
     _atomic_json(workspace / "run-state.json", state)
     return state
@@ -462,6 +532,7 @@ def build_candidate_batches(
             "format_version": STATE_FORMAT_VERSION,
             "updated_at": _utc_now(),
             "source_fingerprint": fingerprint,
+            "baseline_fingerprint": state.get("baseline_fingerprint"),
             "manifest_documents": len(rows),
             "documents_completed": completed,
             "batch_size": batch_size,
@@ -475,6 +546,7 @@ def build_candidate_batches(
             "format_version": STATE_FORMAT_VERSION,
             "updated_at": _utc_now(),
             "source_fingerprint": fingerprint,
+            "baseline_fingerprint": state.get("baseline_fingerprint"),
             "manifest_documents": len(rows),
             "documents_completed": completed,
             "batch_size": batch_size,
@@ -513,7 +585,17 @@ def reconcile_candidate_identities(
         raise ValueError("El registro de revisiones cambió durante el proceso")
     baseline = workspace / "baseline" / "data" / "actas.db"
     candidate = workspace / "candidate" / "data" / "actas.db"
-    reconciliation = reconcile_database_decision_uids(baseline, candidate)
+    # Solo una revisión humana vigente vuelve obligatorio conservar un UID
+    # histórico ante una correspondencia dudosa. Las demás dudas se resuelven
+    # de forma segura creando una identidad nueva, nunca heredando al azar.
+    protected_uids = set(
+        latest_reviews(load_review_events(review_log_path)).keys()
+    )
+    reconciliation = reconcile_database_decision_uids(
+        baseline,
+        candidate,
+        protected_decision_uids=protected_uids,
+    )
     review_reconciliation = _review_reconciliation(candidate, review_log_path)
     report = {
         "format_version": STATE_FORMAT_VERSION,
@@ -642,9 +724,19 @@ def _database_field_completeness(database_path: Path) -> dict[str, dict[str, obj
         ),
         "expediente": "expediente IS NOT NULL AND TRIM(expediente) != ''",
         "radicado": "radicado IS NOT NULL AND TRIM(radicado) != ''",
+        "identifiers": (
+            "(expediente IS NOT NULL AND TRIM(expediente) != '') OR "
+            "(radicado IS NOT NULL AND TRIM(radicado) != '')"
+        ),
         "page_range": (
             "page_number IS NOT NULL AND end_page_number IS NOT NULL "
             "AND page_number > 0 AND end_page_number >= page_number"
+        ),
+        "concept": "concept_text IS NOT NULL AND TRIM(concept_text) != ''",
+        "outcome": (
+            "outcome_code IS NOT NULL AND "
+            "LOWER(TRIM(outcome_code)) NOT IN "
+            "('', 'sin_clasificar', 'unclassified', 'unknown', 'none')"
         ),
     }
     with sqlite3.connect(database_path) as connection:
@@ -1088,6 +1180,7 @@ def validate_candidate(
         ),
         "publication_ready": bool(mode == "publish" and not issues),
         "source_fingerprint": state.get("source_fingerprint"),
+        "baseline_fingerprint": state.get("baseline_fingerprint"),
         "review_log": current_review,
         "baseline": {"documents": baseline_docs, "pages": baseline_pages},
         "candidate": {"documents": candidate_docs, "pages": candidate_pages},
@@ -1190,6 +1283,204 @@ def publish_candidate(
     return result
 
 
+def _github_command_value(value: object) -> str:
+    return (
+        str(value or "")
+        .replace("%", "%25")
+        .replace("\r", "%0D")
+        .replace("\n", "%0A")
+    )
+
+
+def _markdown_cell(value: object) -> str:
+    return str(value if value is not None else "").replace("|", "\\|").replace(
+        "\n", " "
+    )
+
+
+def export_workflow_reports(
+    workspace: Path,
+    *,
+    github_summary_path: Path | None = None,
+) -> dict[str, object]:
+    """Exporta informes con nombres inequívocos y resume el resultado.
+
+    GitHub conserva la estructura de directorios de un artefacto. Como la
+    candidata y la referencia usaban ambas ``evaluation-report.json``, era
+    fácil descargar el archivo equivocado. Esta exportación deliberadamente
+    plana hace explícito cuál corresponde a cada base.
+    """
+
+    workspace = _safe_workspace(workspace)
+    export_dir = workspace / "export"
+    _replace_directory(export_dir)
+    exported: list[str] = []
+    for source_name, exported_name in WORKFLOW_REPORT_EXPORTS:
+        source = workspace / source_name
+        if not source.exists() or not source.is_file():
+            continue
+        shutil.copy2(source, export_dir / exported_name)
+        exported.append(exported_name)
+
+    report = _load_json(workspace / "reprocess-report.json", required=False)
+    checkpoint = _load_json(
+        workspace / "candidate" / "checkpoint.json",
+        required=False,
+    )
+    issues = report.get("issues") if isinstance(report.get("issues"), list) else []
+    quality_gate = (
+        report.get("quality_gate")
+        if isinstance(report.get("quality_gate"), dict)
+        else {}
+    )
+    failed_quality_checks = [
+        item
+        for item in quality_gate.get("checks", [])
+        if isinstance(item, dict) and not item.get("passed")
+    ]
+    if report:
+        status = str(report.get("status") or "unknown")
+        mode = str(report.get("mode") or "unknown")
+    elif checkpoint and not checkpoint.get("complete"):
+        status = "continuation_pending"
+        mode = "unknown"
+    else:
+        status = "report_unavailable"
+        mode = "unknown"
+
+    readme = (
+        "Informes del reprocesamiento\n"
+        "=============================\n\n"
+        "reprocess-report.json es el resultado consolidado y autoritativo.\n"
+        "candidate-evaluation-report.json evalúa la base candidata.\n"
+        "baseline-evaluation-report.json evalúa la base publicada anterior.\n"
+        "Los demás archivos indican candidate- o baseline- en su nombre.\n"
+    )
+    (export_dir / "LEEME-INFORMES.txt").write_text(readme, encoding="utf-8")
+    exported.append("LEEME-INFORMES.txt")
+    index = {
+        "format_version": STATE_FORMAT_VERSION,
+        "generated_at": _utc_now(),
+        "status": status,
+        "mode": mode,
+        "issues": len(issues),
+        "pending_quality_checks": len(failed_quality_checks),
+        "files": sorted(exported),
+    }
+    _atomic_json(export_dir / "report-index.json", index)
+    exported.append("report-index.json")
+
+    if status == "rejected":
+        print(
+            "::warning title=La candidata no está aprobada::"
+            + _github_command_value(
+                f"El diagnóstico encontró {len(issues)} bloqueo(s). "
+                "Un workflow verde solo confirma que el diagnóstico terminó."
+            ),
+            flush=True,
+        )
+        for issue in issues[:10]:
+            if not isinstance(issue, dict):
+                continue
+            print(
+                "::warning title="
+                + _github_command_value(issue.get("code") or "Bloqueo")
+                + "::"
+                + _github_command_value(issue.get("message") or issue),
+                flush=True,
+            )
+    elif status == "report_unavailable":
+        print(
+            "::warning title=Informe consolidado no disponible::"
+            "La ejecución terminó antes de producir reprocess-report.json.",
+            flush=True,
+        )
+
+    if github_summary_path is not None:
+        candidate = report.get("candidate") if isinstance(report.get("candidate"), dict) else {}
+        lines = [
+            "## Resultado del reprocesamiento",
+            "",
+            "| Campo | Valor |",
+            "|---|---|",
+            f"| Estado | `{_markdown_cell(status)}` |",
+            f"| Modo | `{_markdown_cell(mode)}` |",
+            f"| Documentos candidatos | {_markdown_cell(candidate.get('documents', ''))} |",
+            f"| Páginas candidatas | {_markdown_cell(candidate.get('pages', ''))} |",
+            f"| Bloqueos técnicos | {len(issues)} |",
+            f"| Controles de publicación pendientes | {len(failed_quality_checks)} |",
+            "",
+        ]
+        if status == "continuation_pending":
+            run_id = os.getenv("GITHUB_RUN_ID", "").strip()
+            lines.extend(
+                [
+                    "> La candidata es parcial. Continúa con "
+                    f"`resume_run_id={_markdown_cell(run_id or 'ID_DE_ESTA_EJECUCIÓN')}`.",
+                    "",
+                ]
+            )
+        elif status == "rejected":
+            lines.extend(
+                [
+                    "> **No publiques esta candidata.** El color verde indica que "
+                    "el diagnóstico pudo terminar, no que la candidata haya sido aprobada.",
+                    "",
+                    "### Bloqueos detectados",
+                    "",
+                    "| Código | Descripción |",
+                    "|---|---|",
+                ]
+            )
+            for issue in issues:
+                if isinstance(issue, dict):
+                    lines.append(
+                        f"| `{_markdown_cell(issue.get('code', ''))}` | "
+                        f"{_markdown_cell(issue.get('message', ''))} |"
+                    )
+            lines.append("")
+        elif status == "diagnostic_complete":
+            lines.extend(
+                [
+                    "> El diagnóstico técnico terminó sin bloqueos. Antes de "
+                    "publicar, completa también los controles humanos indicados abajo.",
+                    "",
+                ]
+            )
+        elif status == "accepted":
+            lines.extend(["> La candidata superó los controles de publicación.", ""])
+
+        if failed_quality_checks:
+            lines.extend(
+                [
+                    "### Controles de publicación pendientes",
+                    "",
+                    "| Control | Detalle |",
+                    "|---|---|",
+                ]
+            )
+            for item in failed_quality_checks:
+                lines.append(
+                    f"| {_markdown_cell(item.get('label', item.get('key', '')))} | "
+                    f"{_markdown_cell(item.get('detail', ''))} |"
+                )
+            lines.append("")
+        lines.extend(
+            [
+                "Los archivos descargables usan nombres distintos para la candidata "
+                "y la base de referencia.",
+                "",
+            ]
+        )
+        github_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        with github_summary_path.open("a", encoding="utf-8") as handle:
+            handle.write("\n".join(lines))
+
+    result = {**index, "files": sorted(exported)}
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return result
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Prepara, construye y valida un reprocesamiento seguro"
@@ -1227,6 +1518,10 @@ def parse_args() -> argparse.Namespace:
     validate.add_argument(
         "--mode", choices=("diagnostic", "publish"), default="diagnostic"
     )
+
+    export_reports = subparsers.add_parser("export-reports")
+    export_reports.add_argument("--workspace", type=Path, default=DEFAULT_WORKSPACE)
+    export_reports.add_argument("--github-summary", type=Path)
 
     publish = subparsers.add_parser("publish")
     publish.add_argument("--workspace", type=Path, default=DEFAULT_WORKSPACE)
@@ -1275,6 +1570,11 @@ def main() -> int:
             )
             if arguments.mode == "publish" and result["status"] != "accepted":
                 return 1
+        elif arguments.command == "export-reports":
+            result = export_workflow_reports(
+                arguments.workspace,
+                github_summary_path=arguments.github_summary,
+            )
         else:
             result = publish_candidate(
                 arguments.workspace,
@@ -1286,6 +1586,7 @@ def main() -> int:
             "reconcile",
             "validate",
             "publish",
+            "export-reports",
         }:
             print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0

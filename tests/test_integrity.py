@@ -199,6 +199,60 @@ class IntegrityTests(unittest.TestCase):
             "SEMPB",
         )
 
+    def test_regulatory_extraction_error_sets_integrity_status_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database_path = root / "actas.db"
+            manifest_path = root / "manifest.csv"
+            url = "https://www.invima.gov.co/biblioteca/download/17"
+            manifest_path.write_text(
+                "title,url,year,acta_number,section,part,source_type\n"
+                f"Acta No 17 de 2026 SEMPB,{url},2026,17,SEMPB,,official\n",
+                encoding="utf-8",
+            )
+            initialize_database(database_path)
+            insert_document(
+                database_path,
+                DocumentMetadata(
+                    title="Acta No 17 de 2026 SEMPB",
+                    url=url,
+                    year=2026,
+                    acta_number="17",
+                    section="SEMPB",
+                ),
+                "hash-17",
+                [{"page": 1, "text": "Texto", "chunks": ["Texto"]}],
+                pdf_page_count=1,
+            )
+            with sqlite3.connect(database_path) as connection:
+                document_id = connection.execute(
+                    "SELECT id FROM documents WHERE manifest_url = ?",
+                    (url,),
+                ).fetchone()[0]
+                connection.execute(
+                    """
+                    INSERT INTO document_extractions (
+                        document_id, document_hash, extractor_version, status,
+                        record_count, error_message, extracted_at
+                    ) VALUES (?, ?, ?, 'error', 0, ?, ?)
+                    """,
+                    (
+                        document_id,
+                        "hash-17",
+                        "4",
+                        "ordinal duplicado",
+                        "2026-09-03T00:00:00+00:00",
+                    ),
+                )
+            report = build_integrity_report(
+                database_path,
+                manifest_path,
+                ("www.invima.gov.co",),
+            )
+
+        self.assertEqual(report["status"], "error")
+        self.assertEqual(len(report["regulatory_extraction_errors"]), 1)
+
     def test_complete_inventory_with_a_missing_physical_page_is_an_error(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

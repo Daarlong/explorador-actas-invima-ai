@@ -1,6 +1,6 @@
-# Alcance cerrado de la versión 0.7.0
+# Alcance cerrado de la versión 0.7.1
 
-La versión 0.7.0 corrige y hace auditable la estructuración masiva del corpus
+La versión 0.7.1 corrige y hace auditable la estructuración masiva del corpus
 histórico. No incorpora nuevas funciones de IA ni realiza llamadas a modelos
 externos.
 
@@ -20,7 +20,7 @@ externos.
      después de superar las validaciones.
    - Preservar el registro de correcciones humanas.
 
-3. **Extractor regulatorio v4**
+3. **Extractor regulatorio v5**
    - Reconocer estructuras históricas de numerales y rótulos.
    - Extraer productos e ingredientes desde `Composición`, `IFA`, `DCI`,
      `Principio activo` y expresiones del tipo `Cada ... contiene`.
@@ -36,8 +36,13 @@ externos.
 5. **Identidad y revisiones estables**
    - Conservar el identificador de una decisión al reprocesar cuando exista una
      coincidencia única y segura.
-   - Detectar revisiones huérfanas o coincidencias ambiguas y bloquear la
-     publicación hasta resolverlas.
+   - Resolver masivamente identificadores repetidos mediante coincidencias
+     uno-a-uno que combinen página, contenido, campos regulatorios y orden.
+   - Si no existe una correspondencia segura y ningún UID involucrado tiene
+     revisión humana, asignar explícitamente una identidad nueva y auditarla
+     como `not_inherited`; nunca heredar un UID al azar.
+   - Detectar revisiones huérfanas o coincidencias ambiguas que puedan afectar
+     un UID revisado y bloquear la publicación hasta resolverlas.
 
 6. **Valor vigente único**
    - Aplicar las correcciones humanas de forma consistente en búsqueda,
@@ -53,7 +58,8 @@ externos.
 
 8. **Controles de publicación**
    - Medir completitud de numeral, producto, principio activo, interesado,
-     expediente y radicado.
+     expediente, radicado, identificadores, rango de páginas, concepto y
+     resultado clasificado.
    - Comparar la candidata con la base vigente y bloquear regresiones por encima
      del umbral definido.
    - Verificar integridad SQLite, paquetes comprimidos restaurables y ausencia
@@ -61,7 +67,7 @@ externos.
    - Mantener pruebas sintéticas reproducibles y admitir un banco oro humano sin
      inventar resultados esperados.
 
-## Deseable, no bloqueante para 0.7.0
+## Deseable, no bloqueante para 0.7.1
 
 - OCR avanzado para páginas con texto parcial o de muy baja calidad.
 - Fusión semántica global y reranking del buscador híbrido.
@@ -83,4 +89,3 @@ externos.
 La versión queda lista cuando las pruebas automatizadas pasan, el flujo de
 `Diagnóstico` genera informes sin modificar la base publicada y el flujo de
 `Publicar` solo permite reemplazarla después de superar todos los controles.
-

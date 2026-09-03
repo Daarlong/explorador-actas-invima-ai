@@ -68,6 +68,9 @@ RELEASE_COMPLETENESS_FIELDS = (
     "interested_party",
     "expediente",
     "radicado",
+    "identifiers",
+    "concept",
+    "outcome",
 )
 _CASE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 _DANGEROUS_CSV_PREFIXES = ("=", "+", "-", "@")
@@ -970,16 +973,75 @@ def build_quality_gate(
         else "El caso falta o no recuperó su fuente esperada.",
     )
 
-    integrity_ok = bool(integrity_report) and str(
-        (integrity_report or {}).get("status")
-    ) in {"ok", "warning"}
+    integrity = integrity_report if isinstance(integrity_report, Mapping) else {}
+    integrity_blockers: list[str] = []
+    integrity_status = str(integrity.get("status", "")).strip().lower()
+    if not integrity:
+        integrity_blockers.append("informe ausente")
+    elif integrity_status not in {"ok", "warning"}:
+        integrity_blockers.append(f"estado={integrity_status or 'ausente'}")
+
+    # Un estado agregado ``warning`` puede representar una observación no
+    # destructiva (por ejemplo, una página candidata OCR), pero no debe ocultar
+    # fallos que el publicador trata como fatales. Inspeccionamos esos campos
+    # explícitamente para mantener el gate fail-closed ante reportes antiguos o
+    # internamente inconsistentes.
+    sequence_blockers = (
+        "missing_documents",
+        "unexpected_documents",
+        "documents_without_pages",
+        "documents_without_chunks",
+        "page_inventory_errors",
+        "page_inventory_pending",
+        "regulatory_extraction_pending",
+        "regulatory_extraction_errors",
+    )
+    numeric_blockers = (
+        "foreign_key_errors",
+        "fts_rowid_mismatches",
+        "pages_unaccounted",
+    )
+    for key in sequence_blockers:
+        value = integrity.get(key)
+        if isinstance(value, (str, bytes)):
+            count = int(bool(value))
+        else:
+            try:
+                count = len(value) if value is not None else 0
+            except TypeError:
+                count = int(bool(value))
+        if count:
+            integrity_blockers.append(f"{key}={count}")
+    for key in numeric_blockers:
+        value = _safe_int(integrity.get(key))
+        if value:
+            integrity_blockers.append(f"{key}={value}")
+
+    sqlite_status = str(integrity.get("sqlite_integrity", "")).strip().lower()
+    if "sqlite_integrity" in integrity and sqlite_status != "ok":
+        integrity_blockers.append(
+            f"sqlite_integrity={sqlite_status or 'ausente'}"
+        )
+    if {
+        "schema_version",
+        "expected_schema_version",
+    }.issubset(integrity) and (
+        integrity.get("schema_version") != integrity.get("expected_schema_version")
+    ):
+        integrity_blockers.append("schema_version no coincide")
+    if {"chunks", "fts_rows"}.issubset(integrity) and (
+        integrity.get("chunks") != integrity.get("fts_rows")
+    ):
+        integrity_blockers.append("chunks != fts_rows")
+
+    integrity_ok = bool(integrity) and not integrity_blockers
     check(
         "integrity",
         "Integridad técnica del candidato",
         integrity_ok,
         "Informe disponible sin errores."
         if integrity_ok
-        else "Falta el informe o reporta errores.",
+        else "Bloqueos: " + ", ".join(integrity_blockers) + ".",
     )
 
     quality = _quality_payload(extractor_quality)
