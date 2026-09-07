@@ -144,8 +144,8 @@
       "year": 2013
     }
   ],
-  "database_bytes": 601374720,
-  "database_mib": 573.5,
+  "database_bytes": 1239117824,
+  "database_mib": 1181.7,
   "documents_without_chunks": [],
   "documents_without_pages": [],
   "duplicate_document_hashes": [
@@ -175,31 +175,490 @@
       ]
     }
   ],
-  "expected_schema_version": 5,
+  "expected_schema_version": 6,
+  "field_completeness": {
+    "active_ingredient": {
+      "available": true,
+      "coverage_percent": 79.14,
+      "label": "Principio activo",
+      "missing": 4925,
+      "present": 18687,
+      "total": 23612
+    },
+    "concept": {
+      "available": true,
+      "coverage_percent": 98.7,
+      "label": "Concepto",
+      "missing": 308,
+      "present": 23304,
+      "total": 23612
+    },
+    "expediente": {
+      "available": true,
+      "coverage_percent": 84.49,
+      "label": "Expediente",
+      "missing": 3663,
+      "present": 19949,
+      "total": 23612
+    },
+    "identifiers": {
+      "available": true,
+      "coverage_percent": 93.26,
+      "label": "Expediente o radicado",
+      "missing": 1592,
+      "present": 22020,
+      "total": 23612
+    },
+    "interested_party": {
+      "available": true,
+      "coverage_percent": 89.15,
+      "label": "Interesado",
+      "missing": 2563,
+      "present": 21049,
+      "total": 23612
+    },
+    "numeral": {
+      "available": true,
+      "coverage_percent": 100.0,
+      "label": "Numeral",
+      "missing": 0,
+      "present": 23612,
+      "total": 23612
+    },
+    "outcome": {
+      "available": true,
+      "coverage_percent": 49.27,
+      "label": "Resultado clasificado",
+      "missing": 11979,
+      "present": 11633,
+      "total": 23612
+    },
+    "page_range": {
+      "available": true,
+      "coverage_percent": 100.0,
+      "label": "Rango de páginas",
+      "missing": 0,
+      "present": 23612,
+      "total": 23612
+    },
+    "product": {
+      "available": true,
+      "coverage_percent": 48.41,
+      "label": "Producto",
+      "missing": 12182,
+      "present": 11430,
+      "total": 23612
+    },
+    "radicado": {
+      "available": true,
+      "coverage_percent": 78.48,
+      "label": "Radicado",
+      "missing": 5082,
+      "present": 18530,
+      "total": 23612
+    }
+  },
   "foreign_key_errors": 0,
   "fts_rowid_mismatches": 0,
   "fts_rows": 321246,
-  "generated_at": "2026-09-02T17:10:11.741402+00:00",
+  "generated_at": "2026-09-07T17:24:52.218671+00:00",
   "indexed_documents": 638,
+  "inventory_coverage_percent": 100.0,
   "manifest_documents": 638,
   "missing_documents": [],
   "ocr_candidates": [],
+  "page_extraction_errors": [],
+  "page_inventory_errors": [],
+  "page_inventory_mismatches": [],
   "page_inventory_pending": [],
+  "pages_accounted": 130809,
   "pages_indexed": 130809,
+  "pages_recorded": 130809,
+  "pages_unaccounted": 0,
+  "pages_with_extraction_error": 0,
+  "pages_with_failed_extraction": 0,
+  "pages_with_source_text": 130809,
   "pdf_pages": 130809,
   "regulatory_documents": 638,
   "regulatory_extraction_errors": [],
   "regulatory_extraction_pending": [],
   "regulatory_quality": {
-    "low_confidence": 7472,
-    "total": 22748,
-    "unclassified_request_type": 15684,
-    "without_numeral": 22748,
-    "without_session_date": 3770,
+    "low_confidence": 4094,
+    "total": 23612,
+    "unclassified_request_type": 16188,
+    "without_active_ingredient": 4925,
+    "without_concept": 308,
+    "without_expediente": 3663,
+    "without_identifiers": 1592,
+    "without_interested_party": 2563,
+    "without_numeral": 0,
+    "without_outcome": 11979,
+    "without_page_range": 0,
+    "without_product": 12182,
+    "without_radicado": 5082,
+    "without_session_date": 3965,
     "without_uid": 0
   },
-  "regulatory_records": 22748,
-  "schema_version": 5,
+  "regulatory_quality_snapshot": {
+    "complete_core_percent": 17.96,
+    "complete_core_records": 4241,
+    "extractor_versions": [
+      {
+        "records": 23612,
+        "version": "5"
+      }
+    ],
+    "field_completeness": {
+      "active_ingredient": {
+        "available": true,
+        "coverage_percent": 79.14,
+        "label": "Principio activo",
+        "missing": 4925,
+        "present": 18687,
+        "total": 23612
+      },
+      "concept": {
+        "available": true,
+        "coverage_percent": 98.7,
+        "label": "Concepto",
+        "missing": 308,
+        "present": 23304,
+        "total": 23612
+      },
+      "expediente": {
+        "available": true,
+        "coverage_percent": 84.49,
+        "label": "Expediente",
+        "missing": 3663,
+        "present": 19949,
+        "total": 23612
+      },
+      "identifiers": {
+        "available": true,
+        "coverage_percent": 93.26,
+        "label": "Expediente o radicado",
+        "missing": 1592,
+        "present": 22020,
+        "total": 23612
+      },
+      "interested_party": {
+        "available": true,
+        "coverage_percent": 89.15,
+        "label": "Interesado",
+        "missing": 2563,
+        "present": 21049,
+        "total": 23612
+      },
+      "numeral": {
+        "available": true,
+        "coverage_percent": 100.0,
+        "label": "Numeral",
+        "missing": 0,
+        "present": 23612,
+        "total": 23612
+      },
+      "outcome": {
+        "available": true,
+        "coverage_percent": 49.27,
+        "label": "Resultado clasificado",
+        "missing": 11979,
+        "present": 11633,
+        "total": 23612
+      },
+      "page_range": {
+        "available": true,
+        "coverage_percent": 100.0,
+        "label": "Rango de páginas",
+        "missing": 0,
+        "present": 23612,
+        "total": 23612
+      },
+      "product": {
+        "available": true,
+        "coverage_percent": 48.41,
+        "label": "Producto",
+        "missing": 12182,
+        "present": 11430,
+        "total": 23612
+      },
+      "radicado": {
+        "available": true,
+        "coverage_percent": 78.48,
+        "label": "Radicado",
+        "missing": 5082,
+        "present": 18530,
+        "total": 23612
+      }
+    },
+    "field_evidence": {
+      "available": true,
+      "by_field": [
+        {
+          "average_confidence": 0.98,
+          "evidence_rows": 23304,
+          "field": "concepto",
+          "low_confidence": 0,
+          "record_coverage_percent": 98.7,
+          "records": 23304
+        },
+        {
+          "average_confidence": 0.98,
+          "evidence_rows": 19949,
+          "field": "expediente",
+          "low_confidence": 0,
+          "record_coverage_percent": 84.49,
+          "records": 19949
+        },
+        {
+          "average_confidence": 0.98,
+          "evidence_rows": 19647,
+          "field": "fecha_sesion",
+          "low_confidence": 0,
+          "record_coverage_percent": 83.21,
+          "records": 19647
+        },
+        {
+          "average_confidence": 0.98,
+          "evidence_rows": 19647,
+          "field": "fecha_sesion_original",
+          "low_confidence": 0,
+          "record_coverage_percent": 83.21,
+          "records": 19647
+        },
+        {
+          "average_confidence": 0.98,
+          "evidence_rows": 21049,
+          "field": "interesado",
+          "low_confidence": 0,
+          "record_coverage_percent": 89.15,
+          "records": 21049
+        },
+        {
+          "average_confidence": 0.95,
+          "evidence_rows": 23612,
+          "field": "numeral",
+          "low_confidence": 0,
+          "record_coverage_percent": 100.0,
+          "records": 23612
+        },
+        {
+          "average_confidence": 0.8072,
+          "evidence_rows": 27986,
+          "field": "principio_activo",
+          "low_confidence": 0,
+          "record_coverage_percent": 78.94,
+          "records": 18639
+        },
+        {
+          "average_confidence": 0.9097,
+          "evidence_rows": 11430,
+          "field": "producto",
+          "low_confidence": 0,
+          "record_coverage_percent": 48.41,
+          "records": 11430
+        },
+        {
+          "average_confidence": 0.98,
+          "evidence_rows": 18530,
+          "field": "radicado",
+          "low_confidence": 0,
+          "record_coverage_percent": 78.48,
+          "records": 18530
+        },
+        {
+          "average_confidence": 1.0,
+          "evidence_rows": 23612,
+          "field": "rango_paginas",
+          "low_confidence": 0,
+          "record_coverage_percent": 100.0,
+          "records": 23612
+        },
+        {
+          "average_confidence": 0.6246,
+          "evidence_rows": 23304,
+          "field": "resultado_normalizado",
+          "low_confidence": 11671,
+          "record_coverage_percent": 98.7,
+          "records": 23304
+        },
+        {
+          "average_confidence": 0.98,
+          "evidence_rows": 10108,
+          "field": "solicitud",
+          "low_confidence": 0,
+          "record_coverage_percent": 42.81,
+          "records": 10108
+        },
+        {
+          "average_confidence": 0.7438,
+          "evidence_rows": 10108,
+          "field": "tipo_solicitud",
+          "low_confidence": 2684,
+          "record_coverage_percent": 42.81,
+          "records": 10108
+        },
+        {
+          "average_confidence": 0.95,
+          "evidence_rows": 12249,
+          "field": "titulo_numeral",
+          "low_confidence": 0,
+          "record_coverage_percent": 51.88,
+          "records": 12249
+        }
+      ],
+      "by_method": [
+        {
+          "average_confidence": 0.98,
+          "evidence_rows": 95034,
+          "method": "explicit_label",
+          "origin": "explícito estructurado"
+        },
+        {
+          "average_confidence": 0.98,
+          "evidence_rows": 39294,
+          "method": "session_date_label",
+          "origin": "otro método"
+        },
+        {
+          "average_confidence": 0.95,
+          "evidence_rows": 35861,
+          "method": "numbered_heading",
+          "origin": "explícito estructurado"
+        },
+        {
+          "average_confidence": 1.0,
+          "evidence_rows": 23612,
+          "method": "page_span",
+          "origin": "estructura documental"
+        },
+        {
+          "average_confidence": 0.6246,
+          "evidence_rows": 23304,
+          "method": "outcome_inference",
+          "origin": "inferido"
+        },
+        {
+          "average_confidence": 0.82,
+          "evidence_rows": 15471,
+          "method": "composition_label",
+          "origin": "explícito estructurado"
+        },
+        {
+          "average_confidence": 0.78,
+          "evidence_rows": 11803,
+          "method": "dosage_statement",
+          "origin": "explícito estructurado"
+        },
+        {
+          "average_confidence": 0.7438,
+          "evidence_rows": 10108,
+          "method": "request_type_inference",
+          "origin": "inferido"
+        },
+        {
+          "average_confidence": 0.9,
+          "evidence_rows": 10048,
+          "method": "numbered_heading_product",
+          "origin": "explícito estructurado"
+        }
+      ],
+      "record_coverage_percent": 100.0,
+      "records": 23612,
+      "rows": 264535
+    },
+    "fields": [
+      {
+        "available": true,
+        "coverage_percent": 100.0,
+        "key": "numeral",
+        "label": "Numeral",
+        "missing": 0,
+        "present": 23612
+      },
+      {
+        "available": true,
+        "coverage_percent": 48.41,
+        "key": "product",
+        "label": "Producto",
+        "missing": 12182,
+        "present": 11430
+      },
+      {
+        "available": true,
+        "coverage_percent": 79.14,
+        "key": "active_ingredient",
+        "label": "Principio activo",
+        "missing": 4925,
+        "present": 18687
+      },
+      {
+        "available": true,
+        "coverage_percent": 89.15,
+        "key": "interested_party",
+        "label": "Interesado",
+        "missing": 2563,
+        "present": 21049
+      },
+      {
+        "available": true,
+        "coverage_percent": 84.49,
+        "key": "expediente",
+        "label": "Expediente",
+        "missing": 3663,
+        "present": 19949
+      },
+      {
+        "available": true,
+        "coverage_percent": 78.48,
+        "key": "radicado",
+        "label": "Radicado",
+        "missing": 5082,
+        "present": 18530
+      },
+      {
+        "available": true,
+        "coverage_percent": 93.26,
+        "key": "identifiers",
+        "label": "Expediente o radicado",
+        "missing": 1592,
+        "present": 22020
+      },
+      {
+        "available": true,
+        "coverage_percent": 100.0,
+        "key": "page_range",
+        "label": "Rango de páginas",
+        "missing": 0,
+        "present": 23612
+      },
+      {
+        "available": true,
+        "coverage_percent": 98.7,
+        "key": "concept",
+        "label": "Concepto",
+        "missing": 308,
+        "present": 23304
+      },
+      {
+        "available": true,
+        "coverage_percent": 49.27,
+        "key": "outcome",
+        "label": "Resultado clasificado",
+        "missing": 11979,
+        "present": 11633
+      }
+    ],
+    "record_confidence": {
+      "available": true,
+      "average": 0.7873,
+      "low": 4094,
+      "missing": 0
+    },
+    "records": 23612,
+    "status": "available"
+  },
+  "regulatory_records": 23612,
+  "schema_version": 6,
   "sqlite_integrity": "ok",
   "status": "ok",
   "text_page_coverage_percent": 100.0,
