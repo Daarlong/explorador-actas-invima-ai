@@ -45,8 +45,6 @@ aprobado.
 - Informe de integridad visible desde la aplicación.
 - Auditoría por capas: página oficial → catálogo → manifiesto → índice, con
   snapshot y huella SHA-256 del último descubrimiento válido.
-- Banco versionable de consultas y métricas Hit@K, Precision@K, Recall@K y MRR
-  para comparar objetivamente los tres modos de búsqueda.
 - Fichas enriquecidas con numeral, título, fecha de sesión, tipo de solicitud e
   identificador estable independiente del enlace del PDF.
 - Cola protegida para corregir, revisar, aprobar o reabrir fichas, conservando
@@ -65,7 +63,7 @@ aprobado.
 
 No contiene funcionalidades relacionadas con un monitor de transparencia.
 
-## Cambios visibles en la versión 0.7.1
+## Cambios visibles en la versión 0.7.2
 
 | Módulo | Mejora |
 |---|---|
@@ -74,9 +72,11 @@ No contiene funcionalidades relacionadas con un monitor de transparencia.
 | Evidencia | Cada campo automático muestra valor literal, normalizado y canónico, página, fragmento, método y confianza |
 | Correcciones | Un único valor vigente se aplica en filtros, búsqueda, fichas, comparación, cronología y exportaciones |
 | Cronología | Combina datos verificados, estructurados, inferidos y menciones textuales sin confundirlos |
-| Publicación | Una base candidata se diagnostica y valida; inventario, identidades, diez métricas regulatorias, paquetes y banco humano pueden bloquear el reemplazo |
+| Enfoque | Se retiran la página Evaluación, el banco de casos y sus métricas; la herramienta queda centrada en consulta y análisis documental |
+| Publicación | Solo bloquean fallos técnicos: pérdida de documentos o páginas, integridad, identidades, índice semántico y paquetes; los campos derivados generan advertencias |
+| Rendimiento | La reconciliación reutiliza comparaciones de texto y evita repetir el cálculo costoso entre las mismas fichas |
 
-La 0.7.1 no añade funciones de IA. Su objetivo es que el corpus histórico y
+La 0.7.2 no añade funciones de IA. Su objetivo es que el corpus histórico y
 las fichas que utilizará una versión posterior sean completos, trazables y
 reproducibles.
 
@@ -121,14 +121,13 @@ todo el histórico visible desde 2013; el año inicial se configura con
 │   ├── 3_Administracion.py
 │   ├── 4_Integridad.py
 │   ├── 5_Catalogo.py
-│   ├── 6_Evaluacion.py
 │   ├── 7_Comparar.py
 │   └── 8_Revision_Fichas.py
 ├── services/
 │   ├── catalog.py
+│   ├── corpus_status.py
 │   ├── database.py
 │   ├── downloader.py
-│   ├── evaluation.py
 │   ├── indexing.py
 │   ├── integrity.py
 │   ├── llm.py
@@ -150,9 +149,7 @@ todo el histórico visible desde 2013; el año inicial se configura con
 ├── documents_manifest.csv
 ├── build_index.py
 ├── check_index_pending.py
-├── evaluate_search.py
 ├── reprocess_corpus.py
-├── evaluation_cases.csv
 ├── package_index.py
 ├── packages.txt
 ├── sync_catalog.py
@@ -204,10 +201,8 @@ El flujo de construcción del índice:
    desde los fragmentos ya almacenados;
 6. construye o actualiza el índice semántico local;
 7. genera informes de ejecución, integridad y cobertura por año;
-8. ejecuta el banco de evaluación y registra sus métricas cuando contiene casos
-   habilitados;
-9. comprime ambas bases, calcula hashes y las divide en fragmentos de 90 MiB;
-10. guarda los índices y los informes automáticamente en el repositorio privado.
+8. comprime ambas bases, calcula hashes y las divide en fragmentos de 90 MiB;
+9. guarda los índices y los informes automáticamente en el repositorio privado.
 
 No es necesario descargar un artefacto ni subir manualmente `actas.db`.
 
@@ -226,8 +221,8 @@ documentos fallidos pendientes para reintentarlos sin perder los correctos.
 La primera instalación de la 0.7 migra de forma compatible al esquema 6, pero
 el texto fuente histórico solo queda completo después del reprocesamiento
 controlado. Abre **Actions → Reprocesar estructura y fichas**: primero ejecuta
-el modo `diagnostic` y luego el modo `publish` cuando el banco humano y todos
-los controles estén aprobados. Ese flujo trabaja sobre una candidata separada,
+el modo `diagnostic` y luego el modo `publish` cuando todos los controles
+técnicos estén aprobados. Ese flujo trabaja sobre una candidata separada,
 permite continuar una ejecución y nunca reemplaza la base publicada durante el
 diagnóstico. Después, las actualizaciones normales vuelven a ser incrementales.
 
@@ -235,9 +230,10 @@ Los puntos de continuación están vinculados al código de extracción, al ento
 y a la huella de la base publicada. Después de cambiar cualquiera de ellos se
 debe iniciar con `resume_run_id` vacío; la caché separada de PDF evita volver a
 descargar normalmente los documentos. El resumen de GitHub distingue entre un
-workflow que terminó y una candidata realmente aprobada, y los artefactos usan
-los nombres `candidate-evaluation-report.json` y
-`baseline-evaluation-report.json` para no mezclar ambas mediciones.
+workflow que terminó y una candidata realmente aprobada. Los cambios de
+completitud en campos estructurados se informan como advertencias porque el PDF
+oficial es la fuente documental; no existe un banco de evaluación como requisito
+de publicación.
 
 Ya no existe una casilla `full_rebuild` en el workflow normal. Esto evita que
 una reconstrucción total pueda iniciarse accidentalmente desde la acción
@@ -355,21 +351,15 @@ estar incompleta o mal clasificada por diferencias históricas de formato; por
 eso se marca como automática y siempre debe comprobarse contra la página del
 PDF mostrada en el visor.
 
-## Evaluación, comparación y revisión humana
-
-La página **Evaluación** no califica respuestas generadas por IA. Mide si el
-buscador recupera las actas que un revisor regulatorio definió previamente como
-correctas. El archivo `evaluation_cases.csv` comienza con un ejemplo
-deshabilitado; completa y habilita casos únicamente después de validar la
-fuente esperada. El workflow conserva el resultado en
-`data/evaluation-report.json`.
+## Comparación y trazabilidad
 
 Desde el **Explorador** se pueden marcar evidencias y enviarlas a **Comparar**.
 Allí se muestran las fichas lado a lado, se pueden construir cronologías y se
 pueden descargar un CSV compatible con Excel y un reporte HTML que el navegador
 permite guardar como PDF.
 
-La página **Revisión de fichas** guarda eventos separados del índice automático:
+La página opcional **Revisión de fichas** nunca modifica las actas. Guarda
+observaciones sobre los campos derivados, separadas del índice automático:
 una reconstrucción no sobrescribe las correcciones. Si cambia el PDF o el valor
 extraído que sustentaba una revisión, la aplicación exige reconfirmarla. La
 reconciliación combina identificadores, página, texto, campos y orden, siempre
@@ -399,7 +389,7 @@ Antes de publicar una versión se debe comprobar:
 
 El flujo `.github/workflows/tests.yml` repite automáticamente la compilación y
 las pruebas con Python 3.12 después de cada cambio enviado a GitHub. La versión
-0.7.1 usa directamente la API `pymupdf`, sin depender del nombre heredado
+0.7.2 usa directamente la API `pymupdf`, sin depender del nombre heredado
 `fitz`, y Tesseract se instala dentro del runner de GitHub. La búsqueda
 semántica también es local y usa únicamente la biblioteca estándar de Python.
 No requiere instalar herramientas de desarrollo en el computador corporativo.

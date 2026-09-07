@@ -46,12 +46,6 @@ SOURCE_SNAPSHOT_PATH = Path(
 REVIEW_LOG_PATH = Path(
     os.getenv("ACTAS_REVIEW_LOG_PATH", DATA_DIR / "regulatory-review-log.csv")
 )
-EVALUATION_CASES_PATH = Path(
-    os.getenv("ACTAS_EVALUATION_CASES_PATH", ROOT_DIR / "evaluation_cases.csv")
-)
-EVALUATION_REPORT_PATH = Path(
-    os.getenv("ACTAS_EVALUATION_REPORT_PATH", DATA_DIR / "evaluation-report.json")
-)
 REPROCESS_ROOT = Path(
     os.getenv("ACTAS_REPROCESS_ROOT", ROOT_DIR / ".reprocess")
 )

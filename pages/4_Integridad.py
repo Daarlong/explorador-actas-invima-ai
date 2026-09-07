@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import streamlit as st
 
-from config import INDEXING_REPORT_PATH, INTEGRITY_REPORT_PATH
+from config import (
+    CATALOG_REPORT_PATH,
+    INDEXING_REPORT_PATH,
+    INTEGRITY_REPORT_PATH,
+    SEMANTIC_REPORT_PATH,
+    SOURCE_SNAPSHOT_PATH,
+)
+from services.corpus_status import corpus_status_from_reports
 from services.indexing import load_indexing_report
 from services.integrity import load_integrity_report
 
@@ -15,6 +22,13 @@ st.caption(
 
 report = load_integrity_report(INTEGRITY_REPORT_PATH)
 indexing_report = load_indexing_report(INDEXING_REPORT_PATH)
+corpus_status = corpus_status_from_reports(
+    INTEGRITY_REPORT_PATH,
+    INDEXING_REPORT_PATH,
+    SEMANTIC_REPORT_PATH,
+    catalog_report_path=CATALOG_REPORT_PATH,
+    source_snapshot_path=SOURCE_SNAPSHOT_PATH,
+)
 if not report:
     st.info(
         "Todavía no existe un informe. Ejecuta Actions → Construir índice → "
@@ -52,6 +66,46 @@ technical_col1.metric(
 )
 technical_col2.metric(
     "Desajustes texto–FTS", report.get("fts_rowid_mismatches", 0)
+)
+
+st.subheader("Cadena de cobertura documental")
+st.caption(
+    "Comprueba que las publicaciones observadas en la fuente oficial llegan al "
+    "catálogo, al manifiesto y finalmente al índice consultable."
+)
+coverage_layers = corpus_status.get("coverage_layers") or []
+if coverage_layers:
+    st.dataframe(
+        [
+            {
+                "Etapa": item.get("label"),
+                "Disponibles": item.get("numerator", 0),
+                "Esperados": item.get("denominator", 0),
+                "Cobertura": (
+                    f"{item.get('coverage_percent')} %"
+                    if item.get("coverage_percent") is not None
+                    else "No verificada"
+                ),
+                "Estado": item.get("status", "unverified"),
+            }
+            for item in coverage_layers
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+source_col1, source_col2, source_col3 = st.columns(3)
+source_col1.metric(
+    "Fuente oficial verificada",
+    "Sí" if corpus_status.get("source_snapshot_valid") else "No",
+)
+source_col2.metric(
+    "Publicaciones observadas",
+    corpus_status.get("source_discovered_records", 0),
+)
+source_age = corpus_status.get("source_age_hours")
+source_col3.metric(
+    "Antigüedad de la consulta",
+    f"{source_age} h" if source_age is not None else "Sin registro",
 )
 
 st.subheader("Cobertura del índice")

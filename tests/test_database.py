@@ -2,12 +2,17 @@ import tempfile
 import unittest
 import sqlite3
 import zlib
+from difflib import SequenceMatcher as StandardSequenceMatcher
 from pathlib import Path
 from unittest.mock import patch
 
 from services.database import (
     DATABASE_SCHEMA_VERSION,
     REGULATORY_EXTRACTOR_VERSION,
+    _mutual_scored_matches,
+    _precompute_record_link_scores,
+    _record_link_score,
+    _record_match_has_evidence,
     _regulatory_record_key,
     connect,
     count_regulatory_records,
@@ -1211,6 +1216,187 @@ class DatabaseTests(unittest.TestCase):
         self.assertNotEqual(rows["expnew"], protected_uid)
         self.assertEqual(duplicate_count, 0)
         self.assertIn(protected_uid, report["candidate_uid_replacements"])
+
+    def test_scored_reconciliation_reuses_pair_scores_between_rounds(self) -> None:
+        candidates = [{"id": value} for value in (1, 2, 3)]
+        baselines = [{"id": value} for value in (101, 102, 103)]
+        score_matrix = {
+            (1, 101): 150.0,
+            (2, 101): 100.0,
+            (2, 102): 90.0,
+            (3, 102): 50.0,
+            (3, 103): 40.0,
+        }
+
+        def reconcile(*, cached: bool) -> tuple[list[tuple[int, int]], int]:
+            candidate_unused = {1, 2, 3}
+            baseline_unused = {101, 102, 103}
+            accepted: list[tuple[int, int]] = []
+            calls = 0
+
+            def score(candidate: dict, baseline: dict, *_args) -> float | None:
+                nonlocal calls
+                calls += 1
+                return score_matrix.get((candidate["id"], baseline["id"]))
+
+            with patch("services.database._record_link_score", side_effect=score):
+                precomputed_scores = None
+                if cached:
+                    precomputed_scores = _precompute_record_link_scores(
+                        candidates,
+                        baselines,
+                        {},
+                    )
+                while True:
+                    matches = _mutual_scored_matches(
+                        candidates,
+                        baselines,
+                        candidate_unused,
+                        baseline_unused,
+                        precomputed_scores=precomputed_scores,
+                    )
+                    if not matches:
+                        break
+                    for candidate_id, baseline_id in matches:
+                        accepted.append((candidate_id, baseline_id))
+                        candidate_unused.remove(candidate_id)
+                        baseline_unused.remove(baseline_id)
+            return accepted, calls
+
+        uncached_matches, uncached_calls = reconcile(cached=False)
+        cached_matches, cached_calls = reconcile(cached=True)
+
+        self.assertEqual(cached_matches, uncached_matches)
+        self.assertEqual(cached_matches, [(1, 101), (2, 102), (3, 103)])
+        self.assertEqual(cached_calls, 9)
+        self.assertGreater(uncached_calls, cached_calls)
+
+    def test_text_similarity_is_shared_by_scoring_and_ambiguity_check(self) -> None:
+        common = {
+            "page_number": 7,
+            "end_page_number": 7,
+            "page_span": (7, 7),
+            "radicado": "",
+            "radicado_prefix": "",
+            "expediente": "",
+            "stable_numeral": "",
+            "product": "producto",
+            "active_ingredient": "activo",
+            "interested_party": "titular",
+            "ordinal": 1,
+        }
+        candidate = {
+            **common,
+            "id": 1,
+            "text_signature": (
+                "inicio candidato "
+                + ("texto regulatorio " * 20)
+                + "cierre candidato"
+            ),
+        }
+        baseline = {
+            **common,
+            "id": 101,
+            "text_signature": (
+                "inicio referencia "
+                + ("texto regulatorio " * 19)
+                + "cierre referencia"
+            ),
+        }
+        cache: dict[tuple[str, str], tuple[float, bool]] = {}
+
+        with patch(
+            "services.database.SequenceMatcher",
+            wraps=StandardSequenceMatcher,
+        ) as matcher:
+            cached_score = _record_link_score(candidate, baseline, cache)
+            cached_evidence = _record_match_has_evidence(
+                candidate,
+                baseline,
+                cache,
+            )
+            # Otro par con el mismo contenido debe compartir la comparación,
+            # aunque sus identificadores internos sean distintos.
+            duplicate_candidate = {**candidate, "id": 2}
+            duplicate_baseline = {**baseline, "id": 102}
+            self.assertEqual(
+                _record_link_score(duplicate_candidate, duplicate_baseline, cache),
+                cached_score,
+            )
+
+        self.assertEqual(matcher.call_count, 1)
+        self.assertEqual(len(cache), 1)
+        self.assertEqual(cached_score, _record_link_score(candidate, baseline))
+        self.assertEqual(
+            cached_evidence,
+            _record_match_has_evidence(candidate, baseline),
+        )
+
+    def test_identical_long_text_skips_sequence_matcher_without_changing_score(
+        self,
+    ) -> None:
+        text = "concepto regulatorio repetido " * 200
+        common = {
+            "page_number": 9,
+            "end_page_number": 9,
+            "page_span": (9, 9),
+            "radicado": "",
+            "radicado_prefix": "",
+            "expediente": "",
+            "stable_numeral": "",
+            "product": "producto",
+            "active_ingredient": "activo",
+            "interested_party": "titular",
+            "ordinal": 1,
+            "text_signature": text,
+        }
+        candidate = {**common, "id": 1}
+        baseline = {**common, "id": 101}
+
+        expected = _record_link_score(candidate, baseline)
+        with patch("services.database.SequenceMatcher") as matcher:
+            actual = _record_link_score(candidate, baseline, {})
+
+        self.assertEqual(actual, expected)
+        matcher.assert_not_called()
+
+    def test_contained_long_text_uses_exact_ratio_without_sequence_matcher(
+        self,
+    ) -> None:
+        shorter = "fundamento regulatorio " * 100
+        longer = "introduccion " + shorter + " conclusion"
+        common = {
+            "page_number": 9,
+            "end_page_number": 9,
+            "page_span": (9, 9),
+            "radicado": "",
+            "radicado_prefix": "",
+            "expediente": "",
+            "stable_numeral": "",
+            "product": "producto",
+            "active_ingredient": "activo",
+            "interested_party": "titular",
+            "ordinal": 1,
+        }
+        candidate = {**common, "id": 1, "text_signature": shorter}
+        baseline = {**common, "id": 101, "text_signature": longer}
+
+        expected = _record_link_score(candidate, baseline)
+        expected_ratio = StandardSequenceMatcher(
+            None,
+            shorter,
+            longer,
+            autojunk=False,
+        ).ratio()
+        self.assertEqual(
+            expected_ratio,
+            (2.0 * len(shorter)) / (len(shorter) + len(longer)),
+        )
+        with patch("services.database.SequenceMatcher") as matcher:
+            actual = _record_link_score(candidate, baseline, {})
+
+        self.assertEqual(actual, expected)
+        matcher.assert_not_called()
 
     def test_filters_are_applied(self) -> None:
         self.assertEqual(

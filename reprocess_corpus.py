@@ -3,7 +3,7 @@
 La acción de reprocesamiento nunca trabaja directamente sobre los paquetes
 publicados. Construye una candidata por lotes, conserva un punto de
 continuación y solo permite copiarla a ``data/`` después de validar integridad,
-calidad, revisiones y una restauración real de los paquetes.
+trazabilidad, revisiones y una restauración real de los paquetes.
 """
 
 from __future__ import annotations
@@ -58,7 +58,6 @@ REPORT_NAMES = (
     "indexing-report.json",
     "integrity-report.json",
     "semantic-report.json",
-    "evaluation-report.json",
     "reconciliation-report.json",
 )
 WORKFLOW_REPORT_EXPORTS = (
@@ -68,13 +67,11 @@ WORKFLOW_REPORT_EXPORTS = (
     ("candidate/data/indexing-report.json", "candidate-indexing-report.json"),
     ("candidate/data/integrity-report.json", "candidate-integrity-report.json"),
     ("candidate/data/semantic-report.json", "candidate-semantic-report.json"),
-    ("candidate/data/evaluation-report.json", "candidate-evaluation-report.json"),
     (
         "candidate/data/reconciliation-report.json",
         "candidate-reconciliation-report.json",
     ),
     ("baseline/data/integrity-report.json", "baseline-integrity-report.json"),
-    ("baseline/data/evaluation-report.json", "baseline-evaluation-report.json"),
 )
 REQUIRED_COMPLETENESS_FIELDS = (
     "product",
@@ -121,7 +118,6 @@ _FIELD_ALIASES = {
         "outcome_code",
     ),
 }
-_ACCEPTED_GATE_STATUSES = {"pass", "passed", "ok", "accepted", "aprobado"}
 _WORD_PATTERN = re.compile(r"\b[^\W\d_][\wáéíóúüñ-]{3,}\b", re.IGNORECASE)
 
 
@@ -669,20 +665,6 @@ def _field_metric(fields: dict, canonical: str) -> tuple[float | None, int | Non
     return None, count
 
 
-def _quality_gate_passes(evaluation: dict) -> bool:
-    if evaluation.get("release_mode") is not True:
-        return False
-    gate = evaluation.get("quality_gate")
-    if not isinstance(gate, dict):
-        return False
-    return bool(
-        gate.get("mode") == "release"
-        and gate.get("can_publish") is True
-        and str(gate.get("status", "")).strip().lower()
-        in _ACCEPTED_GATE_STATUSES
-    )
-
-
 def _database_missing_decision_uids(database_path: Path) -> int:
     if not database_path.exists():
         return -1
@@ -763,7 +745,7 @@ def _compare_required_field_completeness(
     candidate_fields: dict,
     baseline_fields: dict,
 ) -> tuple[dict[str, dict[str, object]], list[dict[str, object]]]:
-    """Compara todos los campos obligatorios con una política fail-closed."""
+    """Compara campos derivados para informar cambios, sin calificar las actas."""
 
     summary: dict[str, dict[str, object]] = {}
     issues: list[dict[str, object]] = []
@@ -950,11 +932,6 @@ def validate_candidate(
     candidate_integrity = _load_json(candidate_data / "integrity-report.json")
     baseline_integrity = _load_json(baseline_data / "integrity-report.json")
     candidate_indexing = _load_json(candidate_data / "indexing-report.json")
-    candidate_evaluation = _load_json(candidate_data / "evaluation-report.json")
-    baseline_evaluation = _load_json(
-        baseline_data / "evaluation-report.json",
-        required=False,
-    )
     candidate_semantic = _load_json(candidate_data / "semantic-report.json")
     identity_reconciliation = _load_json(
         candidate_data / "reconciliation-report.json"
@@ -1018,12 +995,6 @@ def validate_candidate(
             "page_regression",
             "La candidata pierde páginas consultables",
             {"baseline": baseline_pages, "candidate": candidate_pages},
-        )
-
-    if mode == "publish" and not _quality_gate_passes(candidate_evaluation):
-        reject(
-            "quality_gate",
-            "La candidata no tiene una evaluación de publicación aprobada",
         )
 
     missing_decision_uids = _database_missing_decision_uids(
@@ -1101,11 +1072,11 @@ def validate_candidate(
                 )
 
     candidate_fields = _find_nested_mapping(
-        (candidate_indexing, candidate_integrity, candidate_evaluation),
+        (candidate_indexing, candidate_integrity),
         "field_completeness",
     )
     baseline_fields = _find_nested_mapping(
-        (baseline_evaluation, baseline_integrity),
+        (baseline_integrity,),
         "field_completeness",
     )
     if not candidate_fields:
@@ -1119,7 +1090,10 @@ def validate_candidate(
     completeness_summary, completeness_issues = (
         _compare_required_field_completeness(candidate_fields, baseline_fields)
     )
-    issues.extend(completeness_issues)
+    # Los campos estructurados ayudan a filtrar y construir cronologías, pero
+    # el texto y la página del acta son la fuente de consulta. Una variación en
+    # campos derivados se informa sin bloquear una base documental íntegra.
+    advisories = completeness_issues
 
     if str(candidate_semantic.get("status", "")).lower() not in {"built", "reused"}:
         reject("semantic_report", "El índice semántico candidato no está vigente")
@@ -1188,7 +1162,7 @@ def validate_candidate(
         "review_reconciliation": reconciliation,
         "identity_reconciliation": identity_reconciliation,
         "field_completeness": completeness_summary,
-        "quality_gate": candidate_evaluation.get("quality_gate"),
+        "advisories": advisories,
         "smoke": smoke,
         "packages": package_fingerprints,
         "reports": report_fingerprints,
@@ -1270,6 +1244,9 @@ def publish_candidate(
         for old_part in published_data.glob(f"{database_name}.gz.part-*"):
             if old_part.name not in new_names:
                 old_part.unlink()
+    # La 0.7.2 retiró el módulo de evaluación. Si una publicación anterior
+    # dejó este reporte, se elimina de forma explícita y recuperable por Git.
+    (published_data / "evaluation-report.json").unlink(missing_ok=True)
 
     if _file_snapshot(review_log_path) != state.get("review_log"):
         raise RuntimeError("La publicación alteró el registro de revisiones")
@@ -1303,13 +1280,7 @@ def export_workflow_reports(
     *,
     github_summary_path: Path | None = None,
 ) -> dict[str, object]:
-    """Exporta informes con nombres inequívocos y resume el resultado.
-
-    GitHub conserva la estructura de directorios de un artefacto. Como la
-    candidata y la referencia usaban ambas ``evaluation-report.json``, era
-    fácil descargar el archivo equivocado. Esta exportación deliberadamente
-    plana hace explícito cuál corresponde a cada base.
-    """
+    """Exporta los informes técnicos con nombres inequívocos."""
 
     workspace = _safe_workspace(workspace)
     export_dir = workspace / "export"
@@ -1328,16 +1299,11 @@ def export_workflow_reports(
         required=False,
     )
     issues = report.get("issues") if isinstance(report.get("issues"), list) else []
-    quality_gate = (
-        report.get("quality_gate")
-        if isinstance(report.get("quality_gate"), dict)
-        else {}
+    advisories = (
+        report.get("advisories")
+        if isinstance(report.get("advisories"), list)
+        else []
     )
-    failed_quality_checks = [
-        item
-        for item in quality_gate.get("checks", [])
-        if isinstance(item, dict) and not item.get("passed")
-    ]
     if report:
         status = str(report.get("status") or "unknown")
         mode = str(report.get("mode") or "unknown")
@@ -1352,9 +1318,9 @@ def export_workflow_reports(
         "Informes del reprocesamiento\n"
         "=============================\n\n"
         "reprocess-report.json es el resultado consolidado y autoritativo.\n"
-        "candidate-evaluation-report.json evalúa la base candidata.\n"
-        "baseline-evaluation-report.json evalúa la base publicada anterior.\n"
         "Los demás archivos indican candidate- o baseline- en su nombre.\n"
+        "Las advertencias de campos derivados son informativas y no corrigen "
+        "el contenido oficial de las actas.\n"
     )
     (export_dir / "LEEME-INFORMES.txt").write_text(readme, encoding="utf-8")
     exported.append("LEEME-INFORMES.txt")
@@ -1364,7 +1330,7 @@ def export_workflow_reports(
         "status": status,
         "mode": mode,
         "issues": len(issues),
-        "pending_quality_checks": len(failed_quality_checks),
+        "advisories": len(advisories),
         "files": sorted(exported),
     }
     _atomic_json(export_dir / "report-index.json", index)
@@ -1408,7 +1374,7 @@ def export_workflow_reports(
             f"| Documentos candidatos | {_markdown_cell(candidate.get('documents', ''))} |",
             f"| Páginas candidatas | {_markdown_cell(candidate.get('pages', ''))} |",
             f"| Bloqueos técnicos | {len(issues)} |",
-            f"| Controles de publicación pendientes | {len(failed_quality_checks)} |",
+            f"| Advertencias informativas | {len(advisories)} |",
             "",
         ]
         if status == "continuation_pending":
@@ -1442,27 +1408,26 @@ def export_workflow_reports(
         elif status == "diagnostic_complete":
             lines.extend(
                 [
-                    "> El diagnóstico técnico terminó sin bloqueos. Antes de "
-                    "publicar, completa también los controles humanos indicados abajo.",
+                    "> El diagnóstico técnico terminó sin bloqueos.",
                     "",
                 ]
             )
         elif status == "accepted":
-            lines.extend(["> La candidata superó los controles de publicación.", ""])
+            lines.extend(["> La candidata superó los controles técnicos.", ""])
 
-        if failed_quality_checks:
+        if advisories:
             lines.extend(
                 [
-                    "### Controles de publicación pendientes",
+                    "### Advertencias sobre campos derivados",
                     "",
-                    "| Control | Detalle |",
+                    "| Código | Detalle |",
                     "|---|---|",
                 ]
             )
-            for item in failed_quality_checks:
+            for item in advisories:
                 lines.append(
-                    f"| {_markdown_cell(item.get('label', item.get('key', '')))} | "
-                    f"{_markdown_cell(item.get('detail', ''))} |"
+                    f"| `{_markdown_cell(item.get('code', ''))}` | "
+                    f"{_markdown_cell(item.get('message', ''))} |"
                 )
             lines.append("")
         lines.extend(

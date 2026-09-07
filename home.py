@@ -17,7 +17,7 @@ from config import (
 )
 from services.catalog import load_catalog
 from services.database import dashboard_summary
-from services.evaluation import audit_corpus_reports
+from services.corpus_status import corpus_status_from_reports
 from services.integrity import load_integrity_report
 from services.semantic import semantic_index_status
 
@@ -33,7 +33,7 @@ summary = dashboard_summary(DATABASE_PATH)
 integrity = load_integrity_report(INTEGRITY_REPORT_PATH) or {}
 catalog = load_catalog(ACTAS_CATALOG_PATH)
 semantic = semantic_index_status(SEMANTIC_INDEX_PATH)
-audit = audit_corpus_reports(
+corpus_status = corpus_status_from_reports(
     INTEGRITY_REPORT_PATH,
     INDEXING_REPORT_PATH,
     SEMANTIC_REPORT_PATH,
@@ -52,12 +52,12 @@ st.caption(
 status = integrity.get("status")
 if summary["documents"] == 0:
     st.error("El índice documental todavía no está disponible.")
-elif status == "error" or audit.get("status") == "error":
+elif status == "error" or corpus_status.get("status") == "error":
     st.warning(
         "El índice puede consultarse, pero la auditoría detectó cobertura, "
         "integridad o fuente oficial pendiente de verificar."
     )
-elif status == "warning" or audit.get("status") != "ok":
+elif status == "warning" or corpus_status.get("status") != "ok":
     st.warning("El corpus está disponible con advertencias documentales por revisar.")
 else:
     st.success("El corpus está disponible para consulta.")
@@ -187,16 +187,15 @@ with activity_col:
     )
     st.write("✅ Visor de página y selección de evidencia")
     st.write(
-        ("✅" if audit.get("status") == "ok" else "⚠️")
-        + " Auditoría reproducible del corpus"
+        ("✅" if corpus_status.get("status") == "ok" else "⚠️")
+        + " Integridad técnica del corpus"
     )
 
 st.subheader("Accesos")
-link1, link2, link3, link4 = st.columns(4)
+link1, link2, link3 = st.columns(3)
 link1.page_link("pages/1_Explorador.py", label="Abrir Explorador", icon="🔍")
 link2.page_link("pages/2_Analista_IA.py", label="Abrir Analista", icon="💬")
 link3.page_link("pages/7_Comparar.py", label="Comparar decisiones", icon="⚖️")
-link4.page_link("pages/6_Evaluacion.py", label="Evaluar búsquedas", icon="📊")
 link5, link6, link7, _ = st.columns(4)
 link5.page_link("pages/8_Revision_Fichas.py", label="Revisar fichas", icon="📝")
 link6.page_link("pages/4_Integridad.py", label="Ver Integridad", icon="✅")

@@ -18,7 +18,6 @@ from reprocess_corpus import (
     _database_missing_decision_uids,
     _file_snapshot,
     _page_inventory_gate_passes,
-    _quality_gate_passes,
     _review_reconciliation,
     _safe_workspace,
     _source_fingerprint,
@@ -146,7 +145,7 @@ class ReprocessCorpusTests(unittest.TestCase):
                     resume_from=resume,
                 )
 
-    def test_workflow_reports_use_unambiguous_names_and_summary_warnings(self) -> None:
+    def test_workflow_reports_export_technical_status_and_advisories(self) -> None:
         with self._project_temporary() as directory:
             workspace = Path(directory) / "workflow-report"
             (workspace / "candidate/data").mkdir(parents=True)
@@ -163,25 +162,17 @@ class ReprocessCorpusTests(unittest.TestCase):
                             "message": "La candidata no supera la integridad",
                         }
                     ],
-                    "quality_gate": {
-                        "checks": [
-                            {
-                                "key": "minimum_cases",
-                                "label": "Banco humano",
-                                "passed": False,
-                                "detail": "Faltan casos.",
-                            }
-                        ]
-                    },
+                    "advisories": [
+                        {
+                            "code": "field_regression",
+                            "message": "Cambió un campo derivado.",
+                        }
+                    ],
                 },
             )
             _atomic_json(
-                workspace / "candidate/data/evaluation-report.json",
+                workspace / "candidate/data/integrity-report.json",
                 {"origin": "candidate"},
-            )
-            _atomic_json(
-                workspace / "baseline/data/evaluation-report.json",
-                {"origin": "baseline"},
             )
             summary = Path(directory) / "github-summary.md"
             output = StringIO()
@@ -194,22 +185,15 @@ class ReprocessCorpusTests(unittest.TestCase):
             exported = workspace / "export"
             self.assertEqual(
                 json.loads(
-                    (exported / "candidate-evaluation-report.json").read_text(
+                    (exported / "candidate-integrity-report.json").read_text(
                         encoding="utf-8"
                     )
                 )["origin"],
                 "candidate",
             )
-            self.assertEqual(
-                json.loads(
-                    (exported / "baseline-evaluation-report.json").read_text(
-                        encoding="utf-8"
-                    )
-                )["origin"],
-                "baseline",
-            )
-            self.assertIn("candidate-evaluation-report.json", result["files"])
-            self.assertIn("baseline-evaluation-report.json", result["files"])
+            self.assertNotIn("candidate-evaluation-report.json", result["files"])
+            self.assertNotIn("baseline-evaluation-report.json", result["files"])
+            self.assertEqual(result["advisories"], 1)
             self.assertIn("::warning title=La candidata no está aprobada", output.getvalue())
             summary_text = summary.read_text(encoding="utf-8")
             self.assertIn("No publiques esta candidata", summary_text)
@@ -279,7 +263,7 @@ class ReprocessCorpusTests(unittest.TestCase):
             self.assertEqual(metrics["concept"]["coverage_percent"], 100.0)
             self.assertEqual(metrics["outcome"]["coverage_percent"], 0.0)
 
-    def test_completeness_gate_covers_release_fields_and_page_range(self) -> None:
+    def test_completeness_advisory_covers_structured_fields(self) -> None:
         self.assertEqual(
             REQUIRED_COMPLETENESS_FIELDS,
             (
@@ -391,44 +375,6 @@ class ReprocessCorpusTests(unittest.TestCase):
             self.assertEqual(summary["needs_reconfirmation"], 1)
             self.assertEqual(summary["orphaned"], 0)
             self.assertEqual(summary["ambiguous"], 0)
-
-    def test_quality_gate_requires_release_approval(self) -> None:
-        self.assertTrue(
-            _quality_gate_passes(
-                {
-                    "release_mode": True,
-                    "quality_gate": {
-                        "mode": "release",
-                        "status": "pass",
-                        "can_publish": True,
-                    },
-                }
-            )
-        )
-        self.assertFalse(
-            _quality_gate_passes(
-                {
-                    "release_mode": True,
-                    "quality_gate": {
-                        "mode": "release",
-                        "status": "fail",
-                        "can_publish": False,
-                    },
-                }
-            )
-        )
-        self.assertFalse(
-            _quality_gate_passes(
-                {
-                    "release_mode": False,
-                    "quality_gate": {
-                        "mode": "advisory",
-                        "status": "advisory",
-                        "can_publish": True,
-                    },
-                }
-            )
-        )
 
     def test_page_inventory_gate_accepts_recorded_failure_not_missing_page(self) -> None:
         with self._project_temporary() as directory:
@@ -621,7 +567,8 @@ class ReprocessCorpusTests(unittest.TestCase):
         self.assertNotIn('[ -n "${{ inputs.resume_run_id }}" ]', workflow)
         self.assertIn('[[ ! "$MODE" =~ ^(diagnostic|publish)$ ]]', workflow)
         self.assertNotIn('if [ "${{ inputs.mode }}"', workflow)
-        self.assertIn("continue-on-error: true", workflow)
+        self.assertNotIn("evaluate_search.py", workflow)
+        self.assertNotIn("evaluation-report.json", workflow)
         self.assertIn("python reprocess_corpus.py export-reports", workflow)
         self.assertIn("--github-summary \"$GITHUB_STEP_SUMMARY\"", workflow)
         self.assertIn("path: .reprocess/export/", workflow)
@@ -637,7 +584,7 @@ class ReprocessCorpusTests(unittest.TestCase):
         self.assertEqual(workflow.count("python reprocess_corpus.py reconcile"), 1)
         self.assertLess(
             workflow.index("python reprocess_corpus.py reconcile"),
-            workflow.index("python evaluate_search.py", workflow.index("Evaluar candidata")),
+            workflow.index("python package_index.py create"),
         )
 
     def test_batched_candidate_can_continue_from_checkpoint(self) -> None:

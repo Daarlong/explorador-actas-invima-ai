@@ -1,7 +1,8 @@
-# Alcance cerrado de la versión 0.7.1
+# Alcance cerrado de la versión 0.7.2
 
-La versión 0.7.1 corrige y hace auditable la estructuración masiva del corpus
-histórico. No incorpora nuevas funciones de IA ni realiza llamadas a modelos
+La versión 0.7.2 consolida el corpus histórico para consulta y análisis
+documental. Retira el módulo de evaluación de búsquedas y no exige bancos de
+casos ni calificaciones humanas. No incorpora nuevas llamadas a modelos
 externos.
 
 ## Imprescindible
@@ -57,17 +58,15 @@ externos.
    - No presentar una mención textual como un campo confirmado.
 
 8. **Controles de publicación**
-   - Medir completitud de numeral, producto, principio activo, interesado,
-     expediente, radicado, identificadores, rango de páginas, concepto y
-     resultado clasificado.
-   - Comparar la candidata con la base vigente y bloquear regresiones por encima
-     del umbral definido.
+   - Verificar que no se pierdan documentos ni páginas consultables.
+   - Medir los campos estructurados y presentar sus cambios como advertencias
+     informativas, sin calificar ni corregir las actas oficiales.
    - Verificar integridad SQLite, paquetes comprimidos restaurables y ausencia
      de revisiones huérfanas o ambiguas.
-   - Mantener pruebas sintéticas reproducibles y admitir un banco oro humano sin
-     inventar resultados esperados.
+   - Mantener pruebas técnicas reproducibles para índice, búsqueda, evidencia,
+     semántica, comparación y empaquetado.
 
-## Deseable, no bloqueante para 0.7.1
+## Deseable, no bloqueante para 0.7.2
 
 - OCR avanzado para páginas con texto parcial o de muy baja calidad.
 - Fusión semántica global y reranking del buscador híbrido.
@@ -79,6 +78,7 @@ externos.
 
 ## Fuera de alcance
 
+- Banco de evaluación, métricas Hit@K/MRR o calificación manual del buscador.
 - Consulta mediante IA, RAG, prompts nuevos o conexión a un LLM.
 - Embeddings externos.
 - Monitor de transparencia o seguimiento de trámites.
@@ -88,4 +88,4 @@ externos.
 
 La versión queda lista cuando las pruebas automatizadas pasan, el flujo de
 `Diagnóstico` genera informes sin modificar la base publicada y el flujo de
-`Publicar` solo permite reemplazarla después de superar todos los controles.
+`Publicar` solo permite reemplazarla después de superar los controles técnicos.

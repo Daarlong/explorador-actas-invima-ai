@@ -1513,7 +1513,63 @@ def _match_unique_groups(
     ]
 
 
-def _record_match_has_evidence(candidate: dict, baseline: dict) -> bool:
+def _record_text_comparison(
+    candidate: dict,
+    baseline: dict,
+    cache: dict[tuple[str, str], tuple[float, bool]] | None = None,
+) -> tuple[float, bool]:
+    """Calcula una sola vez la semejanza textual de un par de fichas.
+
+    ``SequenceMatcher`` con ``autojunk=False`` es deliberadamente conservador,
+    pero puede ser costoso para conceptos extensos. La conciliación compara el
+    mismo par en varias rondas y, si queda sin asignar, vuelve a compararlo para
+    decidir si es ambiguo. El resultado depende únicamente de ambos textos, de
+    modo que reutilizarlo dentro de un documento conserva exactamente la
+    semántica y evita repetir el trabajo dominante.
+    """
+
+    candidate_text = candidate["text_signature"]
+    baseline_text = baseline["text_signature"]
+    # La clave textual también comparte el resultado entre fichas duplicadas
+    # del mismo documento, algo frecuente en actas con bloques repetidos.
+    key = (candidate_text, baseline_text)
+    if cache is not None and key in cache:
+        return cache[key]
+
+    substantial_text = min(len(candidate_text), len(baseline_text)) >= 80
+    if not substantial_text:
+        result = (0.0, False)
+    elif candidate_text == baseline_text:
+        # SequenceMatcher devolvería exactamente lo mismo, pero recorrer un
+        # concepto largo y repetitivo puede ser desproporcionadamente costoso.
+        result = (1.0, True)
+    else:
+        shorter, longer = sorted((candidate_text, baseline_text), key=len)
+        text_containment = shorter in longer
+        if text_containment:
+            # Si todo el texto corto aparece contiguo en el largo, el número
+            # máximo de caracteres coincidentes es exactamente len(shorter).
+            # Esta es la misma fórmula que usa SequenceMatcher.ratio(), sin su
+            # costosa búsqueda cuadrática de bloques.
+            ratio = (2.0 * len(shorter)) / (
+                len(candidate_text) + len(baseline_text)
+            )
+        else:
+            ratio = SequenceMatcher(
+                None, candidate_text, baseline_text, autojunk=False
+            ).ratio()
+        result = (ratio, text_containment)
+
+    if cache is not None:
+        cache[key] = result
+    return result
+
+
+def _record_match_has_evidence(
+    candidate: dict,
+    baseline: dict,
+    text_comparison_cache: dict[tuple[str, str], tuple[float, bool]] | None = None,
+) -> bool:
     if any(
         candidate[field]
         and candidate[field] == baseline[field]
@@ -1531,15 +1587,12 @@ def _record_match_has_evidence(candidate: dict, baseline: dict) -> bool:
     )
     if not overlaps or not candidate["text_signature"] or not baseline["text_signature"]:
         return False
-    return (
-        SequenceMatcher(
-            None,
-            candidate["text_signature"],
-            baseline["text_signature"],
-            autojunk=False,
-        ).ratio()
-        >= 0.85
+    similarity, _ = _record_text_comparison(
+        candidate,
+        baseline,
+        text_comparison_cache,
     )
+    return similarity >= 0.85
 
 
 def _page_ranges_overlap(candidate: dict, baseline: dict) -> bool:
@@ -1549,7 +1602,11 @@ def _page_ranges_overlap(candidate: dict, baseline: dict) -> bool:
     )
 
 
-def _record_link_score(candidate: dict, baseline: dict) -> float | None:
+def _record_link_score(
+    candidate: dict,
+    baseline: dict,
+    text_comparison_cache: dict[tuple[str, str], tuple[float, bool]] | None = None,
+) -> float | None:
     """Puntúa enlaces conservadores entre dos extracciones del mismo PDF.
 
     La página o el orden nunca bastan por sí solos. Se exige además un
@@ -1591,15 +1648,12 @@ def _record_link_score(candidate: dict, baseline: dict) -> float | None:
 
     candidate_text = candidate["text_signature"]
     baseline_text = baseline["text_signature"]
-    text_similarity = 0.0
-    text_containment = False
     substantial_text = min(len(candidate_text), len(baseline_text)) >= 80
-    if substantial_text:
-        text_similarity = SequenceMatcher(
-            None, candidate_text, baseline_text, autojunk=False
-        ).ratio()
-        shorter, longer = sorted((candidate_text, baseline_text), key=len)
-        text_containment = len(shorter) >= 80 and shorter in longer
+    text_similarity, text_containment = _record_text_comparison(
+        candidate,
+        baseline,
+        text_comparison_cache,
+    )
 
     eligible = any(
         (
@@ -1636,19 +1690,36 @@ def _mutual_scored_matches(
     baseline_records: list[dict],
     candidate_unused: set[int],
     baseline_unused: set[int],
+    *,
+    precomputed_scores: dict[tuple[int, int], float] | None = None,
+    text_comparison_cache: dict[tuple[str, str], tuple[float, bool]] | None = None,
 ) -> list[tuple[int, int]]:
     """Devuelve mejores coincidencias mutuas con margen inequívoco."""
 
     candidate_by_id = {record["id"]: record for record in candidate_records}
     baseline_by_id = {record["id"]: record for record in baseline_records}
     pairs: list[tuple[float, int, int]] = []
-    for candidate_id in candidate_unused:
-        candidate = candidate_by_id[candidate_id]
-        for baseline_id in baseline_unused:
-            baseline = baseline_by_id[baseline_id]
-            score = _record_link_score(candidate, baseline)
-            if score is not None:
-                pairs.append((score, candidate_id, baseline_id))
+    if precomputed_scores is None:
+        for candidate_id in candidate_unused:
+            candidate = candidate_by_id[candidate_id]
+            for baseline_id in baseline_unused:
+                baseline = baseline_by_id[baseline_id]
+                score = _record_link_score(
+                    candidate,
+                    baseline,
+                    text_comparison_cache,
+                )
+                if score is not None:
+                    pairs.append((score, candidate_id, baseline_id))
+    else:
+        # La tabla contiene únicamente enlaces elegibles. Filtrarla evita
+        # repetir el producto cartesiano completo (incluidos miles de pares
+        # de páginas lejanas) en cada ronda de eliminación.
+        pairs = [
+            (score, candidate_id, baseline_id)
+            for (candidate_id, baseline_id), score in precomputed_scores.items()
+            if candidate_id in candidate_unused and baseline_id in baseline_unused
+        ]
 
     by_candidate: dict[int, list[tuple[float, int]]] = {}
     by_baseline: dict[int, list[tuple[float, int]]] = {}
@@ -1670,6 +1741,26 @@ def _mutual_scored_matches(
             matches.append((score, candidate_id, baseline_id))
     matches.sort(reverse=True)
     return [(candidate_id, baseline_id) for _, candidate_id, baseline_id in matches]
+
+
+def _precompute_record_link_scores(
+    candidate_records: list[dict],
+    baseline_records: list[dict],
+    text_comparison_cache: dict[tuple[str, str], tuple[float, bool]],
+) -> dict[tuple[int, int], float]:
+    """Materializa una vez el grafo inmutable de enlaces elegibles."""
+
+    scores: dict[tuple[int, int], float] = {}
+    for candidate in candidate_records:
+        for baseline in baseline_records:
+            score = _record_link_score(
+                candidate,
+                baseline,
+                text_comparison_cache,
+            )
+            if score is not None:
+                scores[(candidate["id"], baseline["id"])] = score
+    return scores
 
 
 def _fresh_candidate_uid(
@@ -1864,12 +1955,34 @@ def reconcile_database_decision_uids(
             # mutuos: página + contenido/campos, usando el orden solo como
             # desempate. Se repite porque una asignación segura puede volver
             # inequívoca la siguiente dentro del mismo bloque.
+            #
+            # Las puntuaciones no dependen de qué pares sigan disponibles.
+            # Se conservan durante todas las rondas para no ejecutar de nuevo
+            # SequenceMatcher sobre conceptos extensos. La caché es local al
+            # documento, por lo que su tamaño queda acotado al producto de las
+            # fichas de ambas versiones de una sola acta.
+            text_comparison_cache: dict[
+                tuple[str, str], tuple[float, bool]
+            ] = {}
+            precomputed_scores = _precompute_record_link_scores(
+                [
+                    candidate_records_by_id[candidate_id]
+                    for candidate_id in candidate_unused
+                ],
+                [
+                    baseline_records_by_id[baseline_id]
+                    for baseline_id in baseline_unused
+                ],
+                text_comparison_cache,
+            )
             while True:
                 scored = _mutual_scored_matches(
                     candidate_records,
                     baseline_records,
                     candidate_unused,
                     baseline_unused,
+                    precomputed_scores=precomputed_scores,
+                    text_comparison_cache=text_comparison_cache,
                 )
                 if not scored:
                     break
@@ -1903,6 +2016,7 @@ def reconcile_database_decision_uids(
                     if _record_match_has_evidence(
                         candidate_record,
                         baseline_records_by_id[baseline_id],
+                        text_comparison_cache,
                     )
                 }
                 if possible_baseline_ids:
