@@ -59,9 +59,6 @@ jobs:
       - name: Construir o actualizar base de búsqueda
         run: python build_index.py --allow-partial
 
-      - name: Evaluar los modos de búsqueda
-        run: python evaluate_search.py --allow-empty
-
       - name: Comprimir, verificar y dividir los índices
         shell: bash
         run: |
@@ -88,7 +85,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -u data
-          git add data/actas.db.package.json data/integrity-report.json data/indexing-report.json data/semantic-report.json data/evaluation-report.json
+          git add data/actas.db.package.json data/integrity-report.json data/indexing-report.json data/semantic-report.json
           git add -f data/actas.db.gz.part-*
           if [ -f data/semantic.db.package.json ]; then
             git add data/semantic.db.package.json

@@ -41,7 +41,6 @@ jobs:
       ACTAS_INDEXING_REPORT_PATH: .reprocess/candidate/data/indexing-report.json
       ACTAS_INTEGRITY_REPORT_PATH: .reprocess/candidate/data/integrity-report.json
       ACTAS_SEMANTIC_REPORT_PATH: .reprocess/candidate/data/semantic-report.json
-      ACTAS_EVALUATION_REPORT_PATH: .reprocess/candidate/data/evaluation-report.json
       ACTAS_REVIEW_LOG_PATH: data/regulatory-review-log.csv
       ACTAS_INDEX_START_YEAR: "2013"
       ACTAS_OCR_ENABLED: "1"
@@ -125,19 +124,11 @@ jobs:
           fi
           python reprocess_corpus.py "${args[@]}"
 
-      - name: Medir la base publicada de referencia
-        shell: bash
-        run: |
-          python reprocess_corpus.py baseline-integrity \
-            --workspace .reprocess \
-            --manifest documents_manifest.csv
-          ACTAS_DATABASE_PATH=.reprocess/baseline/data/actas.db \
-          ACTAS_SEMANTIC_INDEX_PATH=.reprocess/baseline/data/semantic.db \
-          ACTAS_EVALUATION_REPORT_PATH=.reprocess/baseline/data/evaluation-report.json \
-          python evaluate_search.py \
-            --output .reprocess/baseline/data/evaluation-report.json \
-            --integrity-report .reprocess/baseline/data/integrity-report.json \
-            --allow-empty
+      - name: Medir integridad de la base publicada de referencia
+        run: >-
+          python reprocess_corpus.py baseline-integrity
+          --workspace .reprocess
+          --manifest documents_manifest.csv
 
       - name: Reprocesar documentos por lotes
         id: batches
@@ -176,25 +167,6 @@ jobs:
           --workspace .reprocess
           --manifest documents_manifest.csv
           --review-log data/regulatory-review-log.csv
-
-      - name: Evaluar candidata contra la referencia
-        if: ${{ steps.batches.outputs.complete == 'true' }}
-        continue-on-error: true
-        env:
-          MODE: ${{ inputs.mode }}
-        shell: bash
-        run: |
-          if [ "$MODE" = "publish" ]; then
-            python evaluate_search.py \
-              --output .reprocess/candidate/data/evaluation-report.json \
-              --release \
-              --baseline .reprocess/baseline/data/evaluation-report.json
-          else
-            python evaluate_search.py \
-              --output .reprocess/candidate/data/evaluation-report.json \
-              --allow-empty \
-              --baseline .reprocess/baseline/data/evaluation-report.json
-          fi
 
       - name: Empaquetar candidata sin borrar las bases de trabajo
         if: ${{ steps.batches.outputs.complete == 'true' }}
@@ -236,7 +208,7 @@ jobs:
           git add -u data
           git add data/actas.db.package.json data/semantic.db.package.json
           git add data/indexing-report.json data/integrity-report.json
-          git add data/semantic-report.json data/evaluation-report.json
+          git add data/semantic-report.json
           git add data/reconciliation-report.json
           git add data/reprocess-report.json
           git add -f data/actas.db.gz.part-* data/semantic.db.gz.part-*

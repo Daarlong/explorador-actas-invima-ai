@@ -1,0 +1,42 @@
+name: Retirar módulo de evaluación
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mantenimiento-actas
+  cancel-in-progress: false
+
+jobs:
+  remove-evaluation:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar código
+        uses: actions/checkout@v7
+
+      - name: Eliminar archivos obsoletos
+        shell: bash
+        run: |
+          git rm -f --ignore-unmatch \
+            pages/6_Evaluacion.py \
+            services/evaluation.py \
+            evaluate_search.py \
+            evaluation_cases.csv \
+            tests/test_evaluation.py \
+            tests/test_evaluate_search.py \
+            data/evaluation-report.json
+
+      - name: Guardar retiro en el repositorio privado
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --cached --quiet; then
+            echo "El módulo de evaluación ya no estaba presente."
+          else
+            git commit -m "Retirar módulo de evaluación"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
