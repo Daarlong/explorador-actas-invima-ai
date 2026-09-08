@@ -4,24 +4,34 @@ import streamlit as st
 
 from config import (
     CATALOG_REPORT_PATH,
+    DATABASE_PATH,
     INDEXING_REPORT_PATH,
     INTEGRITY_REPORT_PATH,
+    SEMANTIC_INDEX_PATH,
     SEMANTIC_REPORT_PATH,
     SOURCE_SNAPSHOT_PATH,
 )
 from services.corpus_status import corpus_status_from_reports
 from services.indexing import load_indexing_report
 from services.integrity import load_integrity_report
+from services.semantic import semantic_index_status
+from services.ui_helpers import apply_app_style
 
 
 st.set_page_config(page_title="Integridad del corpus", page_icon="✅", layout="wide")
-st.title("✅ Integridad del corpus")
+apply_app_style()
+st.title("Integridad del corpus")
 st.caption(
-    "Cobertura, consistencia técnica y completitud de la extracción regulatoria"
+    "Comprueba la cobertura documental, la consistencia del índice y la "
+    "disponibilidad de los campos estructurados."
 )
 
 report = load_integrity_report(INTEGRITY_REPORT_PATH)
 indexing_report = load_indexing_report(INDEXING_REPORT_PATH)
+semantic_state = semantic_index_status(
+    SEMANTIC_INDEX_PATH,
+    source_database_path=DATABASE_PATH,
+)
 corpus_status = corpus_status_from_reports(
     INTEGRITY_REPORT_PATH,
     INDEXING_REPORT_PATH,
@@ -37,14 +47,15 @@ if not report:
     st.stop()
 
 status = report.get("status")
+st.subheader("Estado general")
 if status == "ok":
     st.success("El catálogo y el índice pasaron todas las verificaciones.")
 elif status == "warning":
     st.warning(
-        "El índice está completo, pero existen advertencias documentales por revisar."
+        "El índice está disponible, pero el informe contiene advertencias técnicas."
     )
 else:
-    st.error("El informe detectó inconsistencias que deben corregirse.")
+    st.error("El informe detectó inconsistencias que afectan al corpus consultable.")
 
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Manifiesto", report.get("manifest_documents", 0))
@@ -68,7 +79,7 @@ technical_col2.metric(
     "Desajustes texto–FTS", report.get("fts_rowid_mismatches", 0)
 )
 
-st.subheader("Cadena de cobertura documental")
+st.subheader("Cobertura documental")
 st.caption(
     "Comprueba que las publicaciones observadas en la fuente oficial llegan al "
     "catálogo, al manifiesto y finalmente al índice consultable."
@@ -93,6 +104,8 @@ if coverage_layers:
         use_container_width=True,
         hide_index=True,
     )
+else:
+    st.info("La cadena de cobertura todavía no está disponible en el informe.")
 source_col1, source_col2, source_col3 = st.columns(3)
 source_col1.metric(
     "Fuente oficial verificada",
@@ -108,7 +121,7 @@ source_col3.metric(
     f"{source_age} h" if source_age is not None else "Sin registro",
 )
 
-st.subheader("Cobertura del índice")
+st.markdown("#### Distribución por año")
 coverage_by_year = report.get("coverage_by_year", [])
 if coverage_by_year:
     st.dataframe(
@@ -125,6 +138,8 @@ if coverage_by_year:
         use_container_width=True,
         hide_index=True,
     )
+else:
+    st.info("No hay información de cobertura anual disponible.")
 
 coverage_by_section = report.get("coverage_by_section", [])
 with st.expander("Cobertura por serie o sala", expanded=False):
@@ -152,6 +167,9 @@ problems = {
     "Documentos sin páginas": report.get("documents_without_pages", []),
     "Documentos sin fragmentos": report.get("documents_without_chunks", []),
 }
+st.markdown("#### Incidencias documentales")
+if not any(problems.values()):
+    st.success("No se detectaron documentos faltantes ni registros incompletos.")
 for label, values in problems.items():
     if values:
         with st.expander(f"{label} ({len(values)})", expanded=True):
@@ -193,8 +211,8 @@ with st.expander(
     else:
         st.write("No se detectaron páginas sin texto.")
 
+st.subheader("Última actualización del índice")
 if indexing_report:
-    st.subheader("Última actualización del índice")
     run_col1, run_col2, run_col3, run_col4 = st.columns(4)
     run_col1.metric(
         "Documentos incorporados",
@@ -269,6 +287,34 @@ if indexing_report:
         "Última ejecución del índice: "
         f"{indexing_report.get('generated_at', 'sin fecha')}"
     )
+else:
+    st.info("Aún no existe un informe de actualización del índice.")
+
+st.subheader("Coherencia del índice semántico")
+if semantic_state.get("available"):
+    semantic_col1, semantic_col2, semantic_col3 = st.columns(3)
+    semantic_col1.metric(
+        "Capa neuronal",
+        "Disponible"
+        if semantic_state.get("neural_status") == "ready"
+        else "Respaldo local",
+    )
+    semantic_col2.metric(
+        "Fragmentos representados",
+        semantic_state.get("documents", 0),
+    )
+    semantic_col3.metric(
+        "Dimensión neuronal",
+        semantic_state.get("neural_dimension") or "No aplica",
+    )
+    st.success(str(semantic_state.get("message") or "Índice semántico vigente."))
+else:
+    st.warning(
+        str(
+            semantic_state.get("message")
+            or "El índice semántico no está disponible o no corresponde al corpus."
+        )
+    )
 
 regulatory_pending = report.get("regulatory_extraction_pending", []) or []
 regulatory_errors = report.get("regulatory_extraction_errors", []) or []
@@ -287,7 +333,11 @@ if regulatory_pending or regulatory_errors:
             st.write("Errores detectados:")
             st.dataframe(regulatory_errors, hide_index=True, use_container_width=True)
 
-st.subheader("Calidad de las fichas regulatorias")
+st.subheader("Extracción estructurada")
+st.caption(
+    "Muestra qué campos pudieron identificarse automáticamente para facilitar "
+    "la consulta y la comparación de decisiones."
+)
 quality = report.get("regulatory_quality") or {}
 if quality:
     quality_col1, quality_col2, quality_col3, quality_col4, quality_col5 = st.columns(5)
@@ -301,19 +351,20 @@ if quality:
     if quality.get("without_uid"):
         st.warning(
             f"{quality['without_uid']} fichas aún no tienen identificador estable. "
-            "Ejecuta el flujo Reprocesar estructura y fichas para corregirlas "
-            "sobre una base candidata."
+            "Ejecuta Construir índice para actualizar la extracción sobre el corpus."
         )
 else:
-    st.info("La próxima construcción del índice generará las métricas de fichas.")
+    st.info(
+        "La próxima construcción del índice generará las métricas de extracción."
+    )
 
 quality_snapshot = report.get("regulatory_quality_snapshot") or {}
 field_rows = quality_snapshot.get("fields") or []
 if quality_snapshot.get("status") == "available" and field_rows:
     st.markdown("#### Completitud automática por campo")
     st.caption(
-        "Estas cifras miden si el extractor encontró un valor; no demuestran que "
-        "el valor sea correcto. La precisión requiere casos revisados por una persona."
+        "Estas cifras indican si el extractor encontró un valor utilizable para "
+        "búsqueda, filtros y comparaciones."
     )
     st.dataframe(
         [
@@ -403,7 +454,8 @@ if quality_snapshot.get("status") == "available" and field_rows:
     else:
         st.info(
             "La base actual es compatible, pero todavía no contiene evidencia y "
-            "confianza por campo. El reprocesamiento 0.7 completará esa trazabilidad."
+            "confianza por campo. Ejecuta Construir índice con la versión 0.8.0 "
+            "para completar esa trazabilidad."
         )
 
 duplicate_hashes = report.get("duplicate_document_hashes") or []
@@ -413,8 +465,8 @@ with st.expander(
 ):
     if duplicate_hashes:
         st.write(
-            "Son señales para revisión: dos enlaces pueden apuntar legítimamente al "
-            "mismo documento o indicar un enlace oficial duplicado."
+            "Dos enlaces pueden apuntar legítimamente al mismo documento o "
+            "corresponder a una publicación repetida en la fuente oficial."
         )
         st.dataframe(duplicate_hashes, hide_index=True, use_container_width=True)
     else:

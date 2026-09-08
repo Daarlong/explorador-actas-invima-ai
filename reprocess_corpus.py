@@ -227,6 +227,7 @@ def _source_fingerprint(manifest_path: Path) -> str:
         ROOT_DIR / "services" / "models.py",
         ROOT_DIR / "services" / "pdf_reader.py",
         ROOT_DIR / "services" / "regulatory.py",
+        ROOT_DIR / "services" / "semantic.py",
         ROOT_DIR / "services" / "text_utils.py",
     )
     for path in tracked:
@@ -246,6 +247,12 @@ def _source_fingerprint(manifest_path: Path) -> str:
         os.getenv("ACTAS_OCR_MIN_CHARS", ""),
         os.getenv("ACTAS_OCR_TIMEOUT_SECONDS", ""),
         os.getenv("ACTAS_MAX_PDF_BYTES", ""),
+        os.getenv("ACTAS_SEMANTIC_BACKEND", ""),
+        os.getenv("ACTAS_SEMANTIC_LEXICAL_DIMENSION", ""),
+        os.getenv("ACTAS_SEMANTIC_DISTRIBUTIONAL_DIMENSION", ""),
+        os.getenv("ACTAS_SEMANTIC_NEURAL_MODEL_ID", ""),
+        os.getenv("ACTAS_SEMANTIC_NEURAL_MODEL_REVISION", ""),
+        os.getenv("ACTAS_SEMANTIC_NEURAL_BATCH_SIZE", ""),
     )
     digest.update("\x1f".join(settings).encode("utf-8"))
     digest.update(

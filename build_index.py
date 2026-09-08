@@ -15,6 +15,10 @@ from config import (
     SEMANTIC_ENABLED,
     SEMANTIC_INDEX_PATH,
     SEMANTIC_LEXICAL_DIMENSION,
+    SEMANTIC_NEURAL_BATCH_SIZE,
+    SEMANTIC_NEURAL_ENABLED,
+    SEMANTIC_NEURAL_MODEL_ID,
+    SEMANTIC_NEURAL_MODEL_REVISION,
     SEMANTIC_REPORT_PATH,
     ensure_directories,
 )
@@ -22,9 +26,8 @@ from services.database import sync_regulatory_extractions
 from services.indexing import rebuild_index, update_index, write_indexing_report
 from services.integrity import build_integrity_report, write_integrity_report
 from services.semantic import (
-    SEMANTIC_BUILD_SIGNATURE,
-    SEMANTIC_METHOD,
     build_semantic_index,
+    semantic_build_spec,
     semantic_index_status,
     semantic_source_fingerprint,
 )
@@ -138,7 +141,15 @@ if __name__ == "__main__":
     if SEMANTIC_ENABLED:
         try:
             source_fingerprint = semantic_source_fingerprint(DATABASE_PATH)
-            current = semantic_index_status(SEMANTIC_INDEX_PATH)
+            desired_method, desired_signature = semantic_build_spec(
+                neural_enabled=SEMANTIC_NEURAL_ENABLED,
+                neural_model_id=SEMANTIC_NEURAL_MODEL_ID,
+                neural_model_revision=SEMANTIC_NEURAL_MODEL_REVISION,
+            )
+            current = semantic_index_status(
+                SEMANTIC_INDEX_PATH,
+                DATABASE_PATH,
+            )
             is_current = (
                 current.get("available")
                 and current.get("source_fingerprint") == source_fingerprint
@@ -146,8 +157,8 @@ if __name__ == "__main__":
                 == SEMANTIC_LEXICAL_DIMENSION
                 and int(current.get("semantic_dimension", -1))
                 == SEMANTIC_DISTRIBUTIONAL_DIMENSION
-                and current.get("method") == SEMANTIC_METHOD
-                and current.get("build_signature") == SEMANTIC_BUILD_SIGNATURE
+                and current.get("method") == desired_method
+                and current.get("build_signature") == desired_signature
                 and not arguments.full
             )
             if is_current:
@@ -167,12 +178,27 @@ if __name__ == "__main__":
                     SEMANTIC_INDEX_PATH,
                     lexical_dimension=SEMANTIC_LEXICAL_DIMENSION,
                     semantic_dimension=SEMANTIC_DISTRIBUTIONAL_DIMENSION,
+                    neural_enabled=SEMANTIC_NEURAL_ENABLED,
+                    neural_model_id=SEMANTIC_NEURAL_MODEL_ID,
+                    neural_model_revision=SEMANTIC_NEURAL_MODEL_REVISION,
+                    neural_batch_size=SEMANTIC_NEURAL_BATCH_SIZE,
+                )
+                built_state = semantic_index_status(
+                    SEMANTIC_INDEX_PATH,
+                    DATABASE_PATH,
                 )
                 semantic_report = {
                     "generated_at": datetime.now(timezone.utc).isoformat(),
                     "status": "built",
-                    "message": "Índice semántico local construido correctamente.",
+                    "message": (
+                        "Índice semántico neuronal multilingüe construido."
+                        if semantic.neural_status == "ready"
+                        else "Índice semántico local construido; el complemento "
+                        "neuronal no estuvo disponible."
+                    ),
                     **semantic.as_dict(),
+                    "method": built_state.get("method"),
+                    "build_signature": built_state.get("build_signature"),
                 }
                 report.semantic_index_status = "built"
                 report.semantic_documents_indexed = semantic.documents_indexed
@@ -223,10 +249,15 @@ if __name__ == "__main__":
             "pendientes y se reintentarán en la siguiente ejecución.",
             flush=True,
         )
-    if arguments.fail_on_semantic_error and semantic_report.get("status") not in {
-        "built",
-        "reused",
-    }:
+    semantic_unusable = semantic_report.get("status") not in {"built", "reused"}
+    neural_unavailable = (
+        SEMANTIC_NEURAL_ENABLED
+        and semantic_report.get("neural_status") != "ready"
+    )
+    if arguments.fail_on_semantic_error and (
+        semantic_unusable or neural_unavailable
+    ):
         raise SystemExit(
-            "La candidata requiere un índice semántico vigente antes de publicarse"
+            "La candidata requiere el índice semántico configurado y vigente "
+            "antes de publicarse"
         )

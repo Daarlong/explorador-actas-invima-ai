@@ -241,6 +241,175 @@ class RegulatoryExtractionTests(unittest.TestCase):
         )
         self.assertEqual(normalize_request_type("texto no categorizado"), "otra_solicitud")
 
+    def test_normalizes_specific_historical_request_types_before_generic_ones(self) -> None:
+        cases = {
+            "Solicitud de renovación del producto": "renovacion_registro",
+            "Evaluación de seguridad y eficacia de una nueva molécula": (
+                "evaluacion_farmacologica"
+            ),
+            "Modificación de las indicaciones aprobadas": "indicaciones",
+            "Actualización del inserto del medicamento": "informacion_prescribir",
+            "Inclusión de una nueva contraindicación": (
+                "contraindicaciones_advertencias"
+            ),
+            "Cambio de la posología y del esquema de dosificación": "posologia",
+            "Cambio de condición de venta bajo fórmula médica": "condicion_venta",
+            "Inclusión de una nueva presentación comercial": (
+                "presentacion_comercial"
+            ),
+            "Cambio de nombre comercial del producto": "cambio_nombre",
+            "Adición de un nuevo fabricante": "cambio_fabricante",
+            "Transferencia del registro sanitario a un nuevo titular": (
+                "cambio_titular"
+            ),
+            "Presentación del estudio de bioequivalencia": (
+                "estudios_bioequivalencia"
+            ),
+            "Respuesta al requerimiento emitido por la Sala": (
+                "respuesta_requerimiento"
+            ),
+            "Solicitud de reconsideración del concepto": "recurso_reposicion",
+            "Retiro voluntario del mercado": "cancelacion",
+            "Solicitud de modificación de especificaciones": (
+                "modificacion_registro"
+            ),
+            "Obtención de registro sanitario": "registro_sanitario",
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(normalize_request_type(text), expected)
+
+    def test_extracts_historical_product_label_variants(self) -> None:
+        labels = (
+            "Nombre comercial",
+            "Denominación comercial",
+            "Marca comercial",
+            "Producto farmacéutico",
+            "Nombre del medicamento",
+        )
+        for index, label in enumerate(labels, start=1):
+            with self.subTest(label=label):
+                record = extract_regulatory_records(
+                    [
+                        {
+                            "page": index,
+                            "text": (
+                                f"3.4.{index} DECISIÓN\n{label}: Ozempic {index} mg\n"
+                                f"Expediente: 900{index}\n"
+                                "Solicitud: Evaluación farmacológica.\n"
+                                "Concepto: La Sala emite concepto favorable."
+                            ),
+                        }
+                    ]
+                )[0]
+
+                self.assertEqual(record.producto, f"Ozempic {index} mg")
+                evidence = record.evidence_for("producto")[0]
+                self.assertEqual(evidence.metodo, "explicit_label")
+                self.assertIn(label, evidence.fragmento)
+
+    def test_product_label_words_inside_request_do_not_split_the_record(self) -> None:
+        for wording, expected_type in (
+            (
+                "Cambio de nombre comercial: de PRODUCTO VIEJO a PRODUCTO NUEVO",
+                "cambio_nombre",
+            ),
+            (
+                "Modificación de marca comercial: NUEVA MARCA",
+                "cambio_nombre",
+            ),
+        ):
+            with self.subTest(wording=wording):
+                records = extract_regulatory_records(
+                    [
+                        {
+                            "page": 10,
+                            "text": (
+                                "Producto: PRODUCTO VIEJO\nExpediente: 1001\n"
+                                f"Solicitud: {wording}\n"
+                                "Concepto: La Sala autoriza lo solicitado."
+                            ),
+                        }
+                    ]
+                )
+
+                self.assertEqual(len(records), 1)
+                self.assertEqual(records[0].producto, "PRODUCTO VIEJO")
+                self.assertEqual(records[0].solicitud, wording)
+                self.assertEqual(records[0].tipo_solicitud, expected_type)
+
+    def test_uses_title_case_leaf_heading_as_product_with_evidence(self) -> None:
+        record = extract_regulatory_records(
+            [
+                {
+                    "page": 27,
+                    "text": (
+                        "3.1.8.4 Ozempic 1,34 mg/mL\n"
+                        "Principio activo: semaglutida\nExpediente: 20125116\n"
+                        "Solicitud: Evaluación farmacológica.\n"
+                        "Concepto: La Sala considera que la solicitud es viable."
+                    ),
+                }
+            ]
+        )[0]
+
+        self.assertEqual(record.producto, "Ozempic 1,34 mg/mL")
+        self.assertEqual(record.resultado_normalizado, "favorable")
+        evidence = record.evidence_for("producto")[0]
+        self.assertEqual(evidence.metodo, "numbered_heading_product")
+        self.assertEqual(evidence.pagina, 27)
+
+    def test_does_not_promote_title_case_numbered_instruction_to_product(self) -> None:
+        record = extract_regulatory_records(
+            [
+                {
+                    "page": 28,
+                    "text": (
+                        "3.1.8 MEDICAMENTO HISTÓRICO\nInteresado: LAB A\n"
+                        "Expediente: 2222\nSolicitud: Modificación.\n"
+                        "Concepto: La Sala requiere:\n"
+                        "3.1.8.1 Presentar los estudios de estabilidad.\n"
+                        "3.1.8.2 Aclarar los resultados informados."
+                    ),
+                }
+            ]
+        )[0]
+
+        self.assertEqual(record.producto, "MEDICAMENTO HISTÓRICO")
+        self.assertIn("Presentar los estudios", record.concepto or "")
+        self.assertIn("Aclarar los resultados", record.concepto or "")
+        self.assertEqual(record.resultado_normalizado, RESULT_REQUIRED)
+
+    def test_recognizes_conservative_historical_outcome_wording(self) -> None:
+        cases = {
+            "La Sala autoriza lo solicitado.": RESULT_APPROVED,
+            "La Sala dispone el archivo del trámite.": RESULT_ARCHIVED,
+            "La Sala acepta el desistimiento presentado.": "desistido",
+            "La Sala considera que la solicitud es procedente.": "favorable",
+            "La Sala conceptúa de manera negativa.": "no_favorable",
+            "La Sala considera no procedente la petición.": RESULT_DENIED,
+            "Se solicita al interesado complementar los estudios.": RESULT_REQUIRED,
+            "El interesado deberá dar respuesta a las observaciones.": (
+                RESULT_REQUIRED
+            ),
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(normalize_regulatory_result(text), expected)
+
+    def test_new_outcome_rules_preserve_explicit_negations(self) -> None:
+        neutral = (
+            "La Sala no considera necesario requerir información adicional y "
+            "mantiene el análisis en curso."
+        )
+        self.assertEqual(normalize_regulatory_result(neutral), "sin_clasificar")
+        self.assertEqual(
+            normalize_regulatory_result(
+                "La Sala concluye que no es procedente requerir al interesado."
+            ),
+            "sin_clasificar",
+        )
+
     def test_extracts_semaglutide_from_multiline_historical_composition(self) -> None:
         # Caso minimo inspirado en una publicacion historica; el texto se
         # parafrasea y conserva solo los rotulos necesarios para la regresion.

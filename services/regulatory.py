@@ -151,7 +151,11 @@ _FIELD_PATTERNS: tuple[tuple[str, str], ...] = (
     ),
     (
         "producto",
-        r"(?:nombre\s+(?:comercial\s+)?del\s+)?(?:producto|medicamento)",
+        r"(?:"
+        r"(?:nombre\s+(?:comercial\s+)?(?:del?|de\s+el)\s+)?"
+        r"(?:producto|medicamento)(?:\s+farmaceutico)?|"
+        r"nombre\s+comercial|denominacion\s+comercial|marca\s+comercial"
+        r")",
     ),
     (
         "interesado",
@@ -223,8 +227,9 @@ _HEADING_WITH_CONTENT_RE = re.compile(
     r"(?P<numeral>(?:\d{1,3}(?:\.\d{1,3}){0,7}|"
     r"[IVXLCDM]{1,8}(?=[.)\s\-–—])))"
     r"(?:[.)]\s*[-–—]?|\s*[-–—])?\s+"
-    r"(?P<content>(?i:(?:producto|medicamento|nombre\s+"
-    r"(?:comercial\s+)?del\s+(?:producto|medicamento))\s*[:;\-–—].+))$",
+    r"(?P<content>(?i:(?:"
+    + _LABEL_PATTERN_BY_FIELD["producto"]
+    + r")\s*[:;\-–—].+))$",
 )
 # En actas historicas el recipiente incluye forma y calificadores (por ejemplo,
 # ``Cada tableta recubierta contiene`` o ``Cada 1 mL de solucion contiene``).
@@ -316,23 +321,99 @@ _SESSION_NUMERIC_DATE_RE = re.compile(
 )
 
 _REQUEST_TYPES: tuple[tuple[str, str], ...] = (
-    ("renovacion_registro", r"\brenovacion(?:\s+del)?\s+registro\s+sanitario\b"),
-    ("modificacion_registro", r"\bmodificacion(?:\s+del)?\s+registro\s+sanitario\b"),
-    ("evaluacion_farmacologica", r"\bevaluacion\s+farmacologica\b"),
-    ("registro_sanitario", r"\b(?:nuevo\s+)?registro\s+sanitario\b"),
+    # Las categorias especificas van primero: una solicitud historica puede
+    # contener simultaneamente las palabras "modificacion" y "registro".
+    (
+        "renovacion_registro",
+        r"\b(?:renovacion(?:\s+(?:del|de\s+el))?\s+registro\s+sanitario|"
+        r"solicitud\s+de\s+renovacion|renovar\s+(?:el\s+)?registro)\b",
+    ),
+    (
+        "evaluacion_farmacologica",
+        r"\b(?:evaluacion\s+farmacologica|evaluacion\s+(?:de\s+)?"
+        r"(?:seguridad\s+y\s+eficacia|eficacia\s+y\s+seguridad)|"
+        r"nueva\s+(?:entidad\s+quimica|molecula))\b",
+    ),
     (
         "indicaciones",
-        r"\b(?:nueva|ampliacion|modificacion|inclusion|cambio)\s+de\s+"
-        r"indicacion(?:es)?\b|\bindicacion(?:es)?\b",
+        r"\b(?:(?:nueva|ampliacion|extension|modificacion|inclusion|"
+        r"actualizacion|cambio|aprobacion)\s+(?:de\s+(?:la|las)\s+|de\s+)?"
+        r"indicacion(?:es)?|indicacion(?:es)?\s+(?:nueva|adicional)|"
+        r"uso(?:s)?\s+terapeutico(?:s)?)\b",
     ),
     (
         "informacion_prescribir",
-        r"\binformacion\s+(?:para|de)\s+prescribir\b",
+        r"\b(?:informacion\s+(?:para|de)\s+prescribir|"
+        r"inserto|prospecto|informacion\s+del\s+producto)\b",
     ),
-    ("cambio_fabricante", r"\bcambio\s+(?:de\s+)?fabricante\b"),
-    ("cambio_titular", r"\bcambio\s+(?:de\s+)?titular\b"),
-    ("recurso_reposicion", r"\brecurso\s+de\s+reposicion\b"),
-    ("cancelacion", r"\bcancelacion(?:\s+voluntaria)?\b"),
+    (
+        "contraindicaciones_advertencias",
+        r"\b(?:contraindicacion(?:es)?|advertencia(?:s)?|precaucion(?:es)?|"
+        r"reaccion(?:es)?\s+adversa(?:s)?)\b",
+    ),
+    (
+        "posologia",
+        r"\b(?:posologia|dosificacion|esquema\s+de\s+dosificacion|"
+        r"dosis\s+(?:recomendada|de\s+administracion))\b",
+    ),
+    (
+        "condicion_venta",
+        r"\b(?:condicion(?:es)?\s+de\s+venta|venta\s+(?:libre|bajo\s+formula)|"
+        r"formula\s+(?:medica|facultativa))\b",
+    ),
+    (
+        "presentacion_comercial",
+        r"\b(?:(?:nueva|inclusion|adicion|modificacion|cambio)\s+(?:de\s+)?"
+        r"presentacion(?:es)?(?:\s+comercial(?:es)?)?|"
+        r"presentacion(?:es)?\s+comercial(?:es)?)\b",
+    ),
+    (
+        "cambio_nombre",
+        r"\b(?:cambio|modificacion)\s+(?:de\s+)?(?:nombre|marca)\s+"
+        r"(?:comercial|del\s+producto)\b",
+    ),
+    (
+        "cambio_fabricante",
+        r"\b(?:(?:cambio|inclusion|adicion|modificacion)\s+(?:de\s+)?"
+        r"(?:fabricante|sitio\s+de\s+fabricacion)|nuevo\s+fabricante)\b",
+    ),
+    (
+        "cambio_titular",
+        r"\b(?:(?:cambio|transferencia|cesion)\s+(?:de\s+)?titular|"
+        r"transferencia\s+(?:del\s+)?registro\s+sanitario)\b",
+    ),
+    (
+        "estudios_bioequivalencia",
+        r"\b(?:bioequivalencia|biodisponibilidad|estudio(?:s)?\s+"
+        r"(?:farmacocinetico(?:s)?|de\s+bioequivalencia|de\s+biodisponibilidad))\b",
+    ),
+    (
+        "respuesta_requerimiento",
+        r"\b(?:respuesta\s+(?:a|al)\s+(?:auto|requerimiento)|"
+        r"alcance\s+(?:a|al)\s+(?:auto|requerimiento)|"
+        r"subsanacion\s+(?:del\s+)?requerimiento)\b",
+    ),
+    (
+        "recurso_reposicion",
+        r"\b(?:recurso\s+de\s+reposicion|solicitud\s+de\s+reconsideracion|"
+        r"reconsideracion\s+(?:del\s+)?concepto|revocatoria\s+directa)\b",
+    ),
+    (
+        "cancelacion",
+        r"\b(?:cancelacion(?:\s+voluntaria)?|cancelar\s+(?:el\s+)?"
+        r"registro\s+sanitario|retiro\s+voluntario\s+del\s+mercado)\b",
+    ),
+    (
+        "modificacion_registro",
+        r"\b(?:modificacion(?:\s+(?:del|de\s+el))?\s+registro\s+sanitario|"
+        r"modificacion(?:es)?\s+(?:al|del)\s+registro|"
+        r"solicitud\s+de\s+modificacion)\b",
+    ),
+    (
+        "registro_sanitario",
+        r"\b(?:(?:nuevo|concesion|obtencion|aprobacion|solicitud)\s+"
+        r"(?:de\s+)?registro\s+sanitario|registro\s+sanitario\b)",
+    ),
 )
 
 
@@ -475,7 +556,27 @@ def _labeled_segments(
     """Separa el prefijo libre y los pares (campo, valor) de una linea."""
 
     comparable = _without_accents(line)
-    matches = list(_LABEL_RE.finditer(comparable))
+    raw_matches = list(_LABEL_RE.finditer(comparable))
+    matches: list[re.Match[str]] = []
+    for match in raw_matches:
+        if matches:
+            previous = matches[-1]
+            previous_field = _field_from_match(previous)
+            current_field = _field_from_match(match)
+            between = line[previous.end() : match.start()]
+            # ``Nombre comercial`` y ``marca comercial`` son rotulos de
+            # producto, pero tambien aparecen dentro de solicitudes como
+            # ``Cambio de nombre comercial: de A a B``. Dentro de un campo
+            # narrativo solo se consideran una nueva columna si el PDF dejo
+            # una separacion tabular clara (tabulador o dos espacios).
+            if (
+                previous_field in _NARRATIVE_FIELDS
+                and current_field == "producto"
+                and _clean_value(between)
+                and not re.search(r"(?:\t| {2,})$", between)
+            ):
+                continue
+        matches.append(match)
     if not matches:
         if _NEGATED_DOSAGE_STATEMENT_RE.fullmatch(comparable):
             # Es información de ausencia/excipientes, no un ingrediente activo
@@ -607,7 +708,12 @@ def _section_heading(
         if has_active_record or "." not in numeral:
             return None
     elif not _is_heading_title(title, explicit_numeral=explicit_numeral):
-        return None
+        # Entre 2013 y 2020 es frecuente que la hoja de una decision use el
+        # nombre comercial en estilo titulo (``3.1.2 Ozempic 1 mg``), no en
+        # mayusculas. Solo se acepta si el numeral es hoja y el texto supera
+        # las exclusiones cerradas de ``_product_candidate_from_heading``.
+        if _product_candidate_from_heading(numeral, title) is None:
+            return None
     # Dentro de un concepto, "1. Presentar..." es una instruccion enumerada,
     # no una nueva decision. Los numerales de un solo nivel solo son seguros si
     # son explicitos o su titulo luce como un encabezado en mayusculas.
@@ -671,10 +777,44 @@ def _product_candidate_from_heading(
         "modificacion",
         "informacion para prescribir",
         "indicaciones",
+        "principio activo",
+        "composicion",
+        "interesado",
+        "expediente",
+        "radicado",
+        "fabricante",
+        "orden del dia",
+        "verificacion del quorum",
         "recursos",
         "temas varios",
     )
     if not comparable or any(token in comparable for token in category_tokens):
+        return None
+    # Un nombre de producto puede incluir dosis, forma farmaceutica y marca,
+    # pero no debe lucir como una oracion o una instruccion del concepto. Esta
+    # barrera permite nombres en estilo titulo sin convertir listas numeradas
+    # como ``3.1.2 Presentar los estudios...`` en productos.
+    if len(title) > 120 or len(title.split()) > 16:
+        return None
+    if title.rstrip().endswith((".", ";", ":", "?", "!")):
+        return None
+    instruction_prefixes = (
+        "presentar ",
+        "allegar ",
+        "aportar ",
+        "aclarar ",
+        "subsanar ",
+        "remitir ",
+        "incluir ",
+        "actualizar ",
+        "la sala ",
+        "el interesado ",
+        "se requiere ",
+        "se solicita ",
+    )
+    if comparable.startswith(instruction_prefixes):
+        return None
+    if not any(character.isalpha() for character in title):
         return None
     return _clean_value(title) or None
 
@@ -996,46 +1136,77 @@ def normalize_regulatory_result(concept: str | None) -> str:
     if not text:
         return RESULT_UNCLASSIFIED
 
-    if re.search(r"\b(?:desistir|desistido|desistimiento)\b", text):
+    if re.search(
+        r"\b(?:desistir|desiste|desistido|desistimiento|"
+        r"tener\s+por\s+desistid[ao]|aceptar\s+(?:el\s+)?desistimiento)\b",
+        text,
+    ):
         return RESULT_WITHDRAWN
-    if re.search(r"\b(?:archivar|archivado|archivo\s+del\s+tramite)\b", text):
+    if re.search(
+        r"\b(?:archivar|archiva|archivado|archivo\s+del\s+tramite|"
+        r"ordenar\s+(?:el\s+)?archivo|dispone\s+(?:el\s+)?archivo)\b",
+        text,
+    ):
         return RESULT_ARCHIVED
     if re.search(
         r"\b(?:no\s+(?:es\s+)?procedente\s+(?:aprobar|aceptar)|"
+        r"no\s+(?:es\s+)?procedente\s+(?:la\s+|el\s+)?"
+        r"(?:solicitud|peticion|tramite|modificacion|renovacion|registro)|"
+        r"no\s+procede\s+(?:la\s+|el\s+)?"
+        r"(?:solicitud|peticion|tramite|modificacion|renovacion|registro)|"
         r"no\s+aprobar|no\s+(?:se\s+)?(?:aprueba|acepta)|"
+        r"no\s+(?:se\s+)?(?:autoriza|avala|accede)|"
+        r"no\s+recomienda\s+(?:aprobar|aceptar)|"
         r"negar|niega|nego|negado|denegar|deniega|denego|denegado|"
-        r"rechazar|rechazado)\b",
+        r"rechazar|rechaza|rechazado|improcedente|inviable)\b",
         text,
     ):
         return RESULT_DENIED
     if re.search(
         r"\b(?:concepto|evaluacion|respuesta|decision)?\s*"
-        r"(?:es\s+)?(?:no\s+favorable|desfavorable)\b",
+        r"(?:es\s+)?(?:no\s+favorable|desfavorable)|"
+        r"\bconceptua\s+(?:de\s+manera\s+)?negativ(?:a|amente)\b",
         text,
     ):
         return RESULT_UNFAVORABLE
     requirement_text = re.sub(
-        r"\b(?:no\s+se\s+requiere|no\s+requiere|sin\s+requerir)\b",
+        r"\b(?:no\s+se\s+requiere|no\s+requiere|sin\s+requerir|"
+        r"sin\s+requerimientos?|no\s+hay\s+lugar\s+a\s+requerir|"
+        r"no\s+considera\s+necesario\s+requerir|"
+        r"no\s+(?:es\s+)?procedente\s+requerir)\b",
         "",
         text,
     )
     if re.search(
-        r"\b(?:se\s+requiere|requerir|requerido|requiere\s+al|"
+        r"\b(?:se\s+requiere|la\s+sala\s+requiere|requerir|requerido|"
+        r"requiere\s+al|"
         r"requiere\s+(?:allegar|aportar|presentar|aclarar|subsanar)|"
-        r"debera\s+(?:allegar|aportar|presentar|aclarar|subsanar)|"
-        r"debe\s+(?:allegar|aportar|presentar|aclarar|subsanar))\b",
+        r"(?:se\s+)?solicita(?:\s+al\s+interesado)?\s+"
+        r"(?:allegar|aportar|presentar|aclarar|subsanar|complementar|remitir)|"
+        r"debera\s+(?:allegar|aportar|presentar|aclarar|subsanar|"
+        r"complementar|remitir|dar\s+respuesta)|"
+        r"debe\s+(?:allegar|aportar|presentar|aclarar|subsanar|"
+        r"complementar|remitir|dar\s+respuesta)|"
+        r"pendiente\s+(?:de|hasta)\s+(?:allegar|aportar|presentar|"
+        r"recibir|que\s+(?:se\s+)?(?:allegue|aporte|presente)))\b",
         requirement_text,
     ):
         return RESULT_REQUIRED
     if re.search(
         r"\b(?:es\s+procedente\s+(?:aprobar|aceptar)|"
-        r"aprobar|aprueba|aprobo|aprobado|se\s+acepta|aceptado)\b",
+        r"aprobar|aprueba|aprobo|aprobado|se\s+acepta|aceptado|"
+        r"autoriza|autorizado|otorga|otorgado|concede|concedido|"
+        r"accede\s+a\s+lo\s+solicitado|acoge\s+(?:la\s+)?solicitud)\b",
         text,
     ):
         return RESULT_APPROVED
     if re.search(
         r"\b(?:concepto|evaluacion|respuesta|decision)?\s*"
-        r"(?:es\s+)?favorable(?:mente)?\b",
+        r"(?:es\s+)?favorable(?:mente)?\b|"
+        r"\b(?:la\s+sala\s+)?(?:considera|conceptua|concluye|determina)\s+"
+        r"(?:que\s+)?(?:la\s+solicitud\s+)?(?:es\s+)?"
+        r"(?:procedente|viable)\b|"
+        r"\brespuesta\s+(?:es\s+)?satisfactoria\b",
         text,
     ):
         return RESULT_FAVORABLE

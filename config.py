@@ -84,6 +84,22 @@ SEMANTIC_LEXICAL_DIMENSION = int(
 SEMANTIC_DISTRIBUTIONAL_DIMENSION = int(
     os.getenv("ACTAS_SEMANTIC_DISTRIBUTIONAL_DIMENSION", "48")
 )
+SEMANTIC_BACKEND = os.getenv("ACTAS_SEMANTIC_BACKEND", "neural").strip().lower()
+if SEMANTIC_BACKEND not in {"local", "neural"}:
+    raise ValueError("ACTAS_SEMANTIC_BACKEND debe ser local o neural")
+SEMANTIC_NEURAL_ENABLED = SEMANTIC_BACKEND == "neural"
+SEMANTIC_NEURAL_MODEL_ID = os.getenv(
+    "ACTAS_SEMANTIC_NEURAL_MODEL_ID",
+    "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+).strip()
+SEMANTIC_NEURAL_MODEL_REVISION = os.getenv(
+    "ACTAS_SEMANTIC_NEURAL_MODEL_REVISION",
+    "fastembed-0.8.0-registry",
+).strip()
+SEMANTIC_NEURAL_BATCH_SIZE = max(
+    1,
+    int(os.getenv("ACTAS_SEMANTIC_NEURAL_BATCH_SIZE", "64")),
+)
 REPROCESS_BATCH_SIZE = max(1, int(os.getenv("ACTAS_REPROCESS_BATCH_SIZE", "50")))
 REPROCESS_MIN_FREE_MIB = max(
     512,

@@ -6,17 +6,23 @@ from config import DATABASE_PATH, DEFAULT_TOP_K, MAX_CONTEXT_CHARS
 from services.database import database_stats, get_chunks_by_ids, get_filter_options
 from services.llm import generate_answer, load_llm_settings
 from services.models import SearchResult
+from services.pdf_viewer import viewer_session_values
 from services.retrieval import (
     build_grounded_prompt,
     retrieve_evidence,
     select_context_results,
     validate_citations,
 )
+from services.ui_helpers import apply_app_style
 
 
 st.set_page_config(page_title="Analista IA", page_icon="💬", layout="wide")
-st.title("💬 Analista IA")
-st.caption("Respuestas fundamentadas en las actas recuperadas")
+apply_app_style()
+st.title("Analista IA")
+st.caption(
+    "Formula una pregunta, recupera evidencia del corpus y prepara una respuesta "
+    "trazable hasta la página de cada acta."
+)
 
 if database_stats(DATABASE_PATH)["documents"] == 0:
     st.warning(
@@ -35,7 +41,8 @@ selected_source_dicts = st.session_state.get("analysis_selected_sources", [])
 if "analysis_use_selected" not in st.session_state:
     st.session_state["analysis_use_selected"] = bool(selected_source_dicts)
 with st.sidebar:
-    st.header("Alcance del análisis")
+    st.subheader("Alcance de la consulta")
+    st.caption("Acota las actas que se usarán para recuperar evidencia.")
     years = st.multiselect("Año", options["years"], key="ai_years")
     acta_numbers = st.multiselect(
         "Número de acta", options["acta_numbers"], key="ai_actas"
@@ -54,6 +61,7 @@ with st.sidebar:
         key="analysis_use_selected",
         disabled=not selected_source_dicts,
     )
+    st.divider()
     if st.button(
         "Quitar fuentes seleccionadas",
         use_container_width=True,
@@ -63,53 +71,111 @@ with st.sidebar:
         st.session_state["analysis_use_selected"] = False
         st.rerun()
 
-    if settings.is_configured:
-        st.success(f"IA configurada: {settings.provider}")
-    else:
-        st.info("Modo seguro: preparación de contexto sin enviar datos a una IA externa")
+    if st.button(
+        "Limpiar conversación",
+        use_container_width=True,
+        disabled=not st.session_state.get("chat_messages"),
+    ):
+        st.session_state["chat_messages"] = []
+        st.rerun()
 
-if selected_source_dicts and use_selected:
-    st.success(
-        f"El análisis se limitará a {len(selected_source_dicts)} evidencias "
-        "seleccionadas en el Explorador."
-    )
+    st.divider()
+    if settings.is_configured:
+        st.success(f"Proveedor configurado: {settings.provider}")
+    else:
+        st.info(
+            "Modo de preparación: la aplicación no envía información a una IA "
+            "externa."
+        )
 
 if "chat_messages" not in st.session_state:
     st.session_state.chat_messages = []
 
+if selected_source_dicts and use_selected:
+    st.success(
+        f"Consulta acotada a {len(selected_source_dicts)} evidencias seleccionadas "
+        "en el Explorador."
+    )
+elif not settings.is_configured:
+    st.info(
+        "La aplicación recuperará las fuentes y generará un contexto listo para "
+        "copiar en el modelo corporativo aprobado."
+    )
 
-def render_sources(sources: list[dict]) -> None:
+
+def render_sources(sources: list[dict], *, key_prefix: str) -> None:
     if not sources:
         return
-    with st.expander("Fuentes recuperadas", expanded=False):
+    with st.expander(f"Fuentes consultadas ({len(sources)})", expanded=False):
         for source_index, source in enumerate(sources, start=1):
             source_note = (
                 " · copia histórica"
                 if source.get("source_type") == "historical_mirror"
                 else ""
             )
-            st.markdown(
-                f"**[F{source_index}] {source['title']} — página "
-                f"{source['page']}{source_note}**"
-            )
-            st.write(source["text"])
-            link_label = (
-                "Abrir copia histórica en la página"
-                if source.get("source_type") == "historical_mirror"
-                else "Abrir documento oficial en la página"
-            )
-            st.markdown(
-                f"[{link_label} {source['page']}]"
-                f"({source['url']}#page={source['page']})"
-            )
+            with st.container(border=True):
+                st.markdown(
+                    f"**[F{source_index}] {source['title']}**  "
+                    f"\nPágina {source['page']}{source_note}"
+                )
+                st.write(source["text"])
+                source_actions = st.columns(2)
+                link_label = (
+                    "Abrir copia histórica"
+                    if source.get("source_type") == "historical_mirror"
+                    else "Abrir PDF oficial"
+                )
+                source_actions[0].link_button(
+                    link_label,
+                    f"{source['url']}#page={source['page']}",
+                    key=f"open_ai_source_{key_prefix}_{source_index}",
+                    use_container_width=True,
+                )
+                if source_actions[1].button(
+                    "Ver en el visor",
+                    key=f"view_ai_source_{key_prefix}_{source_index}",
+                    use_container_width=True,
+                ):
+                    st.session_state.update(
+                        viewer_session_values(
+                            source,
+                            origin_page="pages/2_Analista_IA.py",
+                        )
+                    )
+                    st.switch_page("pages/1_Explorador.py")
 
 
-for message in st.session_state.chat_messages:
+if not st.session_state.chat_messages:
+    with st.container(border=True):
+        st.subheader("Empieza con una pregunta concreta")
+        st.caption(
+            "Puedes consultar todo el corpus o seleccionar primero fuentes en el "
+            "Explorador. La respuesta siempre debe contrastarse con las actas."
+        )
+        example_col1, example_col2, example_col3 = st.columns(3)
+        example_col1.markdown(
+            "**Buscar antecedentes**  \n"
+            "¿Qué conceptos se han emitido sobre semaglutida?"
+        )
+        example_col2.markdown(
+            "**Resumir una decisión**  \n"
+            "Resume la solicitud y el concepto de esta acta."
+        )
+        example_col3.markdown(
+            "**Comparar criterios**  \n"
+            "¿Qué diferencias hay entre estas fuentes seleccionadas?"
+        )
+
+
+for message_index, message in enumerate(st.session_state.chat_messages):
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
         if message.get("prompt"):
             st.code(message["prompt"], language="text")
-        render_sources(message.get("sources", []))
+        render_sources(
+            message.get("sources", []),
+            key_prefix=f"history_{message_index}",
+        )
 
 question = st.chat_input("Pregunta sobre las actas...")
 if question:
@@ -178,6 +244,17 @@ if question:
                 try:
                     with st.spinner("Generando respuesta sustentada..."):
                         answer = generate_answer(prompt, settings)
+                except Exception as exc:
+                    answer = "No fue posible consultar el proveedor de IA."
+                    st.error(f"{answer} Detalle técnico: {exc}")
+                    st.code(prompt, language="text")
+                    stored_message = {
+                        "role": "assistant",
+                        "content": answer,
+                        "prompt": prompt,
+                        "sources": sources,
+                    }
+                else:
                     st.markdown(answer)
                     citations_are_valid, invalid_citations = validate_citations(
                         answer, len(sources)
@@ -192,27 +269,16 @@ if question:
                             "La validación automática de citas falló; no uses la "
                             f"respuesta sin revisar las fuentes.{detail}"
                         )
-                    render_sources(sources)
-                    st.session_state.chat_messages.append(
-                        {
-                            "role": "assistant",
-                            "content": answer,
-                            "sources": sources,
-                        }
-                    )
-                except Exception as exc:
-                    answer = "No fue posible consultar el proveedor de IA."
-                    st.error(f"{answer} Detalle técnico: {exc}")
-                    st.code(prompt, language="text")
-                    render_sources(sources)
-                    st.session_state.chat_messages.append(
-                        {
-                            "role": "assistant",
-                            "content": answer,
-                            "prompt": prompt,
-                            "sources": sources,
-                        }
-                    )
+                    stored_message = {
+                        "role": "assistant",
+                        "content": answer,
+                        "sources": sources,
+                    }
+                render_sources(
+                    sources,
+                    key_prefix=f"history_{len(st.session_state.chat_messages)}",
+                )
+                st.session_state.chat_messages.append(stored_message)
             else:
                 answer = (
                     "La evidencia está lista. Copia el siguiente contexto en el "
@@ -220,7 +286,10 @@ if question:
                 )
                 st.info(answer)
                 st.code(prompt, language="text")
-                render_sources(sources)
+                render_sources(
+                    sources,
+                    key_prefix=f"history_{len(st.session_state.chat_messages)}",
+                )
                 st.session_state.chat_messages.append(
                     {
                         "role": "assistant",
@@ -230,6 +299,8 @@ if question:
                     }
                 )
 
+st.divider()
 st.caption(
-    "Verifica siempre la respuesta contra las páginas citadas de la fuente enlazada."
+    "Las respuestas y los contextos son ayudas de consulta. Verifica siempre cada "
+    "afirmación contra las páginas citadas."
 )

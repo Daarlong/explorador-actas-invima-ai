@@ -9,11 +9,15 @@ from unittest.mock import patch
 
 from services.comparison import (
     HUMAN_CORRECTION_WITHOUT_SOURCE_FRAGMENT,
+    comparison_differences,
     comparison_matrix,
+    comparison_source_payload,
     comparison_to_csv,
     load_selected_decisions,
     printable_html_report,
+    search_comparison_decisions,
     search_timeline,
+    search_timeline_page,
     timeline_to_csv,
 )
 from services.database import connect, initialize_database, insert_document
@@ -263,10 +267,7 @@ class ComparisonTests(unittest.TestCase):
         unstructured_by_field = {
             row["Campo"]: row for row in unstructured_matrix
         }
-        self.assertEqual(
-            unstructured_by_field["Estado de revisión"]["Decision 1"],
-            "Sin ficha estructurada",
-        )
+        self.assertNotIn("Estado de revisión", unstructured_by_field)
         self.assertEqual(
             unstructured_by_field["Producto"]["Decision 1"],
             "No extraído",
@@ -278,8 +279,55 @@ class ComparisonTests(unittest.TestCase):
         )
         self.assertEqual(unstructured_csv[0]["producto"], "No extraído")
         self.assertEqual(unstructured_csv[0]["resultado"], "No extraído")
+        self.assertNotIn("estado_revision", unstructured_csv[0])
         unstructured_html = printable_html_report(unstructured).decode("utf-8")
         self.assertIn("No extraído", unstructured_html)
+
+    def test_searches_and_pages_decisions_for_direct_comparison(self) -> None:
+        first_page = search_comparison_decisions(
+            self.database_path,
+            "Ozempic",
+            page=1,
+            page_size=1,
+        )
+        second_page = search_comparison_decisions(
+            self.database_path,
+            "Ozempic",
+            page=2,
+            page_size=1,
+        )
+
+        self.assertEqual(first_page.total_matches, 2)
+        self.assertEqual(first_page.total_pages, 2)
+        self.assertEqual(first_page.items[0].year, 2025)
+        self.assertEqual(second_page.items[0].year, 2024)
+        selected = load_selected_decisions(
+            self.database_path,
+            [second_page.items[0].selection],
+        )
+        self.assertEqual([item.decision_uid for item in selected], ["dec_record-1"])
+
+        with self.assertRaises(ValueError):
+            search_comparison_decisions(self.database_path, "x")
+
+    def test_comparison_difference_summary_only_contains_changed_fields(self) -> None:
+        decisions = load_selected_decisions(
+            self.database_path,
+            [{"chunk_id": self.chunk_ids[0]}, {"chunk_id": self.chunk_ids[3]}],
+        )
+
+        differences = comparison_differences(decisions)
+        by_field = {row["Campo"]: row for row in differences}
+
+        self.assertNotIn("Producto", by_field)
+        self.assertIn("Resultado", by_field)
+        self.assertEqual(by_field["Resultado"]["Valores distintos"], 2)
+        self.assertIn("D1: Requerimiento", by_field["Resultado"]["Detalle"])
+
+        payload = comparison_source_payload(decisions[0])
+        self.assertEqual(payload["page"], 10)
+        self.assertEqual(payload["chunk_id"], self.chunk_ids[0])
+        self.assertEqual(payload["decision_uid"], "dec_record-1")
 
     def test_timeline_uses_allowed_field_and_parameterized_like(self) -> None:
         product = search_timeline(self.database_path, "product", "OZEM")
@@ -299,6 +347,64 @@ class ComparisonTests(unittest.TestCase):
             search_timeline(self.database_path, "unsafe_column", "Ozempic")
         with self.assertRaises(ValueError):
             search_timeline(self.database_path, "product", "x")
+
+    def test_timeline_supports_new_fields_dates_and_pagination(self) -> None:
+        with connect(self.database_path) as connection:
+            connection.execute(
+                "UPDATE regulatory_records SET session_date = '2024-02-03', "
+                "request_type_code = 'evaluacion_farmacologica' "
+                "WHERE decision_uid = 'dec_record-1'"
+            )
+            connection.execute(
+                "UPDATE regulatory_records SET session_date = '2025-03-04', "
+                "request_type_code = 'modificacion' "
+                "WHERE decision_uid = 'dec_record-2'"
+            )
+
+        interested = search_timeline(
+            self.database_path,
+            "interested_party",
+            "Compania Ejemplo",
+        )
+        favorable = search_timeline(self.database_path, "outcome", "Favorable")
+        modification = search_timeline(
+            self.database_path,
+            "request_type",
+            "Modificacion",
+        )
+        dated = search_timeline(
+            self.database_path,
+            "product",
+            "Ozempic",
+            start_date="2024-01-01",
+            end_date="2024-12-31",
+        )
+        page = search_timeline_page(
+            self.database_path,
+            "product",
+            "Ozempic",
+            page=2,
+            page_size=1,
+        )
+
+        self.assertEqual([item.decision_uid for item in interested], ["dec_record-2"])
+        self.assertEqual([item.decision_uid for item in favorable], ["dec_record-2"])
+        self.assertEqual([item.decision_uid for item in modification], ["dec_record-2"])
+        self.assertEqual([item.decision_uid for item in dated], ["dec_record-1"])
+        self.assertEqual(page.total_loaded, 2)
+        self.assertEqual(page.total_pages, 2)
+        self.assertEqual(page.page, 2)
+        self.assertEqual([item.decision_uid for item in page.entries], ["dec_record-2"])
+        self.assertFalse(page.truncated)
+
+        with self.assertRaises(ValueError):
+            search_timeline(
+                self.database_path,
+                "product",
+                "Ozempic",
+                start_date="2025-01-01",
+                end_date="2024-01-01",
+            )
 
     def test_comparison_and_timeline_apply_current_human_review(self) -> None:
         review = ReviewEvent(
@@ -770,9 +876,12 @@ class ComparisonTests(unittest.TestCase):
         timeline_content = timeline_to_csv(timeline).decode("utf-8-sig")
         timeline_rows = list(csv.DictReader(StringIO(timeline_content)))
         self.assertEqual(len(timeline_rows), 2)
+        self.assertIn("identificador_decision", timeline_rows[0])
+        self.assertNotIn("identificador_revision", timeline_rows[0])
+        self.assertNotIn("estado_revision", timeline_rows[0])
         self.assertEqual(
             timeline_rows[0]["origen_coincidencia"],
-            "Estructurada automática",
+            "Ficha estructurada",
         )
         self.assertEqual(timeline_rows[0]["pagina_coincidencia"], "10")
         self.assertEqual(timeline[0].as_dict()["page"], 10)
@@ -795,6 +904,8 @@ class ComparisonTests(unittest.TestCase):
         self.assertNotIn("<script>", report)
         self.assertIn("#page=10", report)
         self.assertIn("<th>Decision 1</th>", report)
+        self.assertNotIn("<th>Revision</th>", report)
+        self.assertNotIn("ID para revisión", report)
 
         timeline_only = printable_html_report(
             [],

@@ -32,19 +32,38 @@ from services.effective_records import (
     field_metadata,
     hydrate_field_evidence,
     matching_review_uids,
-    provenance_label,
 )
 from services.models import SearchResult
-from services.pdf_viewer import render_pdf_page
+from services.pdf_viewer import (
+    render_pdf_page,
+    search_pdf_page_text,
+    select_viewer_text,
+    viewer_session_values,
+    viewer_source_payload,
+)
 from services.reviews import apply_latest_reviews, latest_reviews, load_review_events
 from services.search import SearchResponse, search_corpus
-from services.ui_helpers import group_search_results, highlight_query, pdf_page_url
+from services.ui_helpers import (
+    apply_app_style,
+    badge_html,
+    group_search_results,
+    highlight_query,
+    pdf_page_url,
+)
 
 
-st.set_page_config(page_title="Explorador de actas", page_icon="🔍", layout="wide")
-st.title("🔍 Explorador de actas")
+st.set_page_config(
+    page_title="Explorador de actas",
+    page_icon="🔍",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+apply_app_style()
+
+st.title("Explorador de actas")
 st.caption(
-    "Búsqueda híbrida, resultados agrupados y verificación en la página exacta"
+    "Encuentra precedentes regulatorios y comprueba cada hallazgo en su "
+    "página de origen."
 )
 
 
@@ -77,7 +96,13 @@ def cached_search(
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def cached_pdf_page(title: str, url: str, page: int, dpi: int = 125):
+def cached_pdf_page(
+    title: str,
+    url: str,
+    page: int,
+    dpi: int = 125,
+    rotation: int = 0,
+):
     return render_pdf_page(
         title,
         url,
@@ -86,7 +111,269 @@ def cached_pdf_page(title: str, url: str, page: int, dpi: int = 125):
         ALLOWED_DOCUMENT_HOSTS,
         MAX_PDF_BYTES,
         dpi=dpi,
+        rotation=rotation,
     )
+
+
+def open_document_viewer(source: SearchResult | dict, page: int | None = None) -> None:
+    """Conserva una fuente verificable para abrirla en el visor compartido."""
+
+    st.session_state.update(viewer_session_values(source, page=page))
+    st.session_state.pop("viewer_origin_page", None)
+
+
+def set_explorer_query(value: str) -> None:
+    """Carga un ejemplo en el buscador sin escribir sobre un widget ya creado."""
+
+    st.session_state["explorer_query"] = value
+
+
+def reset_explorer_filters() -> None:
+    """Restablece solo los filtros; conserva la consulta y la selección."""
+
+    defaults = {
+        "explorer_exact_phrase": False,
+        "explorer_years": [],
+        "explorer_acta_numbers": [],
+        "explorer_sections": [],
+        "explorer_parts": [],
+        "explorer_outcomes": [],
+        "explorer_request_types": [],
+        "explorer_product": "",
+        "explorer_active_ingredient": "",
+        "explorer_interested_party": "",
+        "explorer_identifier": "",
+        "explorer_missing_active_ingredient": False,
+        "explorer_provenance": [],
+        "explorer_confidence": "Cualquiera",
+    }
+    for key, value in defaults.items():
+        st.session_state[key] = value
+
+
+def metadata_tag(value: object) -> str:
+    """Presenta metadatos como etiquetas Markdown compactas y seguras."""
+
+    clean = " ".join(str(value).replace("`", "").split())
+    return f"`{clean}`"
+
+
+def extraction_provenance(value: object) -> str:
+    """Normaliza la trazabilidad técnica para la interfaz de consulta."""
+
+    labels = {
+        "explicit": "Texto explícito",
+        "inferred": "Inferido por estructura",
+        "mixed": "Evidencia combinada",
+        "verified": "Fuente documental",
+        "legacy_automatic": "Extracción automática anterior",
+        "not_extracted": "No extraído",
+    }
+    return labels.get(str(value or "not_extracted"), "Extracción automática")
+
+
+def render_document_viewer(*, key_prefix: str = "viewer") -> None:
+    """Renderiza navegación, imagen y texto copiable de la evidencia activa."""
+
+    raw_source = st.session_state.get("viewer_source")
+    if not raw_source:
+        st.info(
+            "Selecciona **Ver en el visor** en una coincidencia para consultar "
+            "la página sin salir del Explorador."
+        )
+        return
+
+    try:
+        payload = viewer_source_payload(raw_source)
+    except (TypeError, ValueError) as exc:
+        st.error(f"La fuente seleccionada no es válida: {exc}")
+        return
+
+    source_title = str(payload["title"])
+    source_url = str(payload["url"])
+    source_page = int(payload["page"])
+    indexed_fragment = str(payload.get("text") or "")
+    identity = hashlib.sha256(source_url.encode("utf-8")).hexdigest()[:12]
+    page_number = int(st.session_state.get("viewer_page", source_page))
+    source_heading, close_heading = st.columns([5, 1], vertical_alignment="center")
+    source_heading.markdown(f"**{source_title}**")
+    source_heading.caption(f"Fuente seleccionada · página {source_page}")
+    if close_heading.button(
+        "Cerrar",
+        key=f"{key_prefix}_close_top_{identity}_{page_number}",
+        use_container_width=True,
+    ):
+        st.session_state.pop("viewer_source", None)
+        st.session_state.pop("viewer_page", None)
+        st.session_state.pop("viewer_origin_page", None)
+        st.rerun()
+
+    detail_col, rotation_col = st.columns(2)
+    dpi = detail_col.select_slider(
+        "Detalle / zoom",
+        options=[90, 110, 125, 150, 180, 220, 240],
+        value=125,
+        format_func=lambda value: f"{value} DPI",
+        key=f"{key_prefix}_dpi_{identity}",
+        help=(
+            "Una resolución mayor facilita leer letra pequeña, pero tarda más "
+            "y utiliza más memoria."
+        ),
+    )
+    rotation = rotation_col.selectbox(
+        "Rotación",
+        options=[0, 90, 180, 270],
+        format_func=lambda value: f"{value}°",
+        key=f"{key_prefix}_rotation_{identity}",
+    )
+
+    try:
+        with st.spinner("Cargando la página del documento..."):
+            rendered = cached_pdf_page(
+                source_title,
+                source_url,
+                page_number,
+                int(dpi),
+                int(rotation),
+            )
+    except Exception as exc:
+        st.error(f"No fue posible renderizar esta página: {exc}")
+        fallback_url = pdf_page_url(
+            source_url,
+            page_number,
+            ALLOWED_DOCUMENT_HOSTS,
+        )
+        if fallback_url:
+            st.link_button("Abrir documento externamente", fallback_url)
+        if st.button("Cerrar visor", key=f"{key_prefix}_close_error_{identity}"):
+            st.session_state.pop("viewer_source", None)
+            st.session_state.pop("viewer_page", None)
+            st.session_state.pop("viewer_origin_page", None)
+            st.rerun()
+        return
+
+    jump_col, go_col = st.columns([2, 1])
+    requested_page = jump_col.number_input(
+        "Ir a página",
+        min_value=1,
+        max_value=rendered.page_count,
+        value=min(max(1, page_number), rendered.page_count),
+        step=1,
+        key=f"{key_prefix}_jump_{identity}_{page_number}",
+    )
+    if go_col.button(
+        "Ir",
+        key=f"{key_prefix}_go_{identity}_{page_number}",
+        use_container_width=True,
+    ):
+        st.session_state["viewer_page"] = int(requested_page)
+        st.rerun()
+
+    st.image(
+        rendered.image_bytes,
+        caption=(
+            f"Página {rendered.page_number} de {rendered.page_count} · "
+            f"{rendered.dpi} DPI · rotación {rendered.rotation}°"
+        ),
+        use_container_width=True,
+    )
+    previous, following = st.columns(2)
+    if previous.button(
+        "← Página anterior",
+        key=f"{key_prefix}_previous_{identity}_{page_number}",
+        disabled=page_number <= 1,
+        use_container_width=True,
+    ):
+        st.session_state["viewer_page"] = page_number - 1
+        st.rerun()
+    if following.button(
+        "Página siguiente →",
+        key=f"{key_prefix}_next_{identity}_{page_number}",
+        disabled=page_number >= rendered.page_count,
+        use_container_width=True,
+    ):
+        st.session_state["viewer_page"] = page_number + 1
+        st.rerun()
+
+    with st.expander("Buscar y copiar texto de esta página", expanded=False):
+        viewer_text = select_viewer_text(rendered.text, indexed_fragment)
+        if viewer_text.text:
+            if viewer_text.is_full_page:
+                st.caption("Texto completo extraído directamente de esta página del PDF.")
+            else:
+                st.warning(
+                    "El PDF no contiene texto nativo seleccionable. Se muestra "
+                    "únicamente el fragmento indexado asociado a este resultado; "
+                    "no representa necesariamente toda la página."
+                )
+            page_query = st.text_input(
+                "Buscar dentro de la página",
+                key=f"{key_prefix}_text_query_{identity}_{page_number}",
+                placeholder="Ej.: semaglutida",
+            )
+            if page_query.strip():
+                matches = search_pdf_page_text(viewer_text.text, page_query)
+                if matches.occurrence_count:
+                    st.success(
+                        f"{matches.occurrence_count} coincidencia(s) en esta página."
+                    )
+                    for snippet in matches.snippets:
+                        st.markdown(
+                            highlight_query(snippet, page_query),
+                            unsafe_allow_html=True,
+                        )
+                else:
+                    st.info("La frase no aparece en el texto de esta página.")
+            st.caption(
+                "Usa el icono de copiar del bloque para llevarte el texto mostrado."
+            )
+            st.code(viewer_text.text, language=None)
+            st.download_button(
+                (
+                    "Descargar texto de la página"
+                    if viewer_text.is_full_page
+                    else "Descargar fragmento indexado"
+                ),
+                data=viewer_text.text.encode("utf-8"),
+                file_name=f"pagina-{rendered.page_number}.txt",
+                mime="text/plain",
+                key=f"{key_prefix}_download_text_{identity}_{page_number}",
+                use_container_width=True,
+            )
+        else:
+            st.info("No hay texto seleccionable ni fragmento indexado disponible.")
+
+    external_url = pdf_page_url(
+        rendered.resolved_url,
+        page_number,
+        ALLOWED_DOCUMENT_HOSTS,
+    )
+    if external_url:
+        st.link_button(
+            "Abrir documento completo",
+            external_url,
+            use_container_width=True,
+        )
+    origin_pages = {
+        "pages/2_Analista_IA.py": "Volver al Analista IA",
+        "pages/7_Comparar.py": "Volver a Comparar",
+    }
+    origin_page = str(st.session_state.get("viewer_origin_page") or "")
+    if origin_page in origin_pages and st.button(
+        origin_pages[origin_page],
+        key=f"{key_prefix}_return_{identity}_{page_number}",
+        use_container_width=True,
+    ):
+        st.switch_page(origin_page)
+    if st.button(
+        "Cerrar visor",
+        key=f"{key_prefix}_close_{identity}_{page_number}",
+        use_container_width=True,
+    ):
+        st.session_state.pop("viewer_source", None)
+        st.session_state.pop("viewer_page", None)
+        st.session_state.pop("viewer_origin_page", None)
+        st.rerun()
 
 
 def clear_selected_evidence() -> None:
@@ -177,10 +464,10 @@ if stats["documents"] == 0:
 has_structured_data = table_exists(DATABASE_PATH, "regulatory_records")
 try:
     review_events = load_review_events(REVIEW_LOG_PATH)
-except ValueError as exc:
+except ValueError:
     st.error(
-        "El registro de revisiones no es válido. Se detuvo la consulta para "
-        f"no mostrar valores automáticos como si fueran vigentes: {exc}"
+        "No fue posible preparar el catálogo estructurado. Se detuvo la "
+        "consulta para evitar resultados inconsistentes."
     )
     st.stop()
 options = get_filter_options(DATABASE_PATH, review_events=review_events)
@@ -192,7 +479,7 @@ selected_evidence: dict[str, dict] = st.session_state.setdefault(
 mode_labels = {
     "Híbrida (recomendada)": "hybrid",
     "Textual FTS5": "textual",
-    "Semántica local": "semantic",
+    "Semántica neuronal": "semantic",
 }
 order_labels = {
     "Mayor relevancia": "relevance",
@@ -209,77 +496,104 @@ outcome_labels = {
     "no_favorable": "No favorable",
     "sin_clasificar": "Sin clasificar",
 }
-review_labels = {
-    "automatic": "Automática",
-    "reviewed": "Revisada",
-    "approved": "Aprobada",
-    "reopened": "Reabierta",
-    "stale": "Revisión desactualizada",
-}
 provenance_options = {
-    "Explícito": "explicit",
-    "Inferido": "inferred",
-    "Mixto": "mixed",
-    "Verificado": "verified",
-    "Automático anterior": "legacy_automatic",
+    "Texto explícito": "explicit",
+    "Inferido por estructura": "inferred",
+    "Evidencia combinada": "mixed",
     "No extraído": "not_extracted",
 }
 
 with st.sidebar:
-    st.header("Buscar y filtrar")
-    selected_mode_label = st.radio(
-        "Tipo de búsqueda",
-        list(mode_labels),
-        help=(
-            "La búsqueda híbrida combina FTS5 con relaciones aprendidas del "
-            "propio corpus, sin enviar información a servicios externos."
-        ),
-    )
-    exact_phrase = st.checkbox(
-        "Exigir frase completa",
-        help="Utiliza únicamente coincidencias textuales de la frase en ese orden.",
-    )
-    years = st.multiselect("Año", options["years"])
-    acta_numbers = st.multiselect("Número de acta", options["acta_numbers"])
-    sections = st.multiselect("Sala o sección", options["sections"])
-    parts = st.multiselect("Parte", options["parts"])
+    st.header("Opciones de búsqueda")
+    st.caption("Ajusta la recuperación y acota el conjunto de actas.")
+
+    with st.expander("Cómo buscar", expanded=True):
+        selected_mode_label = st.radio(
+            "Método",
+            list(mode_labels),
+            key="explorer_search_mode",
+            help=(
+                "La búsqueda híbrida combina FTS5 con representaciones "
+                "multilingües locales, sin enviar información a servicios externos."
+            ),
+        )
+        exact_phrase = st.checkbox(
+            "Exigir frase completa",
+            key="explorer_exact_phrase",
+            help="Utiliza únicamente coincidencias textuales en el mismo orden.",
+        )
+
+    with st.expander("Acta y publicación", expanded=True):
+        years = st.multiselect(
+            "Año",
+            options["years"],
+            key="explorer_years",
+            placeholder="Todos los años",
+        )
+        acta_numbers = st.multiselect(
+            "Número de acta",
+            options["acta_numbers"],
+            key="explorer_acta_numbers",
+            placeholder="Todas las actas",
+        )
+        sections = st.multiselect(
+            "Sala o sección",
+            options["sections"],
+            key="explorer_sections",
+            placeholder="Todas las secciones",
+        )
+        parts = st.multiselect(
+            "Parte",
+            options["parts"],
+            key="explorer_parts",
+            placeholder="Todas las partes",
+        )
     outcomes: list[str] = []
     request_types: list[str] = []
     selected_provenance_labels: list[str] = []
-    selected_review_labels: list[str] = []
     missing_active_ingredient = False
     confidence_minimum: float | None = None
     product = active_ingredient = interested_party = identifier = ""
     if has_structured_data:
-        with st.expander("Campos regulatorios", expanded=False):
+        with st.expander("Contenido regulatorio", expanded=False):
             outcomes = st.multiselect(
                 "Resultado extraído",
                 options.get("outcomes", []),
                 format_func=lambda value: outcome_labels.get(value, value),
+                key="explorer_outcomes",
+                placeholder="Todos los resultados",
             )
             request_types = st.multiselect(
                 "Tipo de solicitud",
                 options.get("request_types", []),
                 format_func=lambda value: str(value).replace("_", " ").capitalize(),
+                key="explorer_request_types",
+                placeholder="Todos los tipos",
             )
-            product = st.text_input("Producto")
-            active_ingredient = st.text_input("Principio activo")
-            interested_party = st.text_input("Interesado o titular")
-            identifier = st.text_input("Expediente o radicado")
+            product = st.text_input("Producto", key="explorer_product")
+            active_ingredient = st.text_input(
+                "Principio activo", key="explorer_active_ingredient"
+            )
+            interested_party = st.text_input(
+                "Interesado o titular", key="explorer_interested_party"
+            )
+            identifier = st.text_input(
+                "Expediente o radicado", key="explorer_identifier"
+            )
             missing_active_ingredient = st.checkbox(
-                "Solo fichas sin principio activo vigente"
+                "Solo fichas sin principio activo extraído",
+                key="explorer_missing_active_ingredient",
             )
             selected_provenance_labels = st.multiselect(
                 "Procedencia del principio activo",
                 list(provenance_options),
-            )
-            selected_review_labels = st.multiselect(
-                "Estado de revisión",
-                list(review_labels.values()),
+                key="explorer_provenance",
+                placeholder="Cualquier procedencia",
             )
             confidence_choice = st.selectbox(
                 "Confianza mínima del principio activo",
                 ["Cualquiera", "Media (≥ 60 %)", "Alta (≥ 85 %)"],
+                key="explorer_confidence",
             )
             confidence_minimum = {
                 "Cualquiera": None,
@@ -290,54 +604,157 @@ with st.sidebar:
                 "Los campos son extraídos automáticamente y deben verificarse "
                 "contra el acta."
             )
-    selected_order_label = st.selectbox("Orden", list(order_labels))
-    page_size = st.select_slider("Actas por página", [5, 10, 15, 20], value=10)
+
+    with st.expander("Presentación", expanded=False):
+        selected_order_label = st.selectbox(
+            "Orden",
+            list(order_labels),
+            key="explorer_order",
+        )
+        page_size = st.select_slider(
+            "Actas por página",
+            [5, 10, 15, 20],
+            value=10,
+            key="explorer_page_size",
+        )
+
+    active_filter_count = sum(
+        bool(value)
+        for value in (
+            exact_phrase,
+            years,
+            acta_numbers,
+            sections,
+            parts,
+            outcomes,
+            request_types,
+            product.strip(),
+            active_ingredient.strip(),
+            interested_party.strip(),
+            identifier.strip(),
+            missing_active_ingredient,
+            selected_provenance_labels,
+            confidence_minimum is not None,
+        )
+    )
+    filter_status, filter_reset = st.columns([1.15, 1])
+    filter_status.caption(
+        f"{active_filter_count} filtro(s) activo(s)"
+        if active_filter_count
+        else "Sin filtros adicionales"
+    )
+    filter_reset.button(
+        "Restablecer",
+        key="explorer_reset_filters",
+        disabled=active_filter_count == 0,
+        on_click=reset_explorer_filters,
+        use_container_width=True,
+    )
 
     st.divider()
-    st.metric("Evidencias seleccionadas", len(selected_evidence))
-    analyze_disabled = not selected_evidence
-    if st.button(
-        "Analizar seleccionadas",
-        type="primary",
-        use_container_width=True,
-        disabled=analyze_disabled,
-    ):
-        st.session_state["analysis_selected_sources"] = list(
-            selected_evidence.values()
+    with st.container(border=True):
+        st.markdown("#### Selección")
+        st.caption(
+            f"{len(selected_evidence)} evidencia(s) preparada(s) para usar en "
+            "otras vistas."
         )
-        st.session_state["analysis_use_selected"] = True
-        st.switch_page("pages/2_Analista_IA.py")
-    if st.button(
-        "Comparar seleccionadas",
-        use_container_width=True,
-        disabled=analyze_disabled,
-    ):
-        st.session_state["comparison_selected_sources"] = list(
-            selected_evidence.values()
-        )
-        st.switch_page("pages/7_Comparar.py")
-    if st.button(
-        "Limpiar selección",
-        use_container_width=True,
-        disabled=analyze_disabled,
-    ):
-        clear_selected_evidence()
-        st.rerun()
+        analyze_disabled = not selected_evidence
+        if st.button(
+            f"Analizar selección ({len(selected_evidence)})",
+            type="primary",
+            use_container_width=True,
+            disabled=analyze_disabled,
+        ):
+            st.session_state["analysis_selected_sources"] = list(
+                selected_evidence.values()
+            )
+            st.session_state["analysis_use_selected"] = True
+            st.switch_page("pages/2_Analista_IA.py")
+        if st.button(
+            f"Comparar selección ({len(selected_evidence)})",
+            use_container_width=True,
+            disabled=analyze_disabled,
+        ):
+            st.session_state["comparison_selected_sources"] = list(
+                selected_evidence.values()
+            )
+            st.switch_page("pages/7_Comparar.py")
+        if st.button(
+            "Vaciar selección",
+            use_container_width=True,
+            disabled=analyze_disabled,
+        ):
+            clear_selected_evidence()
+            st.rerun()
 
-query = st.text_input(
-    "¿Qué necesitas encontrar?",
-    key="explorer_query",
-    placeholder=(
-        "Ej.: precedentes de semaglutida, expediente 123456 o requerimientos "
-        "sobre estabilidad"
-    ),
-)
+with st.container(border=True):
+    st.markdown("### Buscar en el corpus")
+    st.caption(
+        "Usa nombres, principios activos, empresas, expedientes, radicados o "
+        "preguntas breves sobre el contenido de las actas."
+    )
+    with st.form("explorer_search_form", border=False):
+        search_input, search_action = st.columns(
+            [5, 1], vertical_alignment="bottom"
+        )
+        query = search_input.text_input(
+            "Consulta",
+            key="explorer_query",
+            placeholder=(
+                "Ej.: semaglutida, expediente 123456 o requerimientos sobre "
+                "estabilidad"
+            ),
+            label_visibility="collapsed",
+        )
+        search_action.form_submit_button(
+            "Buscar",
+            type="primary",
+            use_container_width=True,
+        )
+    search_context = [selected_mode_label]
+    if active_filter_count:
+        search_context.append(f"{active_filter_count} filtro(s)")
+    context_column, clear_query_column = st.columns(
+        [5, 1], vertical_alignment="center"
+    )
+    context_column.caption(" · ".join(search_context))
+    clear_query_column.button(
+        "Limpiar consulta",
+        key="explorer_clear_query",
+        disabled=not query.strip(),
+        on_click=set_explorer_query,
+        args=("",),
+        use_container_width=True,
+    )
 
 if not query.strip():
-    st.info(
-        "Escribe una consulta. Puedes combinarla con año, sala, producto, "
-        "principio activo, interesado, expediente o resultado."
-    )
+    if st.session_state.get("viewer_source"):
+        with st.container(border=True):
+            st.subheader("Fuente seleccionada")
+            render_document_viewer(key_prefix="viewer_standalone")
+    else:
+        st.markdown("### ¿Por dónde empezar?")
+        st.caption(
+            "Prueba una búsqueda frecuente o escribe tu propia consulta en el "
+            "campo superior."
+        )
+        example_columns = st.columns(3)
+        examples = (
+            ("Principio activo", "semaglutida"),
+            ("Tipo de decisión", "requerimientos de estabilidad"),
+            ("Antecedente", "cambio de indicación"),
+        )
+        for column, (label, value) in zip(example_columns, examples):
+            with column.container(border=True):
+                st.markdown(f"**{label}**")
+                st.caption(value.capitalize())
+                st.button(
+                    "Usar este ejemplo",
+                    key=f"example_{hashlib.sha256(value.encode()).hexdigest()[:8]}",
+                    on_click=set_explorer_query,
+                    args=(value,),
+                    use_container_width=True,
+                )
     st.stop()
 
 filters = {
@@ -364,21 +781,16 @@ effective_filter_values = {
         provenance_options[label] for label in selected_provenance_labels
     ],
     "confidence_minimum": confidence_minimum,
-    "review_statuses": [
-        code
-        for code, label in review_labels.items()
-        if label in selected_review_labels
-    ],
+    "review_statuses": [],
 }
-# Los filtros estructurados se aplican sobre el valor vigente cuando hay
-# revisiones o filtros de procedencia. Así una corrección humana es visible sin
-# reconstruir FTS. Año/sala/acta siguen resolviéndose eficientemente en SQLite.
+# Algunos filtros estructurados se aplican después de la recuperación para
+# respetar los metadatos efectivos sin reconstruir FTS. Año/sala/acta siguen
+# resolviéndose eficientemente en SQLite.
 post_filter_effective = bool(
     any(
         (
             missing_active_ingredient,
             selected_provenance_labels,
-            selected_review_labels,
             confidence_minimum is not None,
         )
     )
@@ -435,10 +847,9 @@ with st.spinner("Consultando el corpus..."):
             _file_identity(DATABASE_PATH),
             _file_identity(SEMANTIC_INDEX_PATH),
         )
-        # Conserva también los candidatos que coinciden con los valores
-        # automáticos. El barrido sin filtros permite encontrar correcciones;
-        # esta segunda consulta evita perder fichas automáticas más profundas
-        # en el ranking por el límite de recuperación.
+        # Conserva también los candidatos que coinciden con los valores de la
+        # extracción. El barrido sin filtros y esta segunda consulta evitan
+        # perder fichas más profundas en el ranking por el límite de recuperación.
         if post_filter_effective and search_filters != filters:
             automatic_response = cached_search(
                 query.strip(),
@@ -503,7 +914,7 @@ elif response.requested_mode != response.used_mode:
     st.warning(
         "El índice semántico todavía no está disponible; esta consulta se "
         "resolvió con búsqueda textual. Ejecuta Construir índice para generar "
-        "o actualizar el índice semántico local."
+        "o actualizar el índice semántico."
     )
 
 corrected_records: list[dict] = []
@@ -518,12 +929,11 @@ if review_events and any(
         request_types,
         missing_active_ingredient,
         selected_provenance_labels,
-        selected_review_labels,
         confidence_minimum is not None,
     )
 ):
-    # Una corrección puede cambiar el resultado de cualquiera de estos filtros
-    # aunque el texto de la consulta coincida con solicitud/concepto.
+    # Los metadatos efectivos pueden cambiar el resultado de estos filtros aunque
+    # el texto de la consulta coincida con solicitud o concepto.
     corrected_uids.update(latest_reviews(review_events))
 review_candidate_truncated = len(corrected_uids) > 5_000
 review_match_truncated = False
@@ -576,7 +986,21 @@ corrected_records = [
 
 groups = group_search_results(response.results, order=order_labels[selected_order_label])
 if not groups and not corrected_records:
-    st.warning("No se encontraron coincidencias con los filtros seleccionados.")
+    with st.container(border=True):
+        st.warning("No encontramos coincidencias para esta combinación.")
+        st.markdown("**Puedes intentar:**")
+        st.markdown(
+            "- Usar menos palabras o retirar la frase completa.\n"
+            "- Buscar por un solo identificador, producto o principio activo.\n"
+            "- Restablecer los filtros de la barra lateral.\n"
+            "- Cambiar al modo híbrido para ampliar la recuperación."
+        )
+        if active_filter_count:
+            st.button(
+                "Restablecer filtros y volver a intentar",
+                key=f"empty_reset_{signature}",
+                on_click=reset_explorer_filters,
+            )
     st.stop()
 
 total_pages = max(1, math.ceil(len(groups) / page_size))
@@ -606,35 +1030,42 @@ else:
         },
     )
 
-summary_col1, summary_col2, summary_col3 = st.columns([1.2, 1, 1])
-summary_col1.metric("PDF recuperados", len(groups))
-summary_col2.metric("Fragmentos recuperados", len(response.results))
-summary_col3.metric("Página de resultados", f"{current_page} de {total_pages}")
-st.caption(
-    f"Modo utilizado: **{response.used_mode}** · se muestran hasta tres "
-    "fragmentos por documento."
-)
+result_heading, result_selection = st.columns([4, 1], vertical_alignment="bottom")
+with result_heading:
+    st.subheader("Resultados")
+    st.caption(
+        f"**{len(groups)} acta(s)** · {len(response.results)} fragmento(s) · "
+        f"modo {response.used_mode} · página {current_page} de {total_pages}"
+    )
+with result_selection:
+    st.markdown(
+        badge_html(
+            f"{len(selected_evidence)} seleccionada(s)",
+            tone="success" if selected_evidence else "neutral",
+        ),
+        unsafe_allow_html=True,
+    )
 
 if corrected_records:
     with st.expander(
-        f"Coincidencias con historial de revisión ({len(corrected_records)})",
+        f"Coincidencias adicionales en fichas ({len(corrected_records)})",
         expanded=not groups,
     ):
         st.caption(
-            "Estas fichas se recuperaron mediante su historial y se muestran "
-            "después de validar cuál revisión sigue vigente."
+            "Estas coincidencias provienen de los campos estructurados y se "
+            "presentan con una fuente documental verificable."
         )
         if review_candidate_truncated or review_match_truncated:
             st.warning(
-                "Se alcanzó el límite de seguridad del historial. Acota la "
-                "consulta o los filtros para revisar todas las coincidencias."
+                "Se alcanzó el límite de recuperación. Acota la consulta o los "
+                "filtros para consultar todas las coincidencias."
             )
         corrected_page_size = 20
         corrected_page_count = max(
             1, math.ceil(len(corrected_records) / corrected_page_size)
         )
         corrected_page = st.number_input(
-            "Página de coincidencias revisadas",
+            "Página de coincidencias adicionales",
             min_value=1,
             max_value=corrected_page_count,
             value=1,
@@ -650,9 +1081,7 @@ if corrected_records:
         )
         if evidence_truncated:
             st.warning("Algunas evidencias no se cargaron por el límite de seguridad.")
-        for corrected_index, record in enumerate(
-            corrected_visible, start=corrected_start + 1
-        ):
+        for record in corrected_visible:
             st.markdown(
                 f"**{display_value(record.get('product_name'))}** · "
                 f"{display_value(record.get('active_ingredient'))} · "
@@ -661,25 +1090,24 @@ if corrected_records:
             )
             uid = str(record.get("decision_uid") or "")
             selectable = selectable_by_uid.get(uid)
-            controls = st.columns([1.1, 1, 1, 1])
+            controls = st.columns([1.1, 1, 1])
             if selectable is not None:
                 selectable_payload = evidence_selection_payload(selectable, uid)
                 selected_key = f"review:{uid}:{selectable.chunk_id}"
                 selection_key = f"select_reviewed_{signature}_{uid}"
                 controls[0].checkbox(
-                    "Seleccionar",
+                    "Agregar a selección",
                     value=selected_key in selected_evidence,
                     key=selection_key,
                     on_change=update_selected_evidence,
                     args=(selection_key, selectable_payload, selected_key),
                 )
                 if controls[1].button(
-                    "Ver página",
+                    "Ver en el visor",
                     key=f"view_reviewed_{signature}_{uid}",
                     use_container_width=True,
                 ):
-                    st.session_state["viewer_source"] = selectable_payload
-                    st.session_state["viewer_page"] = selectable.page
+                    open_document_viewer(selectable_payload, selectable.page)
                 reviewed_url = pdf_page_url(
                     selectable.url, selectable.page, ALLOWED_DOCUMENT_HOSTS
                 )
@@ -692,70 +1120,99 @@ if corrected_records:
                     )
             else:
                 controls[0].caption("Sin fragmento seleccionable")
-            if controls[3].button(
-                "Revisar ficha",
-                key=f"review_corrected_{signature}_{uid or corrected_index}",
-                use_container_width=True,
-            ):
-                st.session_state["review_target_uid"] = record.get("decision_uid")
-                st.switch_page("pages/8_Revision_Fichas.py")
 
 if groups:
-    nav_left, nav_middle, nav_right = st.columns([1, 2, 1])
-    if nav_left.button(
-        "← Anterior",
-        disabled=current_page <= 1,
-        use_container_width=True,
-    ):
-        st.session_state["explorer_page"] = current_page - 1
-        st.rerun()
-    nav_middle.caption(
-        f"Resultados {start + 1}–{min(start + page_size, len(groups))}"
-    )
-    if nav_right.button(
-        "Siguiente →",
-        disabled=current_page >= total_pages,
-        use_container_width=True,
-    ):
-        st.session_state["explorer_page"] = current_page + 1
-        st.rerun()
+    with st.container(border=True):
+        nav_left, nav_middle, nav_right = st.columns(
+            [1, 2, 1], vertical_alignment="center"
+        )
+        if nav_left.button(
+            "← Anterior",
+            key=f"previous_{signature}_{current_page}",
+            disabled=current_page <= 1,
+            use_container_width=True,
+        ):
+            st.session_state["explorer_page"] = current_page - 1
+            st.rerun()
+        nav_middle.markdown(
+            f"Actas **{start + 1}–{min(start + page_size, len(groups))}** "
+            f"de **{len(groups)}**"
+        )
+        if nav_right.button(
+            "Siguiente →",
+            key=f"next_{signature}_{current_page}",
+            disabled=current_page >= total_pages,
+            use_container_width=True,
+        ):
+            st.session_state["explorer_page"] = current_page + 1
+            st.rerun()
 
 results_column, viewer_column = st.columns([1.45, 1], gap="large")
 with results_column:
     for group_index, group in enumerate(visible_groups, start=start + 1):
         with st.container(border=True):
-            st.markdown(f"### {group_index}. {group['title']}")
+            title_column, score_column = st.columns(
+                [5, 1], vertical_alignment="top"
+            )
+            title_column.markdown(f"### {group_index}. {group['title']}")
+            score_column.markdown(
+                badge_html(f"Puntaje {group['score']:.3f}", tone="success"),
+                unsafe_allow_html=True,
+            )
             metadata = []
             if group["year"]:
-                metadata.append(str(group["year"]))
+                metadata.append(f"Año {group['year']}")
             if group["section"]:
                 metadata.append(group["section"])
             if group["part"]:
                 metadata.append(group["part"])
             if group["source_type"] == "historical_mirror":
                 metadata.append("Copia histórica")
-            metadata.append(f"relevancia {group['score']:.3f}")
-            st.caption(" · ".join(metadata))
+            metadata.append(f"{len(group['results'])} coincidencia(s)")
+            selected_in_group = sum(
+                str(result.chunk_id) in selected_evidence
+                for result in group["results"]
+            )
+            if selected_in_group:
+                metadata.append(f"{selected_in_group} seleccionada(s)")
+            st.markdown(
+                " ".join(
+                    badge_html(
+                        value,
+                        tone=(
+                            "warning"
+                            if value == "Copia histórica"
+                            else "success"
+                            if "seleccionada" in value
+                            else "info"
+                        ),
+                    )
+                    for value in metadata
+                ),
+                unsafe_allow_html=True,
+            )
 
             for fragment_index, result in enumerate(group["results"][:3], start=1):
-                st.markdown(f"**Fragmento {fragment_index} · página {result.page}**")
+                st.markdown(
+                    f"#### Coincidencia {fragment_index} "
+                    f"{metadata_tag(f'Página {result.page}')}"
+                )
                 st.markdown(highlight_query(result.text, query), unsafe_allow_html=True)
                 controls = st.columns([1.2, 1, 1])
                 selection_key = f"select_evidence_{signature}_{result.chunk_id}"
                 controls[0].checkbox(
-                    "Seleccionar",
+                    "Agregar a selección",
                     value=str(result.chunk_id) in selected_evidence,
                     key=selection_key,
                     on_change=update_selected_evidence,
                     args=(selection_key, result.as_dict()),
                 )
                 if controls[1].button(
-                    "Ver página",
+                    "Ver en el visor",
                     key=f"view_{signature}_{result.chunk_id}",
                     use_container_width=True,
                 ):
-                    st.session_state["viewer_source"] = result.as_dict()
-                    st.session_state["viewer_page"] = result.page
+                    open_document_viewer(result)
                 direct_url = pdf_page_url(
                     result.url,
                     result.page,
@@ -763,8 +1220,9 @@ with results_column:
                 )
                 if direct_url:
                     controls[2].link_button(
-                        f"Abrir PDF · F{fragment_index}",
+                        "Abrir PDF",
                         direct_url,
+                        key=f"open_pdf_{signature}_{result.chunk_id}",
                         use_container_width=True,
                     )
                 else:
@@ -772,14 +1230,14 @@ with results_column:
 
                 structured = structured_by_chunk.get(result.chunk_id, [])
                 for record_index, record in enumerate(structured, start=1):
-                    ficha_label = "Ficha regulatoria"
+                    ficha_label = "Datos estructurados"
                     if len(structured) > 1:
                         ficha_label += f" {record_index} de {len(structured)}"
-                    ficha_label += " · " + review_labels.get(
-                        str(record.get("review_status") or "automatic"),
-                        "Automática",
-                    )
                     with st.expander(ficha_label, expanded=False):
+                        st.caption(
+                            "Información extraída automáticamente. Comprueba los "
+                            "datos relevantes en la fuente enlazada."
+                        )
                         field_rows = {
                             "Numeral": record.get("numeral"),
                             "Título del numeral": record.get("numeral_title"),
@@ -814,8 +1272,8 @@ with results_column:
                             table_rows.append(
                                 {
                                     "Campo": label,
-                                    "Valor vigente": display_value(value),
-                                    "Procedencia": provenance_label(
+                                    "Valor extraído": display_value(value),
+                                    "Trazabilidad": extraction_provenance(
                                         meta.get("provenance")
                                     ),
                                     "Confianza": (
@@ -863,7 +1321,7 @@ with results_column:
                             source_field = str(
                                 detail.get("source_field") or detail.get("field")
                             )
-                            # Una evidencia de rango sustenta dos campos vigentes;
+                            # Una evidencia de rango sustenta dos campos extraídos;
                             # se presenta una sola vez para no duplicar la fila.
                             evidence_key = (
                                 source_field,
@@ -927,93 +1385,38 @@ with results_column:
                             if start_page == end_page
                             else f"{start_page}–{end_page}"
                         )
-                        st.caption(
-                            f"Estado: {review_labels.get(str(record.get('review_status') or 'automatic'), 'Automática')} "
-                            f"· páginas {page_label}."
-                        )
-                        if record.get("review_stale"):
-                            st.warning(
-                                "La fuente cambió después de la revisión; esta ficha "
-                                "debe verificarse nuevamente."
-                            )
-                        elif record.get("review_needs_reconfirmation"):
-                            st.warning(
-                                "La versión del extractor cambió. La corrección "
-                                "se conserva por su ID estable, pero conviene "
-                                "reconfirmarla contra la fuente."
-                            )
-                        if record.get("reviewer"):
-                            st.caption(
-                                f"Revisor declarado: {record.get('reviewer')} · "
-                                f"{record.get('reviewed_at', '')}"
-                            )
-                        if st.button(
-                            "Revisar esta ficha",
-                            key=(
-                                f"review_record_{signature}_{result.chunk_id}_"
-                                f"{record.get('decision_uid') or record_index}"
-                            ),
-                        ):
-                            st.session_state["review_target_uid"] = record.get(
-                                "decision_uid"
-                            )
-                            st.switch_page("pages/8_Revision_Fichas.py")
+                        st.caption(f"Evidencia localizada en páginas {page_label}.")
                 if fragment_index < min(3, len(group["results"])):
                     st.divider()
 
 with viewer_column:
-    st.subheader("Visor de evidencia")
-    viewer_source = st.session_state.get("viewer_source")
-    if not viewer_source:
-        st.info("Selecciona **Ver página** en un resultado para visualizarla aquí.")
-    else:
-        source = SearchResult.from_dict(viewer_source)
-        page_number = int(st.session_state.get("viewer_page", source.page))
-        st.markdown(f"**{source.title}**")
-        st.caption(f"Página solicitada: {page_number}")
-        try:
-            with st.spinner("Cargando la página del documento..."):
-                rendered = cached_pdf_page(source.title, source.url, page_number)
-            st.image(
-                rendered.image_bytes,
-                caption=f"Página {rendered.page_number} de {rendered.page_count}",
-                use_container_width=True,
-            )
-            previous, following = st.columns(2)
-            if previous.button(
-                "← Página anterior",
-                disabled=page_number <= 1,
-                use_container_width=True,
-            ):
-                st.session_state["viewer_page"] = page_number - 1
-                st.rerun()
-            if following.button(
-                "Página siguiente →",
-                disabled=page_number >= rendered.page_count,
-                use_container_width=True,
-            ):
-                st.session_state["viewer_page"] = page_number + 1
-                st.rerun()
-            external_url = pdf_page_url(
-                rendered.resolved_url,
-                page_number,
-                ALLOWED_DOCUMENT_HOSTS,
-            )
-            st.link_button(
-                "Abrir documento completo",
-                external_url,
-                use_container_width=True,
-            )
-        except Exception as exc:
-            st.error(f"No fue posible renderizar esta página: {exc}")
-            fallback_url = pdf_page_url(
-                source.url,
-                page_number,
-                ALLOWED_DOCUMENT_HOSTS,
-            )
-            if fallback_url:
-                st.link_button("Abrir documento externamente", fallback_url)
-        if st.button("Cerrar visor", use_container_width=True):
-            st.session_state.pop("viewer_source", None)
-            st.session_state.pop("viewer_page", None)
-            st.rerun()
+    with st.container(border=True):
+        st.subheader("Fuente seleccionada")
+        st.caption("Consulta la página y navega por el PDF sin perder los resultados.")
+        render_document_viewer()
+
+if groups and total_pages > 1:
+    st.divider()
+    bottom_previous, bottom_status, bottom_next = st.columns(
+        [1, 2, 1], vertical_alignment="center"
+    )
+    if bottom_previous.button(
+        "← Página anterior",
+        key=f"bottom_previous_{signature}_{current_page}",
+        disabled=current_page <= 1,
+        use_container_width=True,
+    ):
+        st.session_state["explorer_page"] = current_page - 1
+        st.rerun()
+    bottom_status.markdown(
+        f"Página **{current_page}** de **{total_pages}** · "
+        f"{len(groups)} acta(s) encontrada(s)"
+    )
+    if bottom_next.button(
+        "Página siguiente →",
+        key=f"bottom_next_{signature}_{current_page}",
+        disabled=current_page >= total_pages,
+        use_container_width=True,
+    ):
+        st.session_state["explorer_page"] = current_page + 1
+        st.rerun()

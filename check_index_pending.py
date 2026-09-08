@@ -9,10 +9,14 @@ from config import (
     RAW_DATABASE_PATH,
     RAW_SEMANTIC_INDEX_PATH,
     SEMANTIC_ENABLED,
+    SEMANTIC_NEURAL_ENABLED,
+    SEMANTIC_NEURAL_MODEL_ID,
+    SEMANTIC_NEURAL_MODEL_REVISION,
     SEMANTIC_REPORT_PATH,
 )
 from services.automation import pending_index_items
 from services.database_package import package_manifest_path
+from services.semantic import semantic_build_spec
 
 
 def _load_report(path: Path) -> dict:
@@ -58,6 +62,9 @@ def build_pending_status(
     semantic_index_path: Path,
     *,
     semantic_enabled: bool,
+    expected_semantic_method: str | None = None,
+    expected_semantic_signature: str | None = None,
+    require_neural: bool = False,
 ) -> dict[str, object]:
     base = pending_index_items(integrity_path)
     integrity = _load_report(integrity_path)
@@ -100,6 +107,18 @@ def build_pending_status(
         if str(semantic.get("status", "missing")).lower() not in {"built", "reused"}:
             reasons.append("semantic_index_stale")
             pending_count += 1
+        if (
+            expected_semantic_method
+            and semantic.get("method") != expected_semantic_method
+        ) or (
+            expected_semantic_signature
+            and semantic.get("build_signature") != expected_semantic_signature
+        ):
+            reasons.append("semantic_build_outdated")
+            pending_count += 1
+        if require_neural and semantic.get("neural_status") != "ready":
+            reasons.append("semantic_neural_pending")
+            pending_count += 1
         if not _package_available(semantic_index_path):
             reasons.append("semantic_package_missing_or_incomplete")
             pending_count += 1
@@ -114,6 +133,11 @@ def build_pending_status(
 
 
 if __name__ == "__main__":
+    expected_method, expected_signature = semantic_build_spec(
+        neural_enabled=SEMANTIC_NEURAL_ENABLED,
+        neural_model_id=SEMANTIC_NEURAL_MODEL_ID,
+        neural_model_revision=SEMANTIC_NEURAL_MODEL_REVISION,
+    )
     status = build_pending_status(
         INTEGRITY_REPORT_PATH,
         INDEXING_REPORT_PATH,
@@ -121,6 +145,9 @@ if __name__ == "__main__":
         RAW_DATABASE_PATH,
         RAW_SEMANTIC_INDEX_PATH,
         semantic_enabled=SEMANTIC_ENABLED,
+        expected_semantic_method=expected_method,
+        expected_semantic_signature=expected_signature,
+        require_neural=SEMANTIC_NEURAL_ENABLED,
     )
     print(json.dumps(status, ensure_ascii=False, indent=2))
     raise SystemExit(0 if status["needs_update"] else 1)

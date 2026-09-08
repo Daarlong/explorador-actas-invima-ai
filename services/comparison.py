@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import csv
 from dataclasses import asdict, dataclass, replace
+from datetime import date
 from html import escape
 from io import StringIO
 from itertools import islice
+import math
 from pathlib import Path
 import re
 from typing import Iterable, Mapping, Sequence
@@ -37,9 +39,11 @@ MAX_HTML_TIMELINE_TEXT_CHARS = 2_000
 MAX_TIMELINE_QUERY_CHARS = 500
 MAX_REVIEW_EVENTS = 50_000
 MAX_TIMELINE_TEXT_HITS = 1_500
+MAX_DIRECT_SEARCH_PAGE_SIZE = 25
 SQLITE_MAX_INTEGER = 9_223_372_036_854_775_807
 HUMAN_CORRECTION_WITHOUT_SOURCE_FRAGMENT = (
-    "Corrección humana sin fragmento fuente específico; verifica la página en el PDF."
+    "El valor estructurado no tiene un fragmento específico asociado; "
+    "verifica la página enlazada en el PDF."
 )
 
 TIMELINE_MATCH_ORIGINS = (
@@ -204,6 +208,112 @@ class TimelineEntry:
         return value
 
 
+@dataclass(frozen=True)
+class ComparisonSearchItem:
+    """Ficha localizada directamente desde la página de comparación."""
+
+    record_id: int
+    decision_uid: str
+    title: str
+    year: int | None
+    acta_number: str | None
+    page_number: int
+    product_name: str | None
+    active_ingredient: str | None
+    interested_party: str | None
+    expediente: str | None
+    radicado: str | None
+    request_type: str | None
+    outcome_code: str | None
+    selection: dict[str, object]
+
+    @property
+    def key(self) -> str:
+        return f"decision:{self.decision_uid}"
+
+    @property
+    def label(self) -> str:
+        identity = (
+            self.product_name
+            or self.active_ingredient
+            or self.expediente
+            or self.radicado
+            or self.title
+        )
+        acta = f"Acta {self.acta_number}" if self.acta_number else "Acta sin número"
+        year = str(self.year) if self.year is not None else "sin año"
+        return f"{identity} · {acta} ({year}) · p. {self.page_number}"
+
+
+@dataclass(frozen=True)
+class ComparisonSearchPage:
+    """Página exacta de fichas disponibles para añadir a una comparación."""
+
+    items: tuple[ComparisonSearchItem, ...]
+    total_matches: int
+    page: int
+    page_size: int
+    total_pages: int
+
+
+@dataclass(frozen=True)
+class TimelineSearchPage:
+    """Ventana paginada de una cronología y su estado de truncamiento."""
+
+    entries: tuple[TimelineEntry, ...]
+    total_loaded: int
+    page: int
+    page_size: int
+    total_pages: int
+    truncated: bool
+
+
+def comparison_source_payload(
+    item: ComparisonDecision | TimelineEntry,
+    *,
+    page: int | None = None,
+    text: str | None = None,
+) -> dict[str, object]:
+    """Crea el mapping mínimo y trazable que consume el visor compartido."""
+
+    target_page = int(
+        page
+        or getattr(item, "match_page", None)
+        or item.page_number
+    )
+    evidences = tuple(getattr(item, "match_evidences", ())) or tuple(
+        getattr(item, "evidences", ())
+    )
+    selected_evidence = next(
+        (evidence for evidence in evidences if evidence.page == target_page),
+        evidences[0] if evidences else None,
+    )
+    payload: dict[str, object] = {
+        "title": item.title,
+        "url": item.url,
+        "page": target_page,
+        "text": _bounded_text(
+            text
+            if text is not None
+            else (
+                selected_evidence.text
+                if selected_evidence is not None
+                else getattr(item, "match_evidence", "")
+            )
+        ),
+        "year": item.year,
+        "acta_number": item.acta_number,
+        "section": item.section,
+        "part": item.part,
+        "source_type": item.source_type,
+    }
+    if selected_evidence is not None:
+        payload["chunk_id"] = selected_evidence.chunk_id
+    if item.decision_uid:
+        payload["decision_uid"] = item.decision_uid
+    return payload
+
+
 _OPTIONAL_COLUMN_CANDIDATES = {
     "decision_uid": ("decision_uid",),
     "numeral": ("numeral", "subsection_number"),
@@ -219,14 +329,25 @@ _OPTIONAL_COLUMN_CANDIDATES = {
 }
 
 _TIMELINE_FIELDS = {
-    "product": ("normalized_product_name", "product_name", False),
+    "product": ("normalized_product_name", "product_name", False, True),
     "active_ingredient": (
         "normalized_active_ingredient",
         "active_ingredient",
         False,
+        True,
     ),
-    "expediente": ("normalized_expediente", "expediente", True),
-    "radicado": ("normalized_radicado", "radicado", True),
+    "interested_party": (
+        "normalized_interested_party",
+        "interested_party",
+        False,
+        True,
+    ),
+    "expediente": ("normalized_expediente", "expediente", True, True),
+    "radicado": ("normalized_radicado", "radicado", True, True),
+    # Resultado y tipo de solicitud son clasificaciones de la ficha. Una simple
+    # mención de esas palabras en el PDF no demuestra que clasifiquen la decisión.
+    "outcome": ("outcome_code", "outcome_code", False, False),
+    "request_type": ("request_type_code", "request_type_code", False, False),
 }
 
 # La tabla aparece a partir del esquema 0.7. Los alias mantienen la cronología
@@ -249,8 +370,11 @@ _FIELD_EVIDENCE_COLUMN_CANDIDATES = {
 _FIELD_EVIDENCE_NAMES = {
     "product": ("product_name", "product", "producto"),
     "active_ingredient": ("active_ingredient", "principio_activo"),
+    "interested_party": ("interested_party", "interesado", "titular"),
     "expediente": ("expediente",),
     "radicado": ("radicado",),
+    "outcome": ("outcome_code", "resultado"),
+    "request_type": ("request_type_code", "tipo_solicitud"),
 }
 
 _MATCH_ORIGIN_PRIORITY = {
@@ -765,12 +889,207 @@ def load_selected_decisions(
     return decisions
 
 
+def search_comparison_decisions(
+    database_path: Path,
+    query: str,
+    *,
+    page: int = 1,
+    page_size: int = 10,
+    years: Sequence[int] | None = None,
+) -> ComparisonSearchPage:
+    """Busca fichas seleccionables sin obligar a volver al Explorador.
+
+    Solo devuelve registros que tienen ``decision_uid`` y al menos un fragmento
+    vigente dentro de su rango de páginas. El ``selection`` de cada elemento es
+    un snapshot completo y puede pasarse directamente a
+    :func:`load_selected_decisions`.
+    """
+
+    if not database_path.exists():
+        return ComparisonSearchPage((), 0, 1, max(1, int(page_size)), 1)
+    try:
+        requested_page = int(page)
+        bounded_page_size = int(page_size)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Parámetros de paginación inválidos") from exc
+    if requested_page < 1 or bounded_page_size < 1:
+        raise ValueError("Parámetros de paginación inválidos")
+    bounded_page_size = min(bounded_page_size, MAX_DIRECT_SEARCH_PAGE_SIZE)
+    raw_query = str(query or "").strip()
+    if len(raw_query) > MAX_TIMELINE_QUERY_CHARS:
+        raise ValueError(
+            f"La consulta no puede superar {MAX_TIMELINE_QUERY_CHARS} caracteres"
+        )
+    normalized_query = normalize_text(raw_query)
+    if len(normalized_query) < 2:
+        raise ValueError("Escribe al menos dos caracteres para buscar decisiones")
+
+    selected_years: list[int] = []
+    for value in years or ():
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("El filtro de año no es válido") from exc
+        if parsed < 1900 or parsed > 2200:
+            raise ValueError("El filtro de año no es válido")
+        if parsed not in selected_years:
+            selected_years.append(parsed)
+
+    text_pattern = f"%{_escape_like(normalized_query)}%"
+    identifier_pattern = f"%{_escape_like(_normalized_identifier(raw_query))}%"
+    clauses = [
+        "TRIM(COALESCE(r.decision_uid, '')) != ''",
+        "EXISTS ("
+        "SELECT 1 FROM pages ep JOIN chunks ec ON ec.page_id = ep.id "
+        "WHERE ep.document_id = r.document_id "
+        "AND ep.page_number BETWEEN r.page_number AND r.end_page_number"
+        ")",
+        "(r.normalized_product_name LIKE ? ESCAPE '\\' OR "
+        "r.normalized_active_ingredient LIKE ? ESCAPE '\\' OR "
+        "r.normalized_interested_party LIKE ? ESCAPE '\\' OR "
+        "r.normalized_expediente LIKE ? ESCAPE '\\' OR "
+        "r.normalized_radicado LIKE ? ESCAPE '\\' OR "
+        "LOWER(COALESCE(r.numeral, '')) LIKE ? ESCAPE '\\' OR "
+        "LOWER(COALESCE(r.request_text, '')) LIKE ? ESCAPE '\\' OR "
+        "LOWER(COALESCE(r.concept_text, '')) LIKE ? ESCAPE '\\' OR "
+        "LOWER(REPLACE(COALESCE(r.request_type_code, ''), '_', ' ')) "
+        "LIKE ? ESCAPE '\\' OR "
+        "LOWER(REPLACE(COALESCE(r.outcome_code, ''), '_', ' ')) "
+        "LIKE ? ESCAPE '\\')",
+    ]
+    parameters: list[object] = [
+        text_pattern,
+        text_pattern,
+        text_pattern,
+        identifier_pattern,
+        identifier_pattern,
+        text_pattern,
+        text_pattern,
+        text_pattern,
+        text_pattern,
+        text_pattern,
+    ]
+    if selected_years:
+        placeholders = ",".join("?" for _ in selected_years)
+        clauses.append(f"d.year IN ({placeholders})")
+        parameters.extend(sorted(selected_years))
+    where_sql = " WHERE " + " AND ".join(clauses)
+
+    with connect(database_path) as connection:
+        columns = _record_columns(connection)
+        required = {
+            "decision_uid",
+            "normalized_product_name",
+            "normalized_active_ingredient",
+            "normalized_interested_party",
+            "normalized_expediente",
+            "normalized_radicado",
+        }
+        if not required.issubset(columns):
+            return ComparisonSearchPage((), 0, 1, bounded_page_size, 1)
+        total_row = connection.execute(
+            "SELECT COUNT(*) FROM regulatory_records r "
+            "JOIN documents d ON d.id = r.document_id" + where_sql,
+            parameters,
+        ).fetchone()
+        total_matches = int(total_row[0] if total_row else 0)
+        total_pages = max(1, math.ceil(total_matches / bounded_page_size))
+        current_page = min(requested_page, total_pages)
+        offset = (current_page - 1) * bounded_page_size
+        rows = connection.execute(
+            """
+            SELECT r.id AS record_id, r.decision_uid, r.page_number,
+                   r.product_name, r.active_ingredient, r.interested_party,
+                   r.expediente, r.radicado, r.request_type_code,
+                   r.outcome_code, d.title, d.url, d.year, d.acta_number,
+                   d.section, d.part, d.source_type,
+                   (SELECT ec.id FROM pages ep JOIN chunks ec ON ec.page_id = ep.id
+                    WHERE ep.document_id = r.document_id
+                      AND ep.page_number BETWEEN r.page_number AND r.end_page_number
+                    ORDER BY ep.page_number, ec.chunk_index, ec.id LIMIT 1) AS chunk_id,
+                   (SELECT ec.text FROM pages ep JOIN chunks ec ON ec.page_id = ep.id
+                    WHERE ep.document_id = r.document_id
+                      AND ep.page_number BETWEEN r.page_number AND r.end_page_number
+                    ORDER BY ep.page_number, ec.chunk_index, ec.id LIMIT 1) AS chunk_text,
+                   (SELECT ep.page_number FROM pages ep
+                    WHERE ep.document_id = r.document_id
+                      AND ep.page_number BETWEEN r.page_number AND r.end_page_number
+                      AND EXISTS (SELECT 1 FROM chunks ec WHERE ec.page_id = ep.id)
+                    ORDER BY ep.page_number LIMIT 1) AS evidence_page
+            FROM regulatory_records r
+            JOIN documents d ON d.id = r.document_id
+            """
+            + where_sql
+            + " ORDER BY d.year DESC, d.acta_number DESC, r.page_number, r.id "
+            "LIMIT ? OFFSET ?",
+            [*parameters, bounded_page_size, offset],
+        ).fetchall()
+
+    items: list[ComparisonSearchItem] = []
+    for row in rows:
+        snapshot = {
+            "chunk_id": int(row["chunk_id"]),
+            "decision_uid": str(row["decision_uid"]),
+            "title": str(row["title"]),
+            "url": str(row["url"]),
+            "page": int(row["evidence_page"]),
+            "text": str(row["chunk_text"]),
+            "year": row["year"],
+            "acta_number": row["acta_number"],
+            "section": row["section"],
+            "part": row["part"],
+            "source_type": str(row["source_type"] or "official"),
+        }
+        items.append(
+            ComparisonSearchItem(
+                record_id=int(row["record_id"]),
+                decision_uid=str(row["decision_uid"]),
+                title=str(row["title"]),
+                year=row["year"],
+                acta_number=row["acta_number"],
+                page_number=int(row["page_number"]),
+                product_name=row["product_name"],
+                active_ingredient=row["active_ingredient"],
+                interested_party=row["interested_party"],
+                expediente=row["expediente"],
+                radicado=row["radicado"],
+                request_type=row["request_type_code"],
+                outcome_code=row["outcome_code"],
+                selection=snapshot,
+            )
+        )
+    return ComparisonSearchPage(
+        items=tuple(items),
+        total_matches=total_matches,
+        page=current_page,
+        page_size=bounded_page_size,
+        total_pages=total_pages,
+    )
+
+
 def _normalized_identifier(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", normalize_text(value))
 
 
 def _escape_like(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _timeline_comparable(value: object, *, identifier: bool, code: bool) -> str:
+    text = str(value or "")
+    if code:
+        text = text.replace("_", " ")
+    return _normalized_identifier(text) if identifier else normalize_text(text)
+
+
+def _date_bound(value: object | None, label: str) -> str | None:
+    if value in (None, ""):
+        return None
+    text = str(value)[:10]
+    try:
+        return date.fromisoformat(text).isoformat()
+    except ValueError as exc:
+        raise ValueError(f"La {label} no es válida; usa AAAA-MM-DD") from exc
 
 
 def _chronology_key(item: TimelineEntry):
@@ -867,6 +1186,8 @@ def search_timeline(
     years: Sequence[int] | None = None,
     origins: Sequence[str] | None = None,
     review_statuses: Sequence[str] | None = None,
+    start_date: object | None = None,
+    end_date: object | None = None,
 ) -> list[TimelineEntry]:
     """Construye una cronología híbrida, trazable y sin afirmar menciones.
 
@@ -881,7 +1202,13 @@ def search_timeline(
     if not database_path.exists():
         return []
     bounded_limit = max(1, min(int(limit), MAX_TIMELINE_ROWS))
-    normalized_column, display_column, is_identifier = _TIMELINE_FIELDS[field]
+    (
+        normalized_column,
+        display_column,
+        is_identifier,
+        allows_textual_fallback,
+    ) = _TIMELINE_FIELDS[field]
+    is_code_field = field in {"outcome", "request_type"}
     if isinstance(value, str):
         if len(value) > MAX_TIMELINE_QUERY_CHARS:
             raise ValueError(
@@ -890,10 +1217,10 @@ def search_timeline(
         raw_value = value
     else:
         raw_value = str(value or "")[:MAX_TIMELINE_QUERY_CHARS]
-    normalized_value = (
-        _normalized_identifier(raw_value)
-        if is_identifier
-        else normalize_text(raw_value)
+    normalized_value = _timeline_comparable(
+        raw_value,
+        identifier=is_identifier,
+        code=is_code_field,
     )[:200]
     if len(normalized_value) < 2:
         raise ValueError("Escribe al menos dos caracteres para la cronologia")
@@ -914,6 +1241,14 @@ def search_timeline(
     selected_statuses = {str(item) for item in review_statuses or ()}
     if selected_statuses - set(TIMELINE_REVIEW_STATUSES):
         raise ValueError("El filtro de revisión no es válido")
+    normalized_start_date = _date_bound(start_date, "fecha inicial")
+    normalized_end_date = _date_bound(end_date, "fecha final")
+    if (
+        normalized_start_date
+        and normalized_end_date
+        and normalized_start_date > normalized_end_date
+    ):
+        raise ValueError("La fecha inicial no puede ser posterior a la fecha final")
 
     review_values = _bounded_review_events(review_events)
     current_reviews = latest_reviews(review_values)
@@ -925,10 +1260,10 @@ def search_timeline(
             event.corrections.get(display_column),
             MAX_CELL_CHARS,
         )
-        comparable = (
-            _normalized_identifier(corrected_value)
-            if is_identifier
-            else normalize_text(corrected_value)
+        comparable = _timeline_comparable(
+            corrected_value,
+            identifier=is_identifier,
+            code=is_code_field,
         )
         if normalized_value in comparable:
             corrected_uids.append(uid)
@@ -974,6 +1309,17 @@ def search_timeline(
     def allowed(item: TimelineEntry) -> bool:
         if selected_years and item.year not in selected_years:
             return False
+        if normalized_start_date or normalized_end_date:
+            try:
+                session_date = date.fromisoformat(
+                    str(item.session_date or "")[:10]
+                ).isoformat()
+            except ValueError:
+                return False
+            if normalized_start_date and session_date < normalized_start_date:
+                return False
+            if normalized_end_date and session_date > normalized_end_date:
+                return False
         if selected_origins and item.match_origin not in selected_origins:
             return False
         status = item.review_status or (
@@ -1053,10 +1399,10 @@ def search_timeline(
         candidate_value = effective_value
         if not review_controls_field and evidence_value not in (None, ""):
             candidate_value = _bounded_text(evidence_value, MAX_CELL_CHARS)
-        effective_comparable = (
-            _normalized_identifier(candidate_value)
-            if is_identifier
-            else normalize_text(candidate_value)
+        effective_comparable = _timeline_comparable(
+            candidate_value,
+            identifier=is_identifier,
+            code=is_code_field,
         )
         if normalized_value not in effective_comparable:
             return
@@ -1133,9 +1479,12 @@ def search_timeline(
             year_placeholders = ",".join("?" for _ in selected_years)
             year_clause = f" AND d.year IN ({year_placeholders})"
             year_parameters = sorted(selected_years)
+        normalized_sql = f"r.{normalized_column}"
+        if is_code_field:
+            normalized_sql = f"LOWER(REPLACE(r.{normalized_column}, '_', ' '))"
         cursor = connection.execute(
             select_sql
-            + f" WHERE r.{normalized_column} LIKE ? ESCAPE '\\'"
+            + f" WHERE {normalized_sql} LIKE ? ESCAPE '\\'"
             + year_clause,
             (pattern, *year_parameters),
         )
@@ -1203,10 +1552,15 @@ def search_timeline(
                 "JOIN regulatory_field_evidence f "
                 f"ON f.{record_fk} = r.id",
             )
+            evidence_value_sql = f"f.{normalized_evidence_column}"
+            if is_code_field:
+                evidence_value_sql = (
+                    f"LOWER(REPLACE(f.{normalized_evidence_column}, '_', ' '))"
+                )
             evidence_rows = connection.execute(
                 evidence_select
                 + f" WHERE f.{field_name_column} IN ({field_placeholders})"
-                + f" AND f.{normalized_evidence_column} LIKE ? ESCAPE '\\'"
+                + f" AND {evidence_value_sql} LIKE ? ESCAPE '\\'"
                 + year_clause,
                 [*field_names, pattern, *year_parameters],
             ).fetchall()
@@ -1226,7 +1580,9 @@ def search_timeline(
 
         # FTS5 es el último respaldo. El valor consultado nunca se copia al
         # campo regulatorio: se conserva como una mención textual con evidencia.
-        if not selected_origins or "textual" in selected_origins:
+        if allows_textual_fallback and (
+            not selected_origins or "textual" in selected_origins
+        ):
             clean_phrase = normalize_text(raw_value).replace('"', " ").strip()
             query_tokens = [
                 token
@@ -1264,10 +1620,10 @@ def search_timeline(
                 ).fetchall()
                 matching_rows = []
                 for row in fts_rows:
-                    text_comparable = (
-                        _normalized_identifier(str(row["text"]))
-                        if is_identifier
-                        else normalize_text(str(row["text"]))
+                    text_comparable = _timeline_comparable(
+                        row["text"],
+                        identifier=is_identifier,
+                        code=is_code_field,
                     )
                     if normalized_value in text_comparable:
                         matching_rows.append(row)
@@ -1298,10 +1654,10 @@ def search_timeline(
                                     record.get(display_column),
                                     MAX_CELL_CHARS,
                                 )
-                                corrected_comparable = (
-                                    _normalized_identifier(corrected_value)
-                                    if is_identifier
-                                    else normalize_text(corrected_value)
+                                corrected_comparable = _timeline_comparable(
+                                    corrected_value,
+                                    identifier=is_identifier,
+                                    code=is_code_field,
                                 )
                                 if normalized_value not in corrected_comparable:
                                     # La mención puede corresponder al valor
@@ -1365,6 +1721,72 @@ def search_timeline(
     return prioritized
 
 
+def search_timeline_page(
+    database_path: Path,
+    field: str,
+    value: str,
+    *,
+    page: int = 1,
+    page_size: int = 25,
+    review_events: Iterable[ReviewEvent] = (),
+    years: Sequence[int] | None = None,
+    origins: Sequence[str] | None = None,
+    review_statuses: Sequence[str] | None = None,
+    start_date: object | None = None,
+    end_date: object | None = None,
+) -> TimelineSearchPage:
+    """Pagina una cronología y hace explícito el límite de seguridad.
+
+    El total es exacto mientras sea menor que ``MAX_TIMELINE_ROWS``. Cuando se
+    alcanza ese máximo, ``truncated`` indica que pueden existir más decisiones.
+    """
+
+    loaded = search_timeline(
+        database_path,
+        field,
+        value,
+        limit=MAX_TIMELINE_ROWS,
+        review_events=review_events,
+        years=years,
+        origins=origins,
+        review_statuses=review_statuses,
+        start_date=start_date,
+        end_date=end_date,
+    )
+    return paginate_timeline(loaded, page=page, page_size=page_size)
+
+
+def paginate_timeline(
+    entries: Sequence[TimelineEntry],
+    *,
+    page: int = 1,
+    page_size: int = 25,
+) -> TimelineSearchPage:
+    """Pagina resultados ya recuperados para no repetir la consulta en la UI."""
+
+    try:
+        requested_page = int(page)
+        bounded_page_size = int(page_size)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Parámetros de paginación inválidos") from exc
+    if requested_page < 1 or bounded_page_size < 1:
+        raise ValueError("Parámetros de paginación inválidos")
+    bounded_page_size = min(bounded_page_size, 100)
+    loaded = list(entries[:MAX_TIMELINE_ROWS])
+    total_loaded = len(loaded)
+    total_pages = max(1, math.ceil(total_loaded / bounded_page_size))
+    current_page = min(requested_page, total_pages)
+    start = (current_page - 1) * bounded_page_size
+    return TimelineSearchPage(
+        entries=tuple(loaded[start : start + bounded_page_size]),
+        total_loaded=total_loaded,
+        page=current_page,
+        page_size=bounded_page_size,
+        total_pages=total_pages,
+        truncated=total_loaded >= MAX_TIMELINE_ROWS,
+    )
+
+
 _OUTCOME_LABELS = {
     "aprobado": "Aprobado",
     "negado": "Negado",
@@ -1386,9 +1808,9 @@ _REVIEW_STATUS_LABELS = {
 }
 
 _MATCH_ORIGIN_LABELS = {
-    "verified": "Verificada/corregida",
-    "reviewed": "Revisada/corregida",
-    "structured": "Estructurada automática",
+    "verified": "Ficha estructurada",
+    "reviewed": "Ficha estructurada",
+    "structured": "Ficha estructurada",
     "inferred": "Inferida automáticamente",
     "textual": "Mención textual",
 }
@@ -1455,13 +1877,6 @@ def comparison_matrix(decisions: Sequence[ComparisonDecision]) -> list[dict[str,
                 for source in item.evidences
             ),
         ),
-        (
-            "Estado de revisión",
-            _decision_review_label,
-        ),
-        ("Revisor", lambda item: item.reviewer),
-        ("Fecha de revisión", lambda item: item.reviewed_at),
-        ("Notas de revisión", lambda item: item.review_notes),
     ]
     matrix: list[dict[str, str]] = []
     for field_label, getter in fields:
@@ -1470,6 +1885,47 @@ def comparison_matrix(decisions: Sequence[ComparisonDecision]) -> list[dict[str,
             row[f"Decision {index}"] = str(display_value(getter(decision)))
         matrix.append(row)
     return matrix
+
+
+def comparison_differences(
+    decisions: Sequence[ComparisonDecision],
+) -> list[dict[str, object]]:
+    """Resume únicamente los campos cuyo valor cambia entre decisiones."""
+
+    selected = list(decisions[:MAX_COMPARISON_ITEMS])
+    if len(selected) < 2:
+        return []
+    ignored = {
+        "Evidencia seleccionada",
+        "Estado de revisión",
+        "Revisor",
+        "Fecha de revisión",
+        "Notas de revisión",
+    }
+    differences: list[dict[str, object]] = []
+    for row in comparison_matrix(selected):
+        field = str(row["Campo"])
+        if field in ignored:
+            continue
+        values = [str(row[f"Decision {index}"]) for index in range(1, len(selected) + 1)]
+        comparable = {
+            normalize_text(value).replace("\n", " ")
+            for value in values
+        }
+        if len(comparable) <= 1:
+            continue
+        details = "\n".join(
+            f"D{index}: {_bounded_text(value, 600)}"
+            for index, value in enumerate(values, start=1)
+        )
+        differences.append(
+            {
+                "Campo": field,
+                "Valores distintos": len(comparable),
+                "Detalle": details,
+            }
+        )
+    return differences
 
 
 def _safe_csv_cell(value: object) -> str:
@@ -1525,10 +1981,6 @@ def comparison_to_csv(decisions: Sequence[ComparisonDecision]) -> bytes:
         "paginas",
         "evidencia_seleccionada",
         "enlaces_evidencia",
-        "estado_revision",
-        "revisor",
-        "fecha_revision",
-        "notas_revision",
         "fuente",
     )
     rows = []
@@ -1562,10 +2014,6 @@ def comparison_to_csv(decisions: Sequence[ComparisonDecision]) -> bytes:
                 _pages_label(item.page_number, item.end_page_number),
                 evidence,
                 evidence_links,
-                _decision_review_label(item),
-                item.reviewer,
-                item.reviewed_at,
-                item.review_notes,
                 _page_href(item.url, item.page_number),
             )
         )
@@ -1575,7 +2023,7 @@ def comparison_to_csv(decisions: Sequence[ComparisonDecision]) -> bytes:
 def timeline_to_csv(entries: Sequence[TimelineEntry]) -> bytes:
     headers = (
         "decision_uid",
-        "identificador_revision",
+        "identificador_decision",
         "ano",
         "acta",
         "fecha_sesion",
@@ -1591,10 +2039,6 @@ def timeline_to_csv(entries: Sequence[TimelineEntry]) -> bytes:
         "paginas",
         "solicitud",
         "concepto",
-        "estado_revision",
-        "revisor",
-        "fecha_revision",
-        "notas_revision",
         "origen_coincidencia",
         "confianza",
         "pagina_coincidencia",
@@ -1621,10 +2065,6 @@ def timeline_to_csv(entries: Sequence[TimelineEntry]) -> bytes:
             _pages_label(item.page_number, item.end_page_number),
             item.request_text,
             item.concept_text,
-            review_status_label(item.review_status),
-            item.reviewer,
-            item.reviewed_at,
-            item.review_notes,
             match_origin_label(item.match_origin),
             item.confidence,
             item.match_page,
@@ -1747,7 +2187,6 @@ def printable_html_report(
                 f"<td>{_html_value(item.expediente)}</td>"
                 f"<td>{_html_value(item.radicado)}</td>"
                 f"<td>{_html_value(outcome_label(item.outcome_code))}</td>"
-                f"<td>{_html_value(review_status_label(item.review_status))}</td>"
                 f"<td>{_html_value(match_origin_label(item.match_origin))}</td>"
                 f"<td>{_html_link(item.url, item.match_page or item.page_number, 'Pagina ' + str(item.match_page or item.page_number))}</td>"
                 "</tr>"
@@ -1788,7 +2227,7 @@ def printable_html_report(
                 f"{_html_value(match_origin_label(item.match_origin))}"
                 f" · <strong>Página:</strong> {_html_value(item.match_page)}</p>"
                 f"{primary_evidence}"
-                f"<p><strong>ID para revisión:</strong> "
+                f"<p><strong>Identificador de decisión:</strong> "
                 f"{_html_value(item.review_identifier)}</p>"
                 f"{grouped_mentions}"
                 f"<p><strong>Solicitud:</strong> {_html_value(request)}</p>"
@@ -1806,7 +2245,7 @@ def printable_html_report(
             "<section><h2>Cronología</h2><table><thead><tr>"
             "<th>Ano</th><th>Fecha</th><th>Acta</th><th>Numeral</th>"
             "<th>Producto</th><th>Principio activo</th><th>Expediente</th>"
-            "<th>Radicado</th><th>Resultado</th><th>Revision</th>"
+            "<th>Radicado</th><th>Resultado</th>"
             "<th>Coincidencia</th><th>Fuente</th>"
             "</tr></thead><tbody>"
             + "".join(rows)

@@ -1,13 +1,12 @@
-# Explorador de Actas INVIMA + Analista IA
+# Explorador de Actas INVIMA
 
-Aplicación privada en Streamlit para explorar actas públicas del INVIMA y
-formular preguntas con respuestas sustentadas en documento y página.
+Aplicación privada en Streamlit para consultar, comparar y analizar las actas
+públicas del INVIMA con trazabilidad al documento y a la página de origen.
 
 Este proyecto conserva las mejores ideas del prototipo
 `pdf-search-nn-streamlit` —manifiesto de URLs, descarga de PDFs, extracción por
 página y preparación de contexto— y reemplaza el índice JSON por SQLite FTS5,
-filtros estructurados y una integración opcional con un proveedor de IA
-aprobado.
+filtros estructurados y búsqueda semántica local.
 
 ## Alcance
 
@@ -26,31 +25,33 @@ aprobado.
   principio activo, interesado, expediente y radicado.
 - Resultados agrupados por acta, paginados, ordenables y con términos
   resaltados de forma segura.
-- Visor integrado de la página exacta del PDF, con navegación entre páginas.
-- Selección de evidencias en el Explorador para analizarlas directamente en el
-  Analista IA.
+- Visor integrado del PDF con apertura en la página exacta, salto de página,
+  zoom, rotación, búsqueda y copia de texto.
+- Selección de evidencias en el Explorador para compararlas directamente.
 - Tablero inicial con cobertura real, rango de años, documentos recientes y
   estado de las capacidades.
 - Extracción determinística de producto, principio activo, interesado,
   expediente, radicado, solicitud, concepto y resultado normalizado. Estos
-  campos se presentan como ayuda pendiente de verificación humana.
+  campos facilitan la consulta y siempre pueden contrastarse con la evidencia
+  del PDF oficial.
 - Evidencia con título, página, fragmento y URL de origen claramente identificada.
-- Analista IA con citas `[F#]` y negativa cuando no hay evidencia.
-- Modo `prompt_only` para trabajar sin enviar consultas a servicios externos.
-- Compatibilidad opcional con OpenAI o Azure OpenAI.
+- Modo `prompt_only`, sin consulta generativa ni envío de preguntas a servicios
+  externos.
 - Administración del manifiesto e indexación desde la interfaz o por CLI.
 - Índice SQLite compacto, empaquetado en partes verificadas con SHA-256.
-- Índice semántico SQLite independiente, local y cuantizado para limitar su
-  tamaño; si no está disponible, la aplicación vuelve automáticamente a FTS5.
+- Índice semántico SQLite independiente con representaciones neuronales
+  multilingües locales y cuantizadas; si ese complemento no está disponible,
+  la aplicación conserva la búsqueda semántica determinística y FTS5.
 - Informe de integridad visible desde la aplicación.
 - Auditoría por capas: página oficial → catálogo → manifiesto → índice, con
   snapshot y huella SHA-256 del último descubrimiento válido.
 - Fichas enriquecidas con numeral, título, fecha de sesión, tipo de solicitud e
   identificador estable independiente del enlace del PDF.
-- Cola protegida para corregir, revisar, aprobar o reabrir fichas, conservando
-  la huella de la extracción y un historial portable de eventos.
-- Comparación lado a lado, cronologías por producto, principio activo,
-  expediente o radicado, exportación CSV y reporte imprimible a PDF.
+- Búsqueda directa y paginada de fichas dentro de **Comparar**, diferencias
+  resaltadas y acceso al visor desde cada evidencia.
+- Cronologías paginadas por producto, principio activo, expediente, radicado,
+  interesado, resultado o tipo de solicitud, con filtros, total de resultados,
+  exportación CSV y reporte imprimible.
 - Actualización incremental para descargar e indexar únicamente actas nuevas.
 - Automatización completa: el catálogo lanza el índice cuando detecta cambios o
   documentos pendientes, sin intervención manual.
@@ -63,26 +64,60 @@ aprobado.
 
 No contiene funcionalidades relacionadas con un monitor de transparencia.
 
-## Cambios visibles en la versión 0.7.2
+## Cambios visibles en la versión 0.9.0
+
+La 0.9.0 renueva la experiencia de uso sin cambiar el corpus, los manifiestos,
+las bases publicadas ni el funcionamiento de búsqueda incorporado en la 0.8.0.
+
+| Área | Mejora |
+|---|---|
+| Navegación | Una barra superior reúne **Inicio**, **Explorar**, **Comparar** y **Analizar fuentes**; **Catálogo**, **Integridad** y **Administración** quedan organizados por función |
+| Sistema visual | Componentes, tipografía, espaciado, estados y controles comparten un estilo consistente que funciona con los temas claro y oscuro de Streamlit |
+| Portada | La búsqueda es la acción principal; tres accesos orientados por tarea llevan a explorar, comparar o preparar un análisis y los indicadores técnicos quedan en un detalle desplegable |
+| Explorador | Los resultados usan una vista lista–detalle, filtros agrupados y restablecibles, estados vacíos claros, selección de evidencias y acceso inmediato a la página de origen |
+| Visor | La evidencia permanece junto a los resultados y conserva salto de página, navegación, zoom, rotación, búsqueda, copia de texto, descarga y apertura del PDF oficial |
+| Comparar y cronología | La selección, las diferencias, la matriz, las fuentes y la cronología tienen una jerarquía más clara; se mantienen filtros, paginación y descargas |
+| Páginas secundarias | Analizar fuentes, Catálogo, Integridad y Administración adoptan los mismos títulos, ayudas, contenedores y estados visuales |
+| Enfoque documental | Se retiran de la interfaz las referencias a flujos de evaluación o corrección; las actas continúan siendo el insumo de consulta y análisis |
+
+La interfaz sigue construida con controles nativos de Streamlit. El estilo
+compartido vive en `services/ui_helpers.py`, mientras que los temas claro y
+oscuro se definen en `.streamlit/config.toml`. Esta actualización no añade un
+frontend separado, componentes JavaScript ni dependencias de imágenes o
+fuentes externas.
+
+Si el índice ya fue reconstruido con la versión 0.8.0, instalar la 0.9.0 solo
+requiere subir el código, esperar **Pruebas** y dejar que Streamlit se
+redespliegue. No se debe ejecutar **Construir índice** por este cambio visual.
+Si la aplicación sigue en la 0.7, la entrega 0.9.0 sustituye también el código
+de la 0.8.0 y sí exige ejecutar **Construir índice** una vez para activar sus
+mejoras de extracción y semántica.
+
+El alcance cerrado de esta entrega está en `ALCANCE_V0.9.md`. Los documentos
+`ALCANCE_V0.7.md` y `ALCANCE_V0.8.md` se conservan como registro histórico.
+
+## Cambios incorporados en la versión 0.8.0
 
 | Módulo | Mejora |
 |---|---|
-| Fuente | El esquema 6 inventaría cada página física; conserva el texto original o, si falla, el error, además del origen PDF/OCR, calidad y versión del extractor |
-| Extracción | Extractor regulatorio v5: corrige falsos numerales dentro de conceptos, variantes históricas de rótulos, pies concatenados y colisiones de evidencia |
-| Evidencia | Cada campo automático muestra valor literal, normalizado y canónico, página, fragmento, método y confianza |
-| Correcciones | Un único valor vigente se aplica en filtros, búsqueda, fichas, comparación, cronología y exportaciones |
-| Cronología | Combina datos verificados, estructurados, inferidos y menciones textuales sin confundirlos |
-| Enfoque | Se retiran la página Evaluación, el banco de casos y sus métricas; la herramienta queda centrada en consulta y análisis documental |
-| Publicación | Solo bloquean fallos técnicos: pérdida de documentos o páginas, integridad, identidades, índice semántico y paquetes; los campos derivados generan advertencias |
-| Rendimiento | La reconciliación reutiliza comparaciones de texto y evita repetir el cálculo costoso entre las mismas fichas |
+| Extracción masiva | El extractor reconoce más disposiciones históricas, rótulos regulatorios, productos, composiciones, principios activos, solicitudes y conceptos a partir del texto fuente ya almacenado |
+| Semántica neuronal | Se añade un modelo multilingüe local para mejorar el orden de candidatos; el buscador conserva una ruta de respaldo cuando el modelo no puede cargarse |
+| Comparación | Las fichas se buscan y agregan desde la propia página, con paginación y diferencias visibles entre campos |
+| Cronología | Incorpora nuevos ejes y filtros, informa el total y pagina conjuntos extensos sin confundir una mención textual con un campo estructurado |
+| Visor | Permite saltar de página, ampliar, rotar, buscar y copiar texto, y abrir la evidencia desde Explorador, el asistente de fuentes o Comparar |
+| Seguridad documental | La caché comprueba la identidad y la huella del PDF antes de reutilizarlo para evitar asociaciones incorrectas |
+| Enfoque | No hay módulos de evaluación o corrección manual; `prompt_only` mantiene inactiva por defecto la compatibilidad opcional con proveedores generativos |
 
-La 0.7.2 no añade funciones de IA. Su objetivo es que el corpus histórico y
-las fichas que utilizará una versión posterior sean completos, trazables y
-reproducibles.
+La ampliación del extractor no implica una métrica de exactitud todavía no
+medida. Los campos derivados siguen siendo ayudas de navegación y deben
+contrastarse con el texto y la página del PDF oficial.
 
 `LLM_PROVIDER = "prompt_only"` puede mantenerse sin cambios. Ese ajuste solo
-controla la generación de respuestas; la búsqueda semántica de esta versión se
-ejecuta localmente y no necesita una clave de IA.
+evita llamadas generativas; la búsqueda semántica neuronal de esta versión se
+ejecuta localmente y no necesita una clave de API.
+
+El alcance histórico de la 0.7.2 se conserva en `ALCANCE_V0.7.md` y el alcance
+cerrado de la base técnica 0.8.0 está en `ALCANCE_V0.8.md`.
 
 ### Cobertura heredada antes de la primera actualización
 
@@ -114,6 +149,8 @@ todo el histórico visible desde 2013; el año inicial se configura con
 
 ```text
 .
+├── .streamlit/
+│   └── config.toml
 ├── home.py
 ├── pages/
 │   ├── 1_Explorador.py
@@ -121,8 +158,7 @@ todo el histórico visible desde 2013; el año inicial se configura con
 │   ├── 3_Administracion.py
 │   ├── 4_Integridad.py
 │   ├── 5_Catalogo.py
-│   ├── 7_Comparar.py
-│   └── 8_Revision_Fichas.py
+│   └── 7_Comparar.py
 ├── services/
 │   ├── catalog.py
 │   ├── corpus_status.py
@@ -143,7 +179,8 @@ todo el histórico visible desde 2013; el año inicial se configura con
 │   ├── retrieval.py
 │   ├── search.py
 │   ├── semantic.py
-│   └── text_utils.py
+│   ├── text_utils.py
+│   └── ui_helpers.py
 ├── tests/
 ├── actas_catalog.csv
 ├── documents_manifest.csv
@@ -151,8 +188,11 @@ todo el histórico visible desde 2013; el año inicial se configura con
 ├── check_index_pending.py
 ├── reprocess_corpus.py
 ├── package_index.py
-├── packages.txt
 ├── sync_catalog.py
+├── ALCANCE_V0.7.md
+├── ALCANCE_V0.8.md
+├── ALCANCE_V0.9.md
+├── INSTRUCCIONES_ACTUALIZACION.md
 └── requirements.txt
 ```
 
@@ -186,8 +226,8 @@ hacerse desde GitHub Actions:
 
 El workflow **Construir índice** sigue disponible para una ejecución manual,
 pero ya no es necesario lanzarlo cada vez que aparece un acta nueva. Se usa
-para actualizaciones incrementales normales. La reconstrucción histórica de la
-0.7 se realiza con el workflow separado **Reprocesar estructura y fichas**.
+para actualizaciones incrementales normales y para activar una nueva versión
+del extractor sobre el texto fuente ya almacenado.
 
 El flujo de construcción del índice:
 
@@ -199,7 +239,8 @@ El flujo de construcción del índice:
    puedan recuperarse;
 5. migra de forma aditiva el esquema anterior y extrae los campos regulatorios
    desde los fragmentos ya almacenados;
-6. construye o actualiza el índice semántico local;
+6. construye o actualiza el índice semántico local, incluido el complemento
+   neuronal multilingüe cuando está disponible;
 7. genera informes de ejecución, integridad y cobertura por año;
 8. comprime ambas bases, calcula hashes y las divide en fragmentos de 90 MiB;
 9. guarda los índices y los informes automáticamente en el repositorio privado.
@@ -218,49 +259,57 @@ horas y aumentar considerablemente el tamaño de la base. El workflow dispone de
 un máximo de seis horas, conserva los PDF descargados en caché y deja los
 documentos fallidos pendientes para reintentarlos sin perder los correctos.
 
-La primera instalación de la 0.7 migra de forma compatible al esquema 6, pero
-el texto fuente histórico solo queda completo después del reprocesamiento
-controlado. Abre **Actions → Reprocesar estructura y fichas**: primero ejecuta
-el modo `diagnostic` y luego el modo `publish` cuando todos los controles
-técnicos estén aprobados. Ese flujo trabaja sobre una candidata separada,
-permite continuar una ejecución y nunca reemplaza la base publicada durante el
-diagnóstico. Después, las actualizaciones normales vuelven a ser incrementales.
+Al instalar la 0.8 sobre una base 0.7.2 ya publicada basta con una ejecución de
+**Construir índice**. El cambio de versión del extractor hace que las fichas se
+calculen otra vez a partir del texto fuente conservado en SQLite; no es
+necesario volver a descargar los PDF que ya están representados en la base. La
+misma ejecución crea el nuevo índice semántico, verifica los paquetes y realiza
+el commit que activa el redespliegue de Streamlit.
 
-Los puntos de continuación están vinculados al código de extracción, al entorno
-y a la huella de la base publicada. Después de cambiar cualquiera de ellos se
-debe iniciar con `resume_run_id` vacío; la caché separada de PDF evita volver a
-descargar normalmente los documentos. El resumen de GitHub distingue entre un
-workflow que terminó y una candidata realmente aprobada. Los cambios de
-completitud en campos estructurados se informan como advertencias porque el PDF
-oficial es la fuente documental; no existe un banco de evaluación como requisito
-de publicación.
+La actualización de 0.8.0 a 0.9.0 no cambia el esquema ni el contenido del
+índice. Si esa reconstrucción ya se completó, basta con actualizar el código,
+esperar **Pruebas** y el redespliegue de Streamlit; no se debe reconstruir la
+base por el rediseño de interfaz.
 
 Ya no existe una casilla `full_rebuild` en el workflow normal. Esto evita que
 una reconstrucción total pueda iniciarse accidentalmente desde la acción
 destinada a incorporar actas nuevas.
 
-## Configuración segura de IA
+## Configuración sin IA generativa
 
-El modo predeterminado es `prompt_only`. En este modo la aplicación busca las
-fuentes y genera un contexto para copiar al LLM corporativo aprobado, sin hacer
-llamadas externas.
+La versión 0.9.0 se opera con `LLM_PROVIDER = "prompt_only"`. El buscador recupera
+fuentes sin enviar la consulta a un LLM y el complemento semántico se ejecuta
+localmente. No hace falta configurar una clave de OpenAI ni de Azure OpenAI.
 
-Para habilitar un proveedor, copia el contenido necesario de
-`.streamlit/secrets.toml.example` a `.streamlit/secrets.toml`. Este último está
-excluido de Git y nunca debe subirse al repositorio.
+### Índice neuronal multilingüe
+
+El backend predeterminado es `ACTAS_SEMANTIC_BACKEND=neural`. Usa
+`fastembed==0.8.0` y el modelo ONNX cuantizado
+`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` del registro
+versionado `fastembed-0.8.0-registry`. Tanto el modelo como su registro forman
+parte de la firma del índice, de modo que un cambio obliga a reconstruirlo. Los
+vectores se normalizan y se guardan cuantizados a `int8` dentro de
+`semantic.db`.
+
+La consulta comprueba que la huella exacta de IDs, relaciones y texto de
+`actas.db` coincida con la registrada en `semantic.db`. Si no coincide, no usa
+los vectores y vuelve automáticamente a FTS5. Si FastEmbed o el modelo no pueden
+cargarse, conserva el reranking semántico determinístico anterior. Se puede
+forzar esa ruta ligera con `ACTAS_SEMANTIC_BACKEND=local`.
+
+El primer uso tras un despliegue puede tardar mientras FastEmbed descarga el
+modelo de aproximadamente 0,22 GB; ninguna consulta se envía a un servicio de
+inferencia. GitHub Actions conserva el modelo en caché. En la validación de una
+base candidata, `build_index.py --fail-on-semantic-error` exige además que el
+complemento neuronal configurado haya quedado completo; la construcción normal
+puede publicar el respaldo local y reintentarlo posteriormente.
 
 La página de Administración exige `ADMIN_PASSWORD`. Si no se configura, queda
 deshabilitada y el índice solo puede construirse mediante `python build_index.py`.
 
-Valores admitidos para `LLM_PROVIDER`:
-
-- `prompt_only`
-- `openai`
-- `azure_openai`
-
-La integración debe habilitarse únicamente después de la aprobación de
-Seguridad de la Información. Aunque las actas son públicas, las preguntas de
-los usuarios podrían contener contexto corporativo.
+`.streamlit/secrets.toml` está excluido de Git y nunca debe subirse al
+repositorio. `ADMIN_PASSWORD` debe reemplazarse por una contraseña privada si se
+habilita la página de Administración.
 
 ## Despliegue en Streamlit Community Cloud
 
@@ -268,12 +317,9 @@ los usuarios podrían contener contexto corporativo.
 2. Subir el contenido de este proyecto.
 3. Crear una aplicación en Streamlit Community Cloud usando `home.py`.
 4. Configurar los secretos desde el panel de Streamlit, nunca en GitHub.
-5. Ejecutar **Actions → Actualizar catálogo desde INVIMA → Run workflow**.
-6. Para una actualización normal, ejecutar una vez **Actions → Construir índice
-   → Run workflow**.
-7. Para habilitar íntegramente el extractor 0.7 sobre el histórico, seguir
-   `INSTRUCCIONES_ACTUALIZACION.md` y usar **Reprocesar estructura y fichas**.
-8. Esperar el nuevo despliegue automático de Streamlit.
+5. Esperar que **Pruebas** termine en verde.
+6. Ejecutar una vez **Actions → Construir índice → Run workflow**.
+7. Esperar el commit automático del índice y el nuevo despliegue de Streamlit.
 
 El sistema de archivos de una aplicación alojada no debe considerarse una base
 de datos permanente. Para el piloto, la acción versiona el índice comprimido y
@@ -354,21 +400,11 @@ PDF mostrada en el visor.
 ## Comparación y trazabilidad
 
 Desde el **Explorador** se pueden marcar evidencias y enviarlas a **Comparar**.
-Allí se muestran las fichas lado a lado, se pueden construir cronologías y se
-pueden descargar un CSV compatible con Excel y un reporte HTML que el navegador
-permite guardar como PDF.
-
-La página opcional **Revisión de fichas** nunca modifica las actas. Guarda
-observaciones sobre los campos derivados, separadas del índice automático:
-una reconstrucción no sobrescribe las correcciones. Si cambia el PDF o el valor
-extraído que sustentaba una revisión, la aplicación exige reconfirmarla. La
-reconciliación combina identificadores, página, texto, campos y orden, siempre
-uno-a-uno. Cuando no hay correspondencia segura ni revisión involucrada conserva
-el caso en el informe como `not_inherited` y crea un UID nuevo; si una duda deja
-una revisión huérfana o ambigua, la publicación se bloquea. En el piloto,
-el archivo escrito por Streamlit es temporal; tras revisar, descarga
-`regulatory-review-log.csv` y haz commit en `data/` para conservar el historial.
-Para producción se debe sustituir este mecanismo por una base persistente y SSO.
+También es posible buscar fichas directamente en esa página, agregarlas a la
+selección, recorrer los resultados por páginas y ver qué campos difieren antes
+de abrir la evidencia en el visor. La misma página construye cronologías con
+ejes y filtros ampliados, informa el total y permite descargar un CSV compatible
+con Excel y un reporte imprimible.
 
 ## Verificación
 
@@ -382,17 +418,23 @@ Antes de publicar una versión se debe comprobar:
 
 - que cada resultado abre el documento correcto;
 - que el número de página coincide con el PDF;
-- que la IA utiliza únicamente etiquetas `[F#]` disponibles;
 - que no se registran preguntas, secretos ni información corporativa;
+- que el modo neuronal ordena resultados y que su ruta de respaldo sigue
+  respondiendo si el modelo local no está disponible;
+- que la comparación resalta diferencias y la cronología pagina sin duplicar
+  fichas;
+- que el visor abre la evidencia correcta y permite navegar, ampliar, rotar,
+  buscar y copiar texto;
 - que las páginas recuperadas con OCR sean legibles y que las restantes queden
-  identificadas como candidatas para revisión.
+  identificadas como candidatas para comprobación documental.
 
 El flujo `.github/workflows/tests.yml` repite automáticamente la compilación y
-las pruebas con Python 3.12 después de cada cambio enviado a GitHub. La versión
-0.7.2 usa directamente la API `pymupdf`, sin depender del nombre heredado
+las pruebas con Python 3.12 después de cada cambio enviado a GitHub. Desde la
+versión 0.8.0 se usa directamente la API `pymupdf`, sin depender del nombre heredado
 `fitz`, y Tesseract se instala dentro del runner de GitHub. La búsqueda
-semántica también es local y usa únicamente la biblioteca estándar de Python.
-No requiere instalar herramientas de desarrollo en el computador corporativo.
+neuronal usa un modelo multilingüe local a través de FastEmbed y conserva el
+índice semántico determinístico como respaldo. No requiere instalar herramientas
+de desarrollo en el computador corporativo.
 
 ## Propiedad y distribución
 

@@ -70,6 +70,31 @@ class SearchServiceTests(unittest.TestCase):
         self.assertEqual(response.used_mode, "textual")
         self.assertEqual(response.results[0].title, "Acta envase")
 
+    def test_stale_semantic_index_falls_back_without_hydrating_wrong_ids(self) -> None:
+        insert_document(
+            self.database_path,
+            DocumentMetadata(
+                title="Acta nueva",
+                url="https://www.invima.gov.co/biblioteca/download/nueva",
+                year=2026,
+                acta_number="04",
+                section="SEMPB",
+            ),
+            "hash-nueva",
+            [{"page": 1, "chunks": ["liraglutida incorporada recientemente"]}],
+        )
+        response = search_corpus(
+            self.database_path,
+            self.semantic_path,
+            "liraglutida",
+            mode="hybrid",
+            top_k=3,
+        )
+        self.assertEqual(response.used_mode, "textual")
+        self.assertFalse(response.semantic_available)
+        self.assertIn("no corresponde", response.semantic_message)
+        self.assertEqual(response.results[0].title, "Acta nueva")
+
     def test_semantic_results_are_diversified_before_final_limit(self) -> None:
         root = Path(self.temporary.name)
         database = root / "diverse-actas.db"

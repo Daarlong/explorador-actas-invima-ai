@@ -11,7 +11,7 @@ from services.database import (
 )
 from services.models import SearchResult
 from services.semantic import (
-    combine_rankings,
+    reciprocal_rank_fusion,
     semantic_index_status,
     semantic_search,
 )
@@ -76,7 +76,12 @@ def search_corpus(
     if top_k < 1:
         raise ValueError("top_k debe ser mayor que cero")
 
-    semantic_state = semantic_index_status(semantic_index_path)
+    # Un semantic.db válido pero construido para otra actas.db es más
+    # peligroso que no tenerlo: los IDs hidratarían fragmentos equivocados.
+    semantic_state = semantic_index_status(
+        semantic_index_path,
+        database_path,
+    )
     semantic_available = bool(semantic_state.get("available"))
     semantic_message = str(semantic_state.get("message", ""))
     used_mode = mode
@@ -153,11 +158,11 @@ def search_corpus(
         )
 
     lexical_scores = {result.chunk_id: result.score for result in lexical_results}
-    fused = combine_rankings(
+    fused = reciprocal_rank_fusion(
         lexical_scores,
         semantic_scores,
-        lexical_weight=0.65,
-        semantic_weight=0.35,
+        lexical_weight=0.60,
+        semantic_weight=0.40,
         top_k=candidate_limit,
         include_semantic_only=True,
     )

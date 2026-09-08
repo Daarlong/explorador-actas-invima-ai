@@ -22,7 +22,7 @@ from services.text_utils import normalize_text, tokenize_query
 
 DATABASE_SCHEMA_VERSION = 6
 
-REGULATORY_EXTRACTOR_VERSION = "5"
+REGULATORY_EXTRACTOR_VERSION = "6"
 PAGE_TEXT_CODEC = "zlib-utf8-v1"
 PAGE_TEXT_EXTRACTOR_VERSION = "pymupdf-text-v1"
 PAGE_TEXT_SOURCES = frozenset({"native_pdf", "ocr"})

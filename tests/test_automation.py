@@ -127,6 +127,58 @@ class AutomationTests(unittest.TestCase):
         self.assertFalse(status["needs_update"])
         self.assertEqual(status["reason"], "complete")
 
+    def test_combined_status_detects_an_outdated_neural_build(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            integrity = root / "integrity.json"
+            indexing = root / "indexing.json"
+            semantic = root / "semantic.json"
+            integrity.write_text(
+                json.dumps(
+                    {
+                        "missing_documents": [],
+                        "documents_without_pages": [],
+                        "documents_without_chunks": [],
+                        "regulatory_extraction_pending": [],
+                        "regulatory_extraction_errors": [],
+                        "page_inventory_pending": [],
+                        "schema_version": 7,
+                        "expected_schema_version": 7,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            indexing.write_text(json.dumps({"documents_failed": 0}), encoding="utf-8")
+            semantic.write_text(
+                json.dumps(
+                    {
+                        "status": "built",
+                        "method": "old",
+                        "build_signature": "old",
+                        "neural_status": "fallback",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root / "actas.db").write_bytes(b"database")
+            (root / "semantic.db").write_bytes(b"semantic")
+
+            status = build_pending_status(
+                integrity,
+                indexing,
+                semantic,
+                root / "actas.db",
+                root / "semantic.db",
+                semantic_enabled=True,
+                expected_semantic_method="new",
+                expected_semantic_signature="new-signature",
+                require_neural=True,
+            )
+
+        self.assertTrue(status["needs_update"])
+        self.assertIn("semantic_build_outdated", status["reasons"])
+        self.assertIn("semantic_neural_pending", status["reasons"])
+
 
 if __name__ == "__main__":
     unittest.main()

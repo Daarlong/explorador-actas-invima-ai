@@ -2,19 +2,50 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from services.semantic import (
+    DEFAULT_NEURAL_MODEL_ID,
+    DEFAULT_NEURAL_MODEL_REVISION,
+    NEURAL_SEMANTIC_METHOD,
     SemanticDocument,
+    SemanticHit,
     SemanticIndexError,
     build_semantic_index,
     build_semantic_documents_index,
     combine_rankings,
     query_semantic_index,
+    reciprocal_rank_fusion,
     semantic_index_info,
     semantic_index_status,
     semantic_search,
     semantic_source_fingerprint,
 )
+
+
+class FakeDenseEncoder:
+    model_id = DEFAULT_NEURAL_MODEL_ID
+    model_revision = DEFAULT_NEURAL_MODEL_REVISION
+
+    @staticmethod
+    def _vector(text: str) -> list[float]:
+        normalized = text.casefold()
+        if any(term in normalized for term in ("glucosa", "azúcar", "diabetes")):
+            return [1.0, 0.0, 0.0]
+        if any(term in normalized for term in ("envase", "aluminio")):
+            return [0.0, 1.0, 0.0]
+        return [0.0, 0.0, 1.0]
+
+    def encode_passages(self, texts, *, batch_size):
+        return [self._vector(text) for text in texts]
+
+    def encode_query(self, text):
+        return self._vector(text)
+
+
+class BrokenDenseEncoder(FakeDenseEncoder):
+    def encode_passages(self, texts, *, batch_size):
+        raise RuntimeError("modelo no disponible")
 
 
 class SemanticIndexTests(unittest.TestCase):
@@ -199,6 +230,109 @@ class SemanticIndexTests(unittest.TestCase):
             [],
         )
 
+    def test_optional_multilingual_dense_layer_can_retrieve_unknown_term(self) -> None:
+        summary = build_semantic_documents_index(
+            [
+                SemanticDocument(1, "Control metabólico de glucosa"),
+                SemanticDocument(2, "Evaluación del envase de aluminio"),
+            ],
+            self.index_path,
+            min_df=1,
+            neural_enabled=True,
+            neural_encoder=FakeDenseEncoder(),
+        )
+        self.assertEqual(summary.neural_status, "ready")
+        self.assertEqual(summary.neural_documents_indexed, 2)
+        info = semantic_index_info(self.index_path)
+        self.assertEqual(info["method"], NEURAL_SEMANTIC_METHOD)
+        self.assertEqual(info["neural_dimension"], 3)
+
+        hits = query_semantic_index(
+            self.index_path,
+            "azúcar",
+            top_k=2,
+            lexical_weight=0.0,
+            distributional_weight=0.0,
+            neural_weight=1.0,
+            neural_encoder=FakeDenseEncoder(),
+            min_score=0.0,
+        )
+        self.assertEqual(hits[0].item_id, 1)
+        self.assertGreater(hits[0].neural_score, hits[1].neural_score)
+
+    def test_neural_build_failure_keeps_local_semantic_fallback(self) -> None:
+        summary = build_semantic_documents_index(
+            self.documents,
+            self.index_path,
+            min_df=1,
+            neural_enabled=True,
+            neural_encoder=BrokenDenseEncoder(),
+        )
+        self.assertEqual(summary.neural_status, "fallback")
+        self.assertIn("modelo no disponible", summary.neural_error)
+        info = semantic_index_info(self.index_path)
+        self.assertEqual(info["method"], "hashed_tfidf+distributional_random_indexing")
+        hits = query_semantic_index(self.index_path, "aluminio", top_k=2)
+        self.assertEqual(hits[0].item_id, 3)
+
+    def test_global_neural_search_uses_a_bounded_preselection(self) -> None:
+        preliminary = [
+            SemanticHit(9, 0.8, 0.2, 0.9),
+            SemanticHit(4, 0.7, 0.3, 0.8),
+        ]
+        reranked = [SemanticHit(4, 0.95, 0.1, 0.2, 0.99)]
+        with patch(
+            "services.semantic.query_semantic_index",
+            side_effect=[preliminary, reranked],
+        ) as query_index:
+            result = semantic_search(
+                self.index_path,
+                "precedentes metabólicos",
+                top_k=1,
+            )
+
+        self.assertEqual(result, [(4, 0.95)])
+        self.assertEqual(query_index.call_count, 2)
+        self.assertEqual(query_index.call_args_list[0].kwargs["neural_weight"], 0.0)
+        self.assertEqual(
+            query_index.call_args_list[1].kwargs["candidate_ids"],
+            [9, 4],
+        )
+        self.assertEqual(query_index.call_args_list[1].kwargs["neural_weight"], 0.60)
+
+    def test_status_rejects_index_built_for_another_database_state(self) -> None:
+        database_path = Path(self.temp_dir.name) / "fingerprint.db"
+        with sqlite3.connect(database_path) as connection:
+            connection.execute(
+                "CREATE TABLE chunks (id INTEGER PRIMARY KEY, text TEXT NOT NULL)"
+            )
+            connection.execute("INSERT INTO chunks VALUES (1, 'semaglutida')")
+        build_semantic_index(database_path, self.index_path, min_df=1)
+        self.assertTrue(
+            semantic_index_status(self.index_path, database_path)["available"]
+        )
+        with sqlite3.connect(database_path) as connection:
+            connection.execute("INSERT INTO chunks VALUES (2, 'liraglutida')")
+        state = semantic_index_status(self.index_path, database_path)
+        self.assertFalse(state["available"])
+        self.assertEqual(state["reason"], "stale")
+
+    def test_runtime_rejects_legacy_index_without_source_fingerprint(self) -> None:
+        database_path = Path(self.temp_dir.name) / "legacy-source.db"
+        with sqlite3.connect(database_path) as connection:
+            connection.execute(
+                "CREATE TABLE chunks (id INTEGER PRIMARY KEY, text TEXT NOT NULL)"
+            )
+            connection.execute("INSERT INTO chunks VALUES (1, 'semaglutida')")
+        build_semantic_documents_index(
+            [SemanticDocument(1, "semaglutida")],
+            self.index_path,
+            min_df=1,
+        )
+        state = semantic_index_status(self.index_path, database_path)
+        self.assertFalse(state["available"])
+        self.assertEqual(state["reason"], "stale")
+
 
 class HybridRankingTests(unittest.TestCase):
     def test_combines_normalized_lexical_and_semantic_scores(self) -> None:
@@ -224,6 +358,22 @@ class HybridRankingTests(unittest.TestCase):
     def test_rejects_invalid_weights(self) -> None:
         with self.assertRaises(ValueError):
             combine_rankings({}, {}, lexical_weight=0.0, semantic_weight=0.0)
+
+    def test_rrf_is_stable_when_score_scales_change(self) -> None:
+        first = reciprocal_rank_fusion(
+            {1: 1000.0, 2: 10.0},
+            {2: 0.99, 1: 0.50},
+            top_k=2,
+        )
+        second = reciprocal_rank_fusion(
+            {1: 1.0, 2: 0.01},
+            {2: 9999.0, 1: 3.0},
+            top_k=2,
+        )
+        self.assertEqual(
+            [item.item_id for item in first],
+            [item.item_id for item in second],
+        )
 
 
 if __name__ == "__main__":
