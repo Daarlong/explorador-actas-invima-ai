@@ -42,6 +42,10 @@ filtros estructurados y búsqueda semántica local.
 - Índice semántico SQLite independiente con representaciones neuronales
   multilingües locales y cuantizadas; si ese complemento no está disponible,
   la aplicación conserva la búsqueda semántica determinística y FTS5.
+- Construcción neuronal reanudable por segmentos, con checkpoint confirmado en
+  GitHub Actions y continuación automática hasta alcanzar la cobertura total.
+- Reutilización de embeddings por SHA-256 del texto exacto: una actualización
+  posterior calcula únicamente los fragmentos nuevos o modificados.
 - Informe de integridad visible desde la aplicación.
 - Auditoría por capas: página oficial → catálogo → manifiesto → índice, con
   snapshot y huella SHA-256 del último descubrimiento válido.
@@ -63,6 +67,39 @@ filtros estructurados y búsqueda semántica local.
 - Página de Catálogo con estado indexado, pendiente, sin enlace o ya no listado.
 
 No contiene funcionalidades relacionadas con un monitor de transparencia.
+
+## Corrección incorporada en la versión 0.9.1
+
+La 0.9.1 corrige la primera construcción del índice neuronal para corpus que no
+alcanzan a completarse dentro de una sola ejecución de GitHub Actions. El
+usuario inicia **Construir índice** una sola vez. Cada ejecución procesa como
+máximo 7.200 segundos o 50.000 textos únicos, confirma el avance y programa el
+siguiente segmento automáticamente. El límite de seguridad de la cadena es de
+20 segmentos.
+
+| Área | Comportamiento en 0.9.1 |
+|---|---|
+| Continuación | El siguiente segmento se inicia automáticamente; no se utiliza `resume_run_id` ni se descargan artefactos manualmente |
+| Checkpoint | `data/semantic.checkpoint.db` conserva el trabajo parcial en Actions Cache y confirma cada lote de 128 textos |
+| Progreso | `data/semantic-progress.json` registra los vectores disponibles, los pendientes y los segmentos terminados |
+| Publicación segura | Las bases publicadas permanecen intactas durante todos los segmentos; `semantic.db` solo se reemplaza y empaqueta cuando llega al 100 % |
+| Reutilización | Los vectores se identifican por SHA-256 del texto exacto, incluso si cambian los identificadores internos de SQLite |
+| Actualizaciones futuras | Una nueva acta reutiliza los embeddings vigentes y calcula únicamente textos nuevos o modificados |
+
+La segmentación evita perder horas de cálculo, pero no elimina el trabajo de la
+primera carga. Un histórico grande puede necesitar varias ejecuciones y consumir
+una cantidad importante de minutos de GitHub Actions. Es normal que aparezcan
+varias ejecuciones consecutivas de **Construir índice**: cada una puede terminar
+en verde mientras la siguiente queda en cola.
+
+Para reconocer el avance, abre el **Summary** de la ejecución más reciente y
+busca **Avance del índice neuronal**. Allí se muestran el estado, los embeddings
+disponibles, los pendientes y los segmentos terminados. En los registros también
+aparece `Embeddings neuronales confirmados: X/Y`. La cadena terminó solamente
+cuando el estado sea **completo**, los pendientes sean `0` y el workflow haya
+creado el commit automático que despliega el índice final en Streamlit.
+
+El alcance cerrado de esta corrección está en `ALCANCE_V0.9.1.md`.
 
 ## Cambios visibles en la versión 0.9.0
 
@@ -192,6 +229,7 @@ todo el histórico visible desde 2013; el año inicial se configura con
 ├── ALCANCE_V0.7.md
 ├── ALCANCE_V0.8.md
 ├── ALCANCE_V0.9.md
+├── ALCANCE_V0.9.1.md
 ├── INSTRUCCIONES_ACTUALIZACION.md
 └── requirements.txt
 ```
@@ -227,7 +265,9 @@ hacerse desde GitHub Actions:
 El workflow **Construir índice** sigue disponible para una ejecución manual,
 pero ya no es necesario lanzarlo cada vez que aparece un acta nueva. Se usa
 para actualizaciones incrementales normales y para activar una nueva versión
-del extractor sobre el texto fuente ya almacenado.
+del extractor sobre el texto fuente ya almacenado. Desde la 0.9.1, una sola
+ejecución manual basta también para la primera carga neuronal: si no termina en
+el primer segmento, el propio workflow programa los siguientes.
 
 El flujo de construcción del índice:
 
@@ -239,13 +279,18 @@ El flujo de construcción del índice:
    puedan recuperarse;
 5. migra de forma aditiva el esquema anterior y extrae los campos regulatorios
    desde los fragmentos ya almacenados;
-6. construye o actualiza el índice semántico local, incluido el complemento
-   neuronal multilingüe cuando está disponible;
+6. construye o actualiza el índice semántico local y avanza el complemento
+   neuronal multilingüe en un segmento de hasta 7.200 segundos o 50.000 textos
+   únicos;
 7. genera informes de ejecución, integridad y cobertura por año;
-8. comprime ambas bases, calcula hashes y las divide en fragmentos de 90 MiB;
-9. guarda los índices y los informes automáticamente en el repositorio privado.
+8. si quedan embeddings, guarda `semantic.checkpoint.db` y
+   `semantic-progress.json` en Actions Cache y programa el siguiente segmento;
+9. al alcanzar el 100 %, comprime ambas bases, calcula hashes, las divide en
+   fragmentos de 90 MiB y guarda los índices y los informes automáticamente en
+   el repositorio privado.
 
-No es necesario descargar un artefacto ni subir manualmente `actas.db`.
+No es necesario volver a pulsar **Run workflow**, descargar un artefacto, pegar
+un identificador de ejecución ni subir manualmente `actas.db`.
 
 El workflow de catálogo se ejecuta automáticamente de lunes a viernes a las
 18:30, hora de Colombia. Cada consulta válida actualiza la evidencia fechada de
@@ -254,10 +299,19 @@ publicación nueva o un documento pendiente. Si el informe de integridad conserv
 documentos pendientes por una caída temporal o un enlace problemático, vuelve a
 intentar incorporarlos en la siguiente revisión programada.
 
-La primera construcción después de ampliar el índice a 2013 puede tardar varias
-horas y aumentar considerablemente el tamaño de la base. El workflow dispone de
-un máximo de seis horas, conserva los PDF descargados en caché y deja los
-documentos fallidos pendientes para reintentarlos sin perder los correctos.
+La primera construcción después de ampliar el índice a 2013 puede tardar muchas
+horas acumuladas y aumentar considerablemente el tamaño de la base. Cada
+segmento termina voluntariamente antes del máximo del runner, conserva su avance
+en Actions Cache y deja otro segmento en cola. Esta primera carga puede consumir
+una cantidad importante de minutos de GitHub Actions; dividirla evita perder el
+cálculo, pero no reduce el cálculo total requerido por el modelo.
+
+Durante esa cadena, cada segmento verde confirma que su avance quedó guardado;
+no significa necesariamente que el índice completo ya esté publicado. Abre el
+**Summary** de la ejecución más reciente y revisa **Avance del índice neuronal**.
+La finalización se reconoce por `Estado: completo`, `Pendientes: 0` y el commit
+automático de las bases empaquetadas. Hasta entonces, Streamlit continúa usando
+sin modificaciones el índice que ya estaba publicado.
 
 Al instalar la 0.8 sobre una base 0.7.2 ya publicada basta con una ejecución de
 **Construir índice**. El cambio de versión del extractor hace que las fichas se
@@ -271,13 +325,19 @@ La actualización de 0.8.0 a 0.9.0 no cambia el esquema ni el contenido del
 esperar **Pruebas** y el redespliegue de Streamlit; no se debe reconstruir la
 base por el rediseño de interfaz.
 
+La 0.9.1 sí cambia el formato interno del índice semántico para permitir
+checkpoint, deduplicación y reutilización segura. Si el índice neuronal de la
+0.9.0 quedó incompleto, ejecuta **Construir índice** una sola vez después de
+subir esta corrección. El workflow continuará por sí mismo y solo publicará la
+nueva base cuando esté completa.
+
 Ya no existe una casilla `full_rebuild` en el workflow normal. Esto evita que
 una reconstrucción total pueda iniciarse accidentalmente desde la acción
 destinada a incorporar actas nuevas.
 
 ## Configuración sin IA generativa
 
-La versión 0.9.0 se opera con `LLM_PROVIDER = "prompt_only"`. El buscador recupera
+La versión 0.9.1 se opera con `LLM_PROVIDER = "prompt_only"`. El buscador recupera
 fuentes sin enviar la consulta a un LLM y el complemento semántico se ejecuta
 localmente. No hace falta configurar una clave de OpenAI ni de Azure OpenAI.
 
@@ -299,10 +359,24 @@ forzar esa ruta ligera con `ACTAS_SEMANTIC_BACKEND=local`.
 
 El primer uso tras un despliegue puede tardar mientras FastEmbed descarga el
 modelo de aproximadamente 0,22 GB; ninguna consulta se envía a un servicio de
-inferencia. GitHub Actions conserva el modelo en caché. En la validación de una
-base candidata, `build_index.py --fail-on-semantic-error` exige además que el
-complemento neuronal configurado haya quedado completo; la construcción normal
-puede publicar el respaldo local y reintentarlo posteriormente.
+inferencia. GitHub Actions conserva el modelo en caché. La construcción también
+mantiene un checkpoint separado del índice publicado y confirma los embeddings
+por lotes. Si un segmento se interrumpe después de un checkpoint válido, una
+nueva ejecución puede continuar desde ese punto sin repetir los lotes ya
+confirmados.
+
+`semantic.checkpoint.db` es una base temporal de trabajo, no un índice para
+Streamlit ni un archivo que deba subirse manualmente. `semantic-progress.json`
+describe el avance de la cadena. Durante una construcción incompleta ambos se
+conservan en Actions Cache; al llegar al 100 %, el checkpoint se valida, se
+promueve atómicamente a `semantic.db` y el reporte de progreso se incorpora al
+commit final.
+
+Los embeddings se almacenan una vez por SHA-256 del texto exacto. Esto evita
+calcular dos veces fragmentos idénticos y permite que la siguiente actualización
+reutilice todos los textos que no cambiaron. La capa TF-IDF/distribucional sí se
+recalcula para representar el corpus vigente, pero normalmente la inferencia
+neuronal costosa queda limitada a los textos nuevos o modificados.
 
 La página de Administración exige `ADMIN_PASSWORD`. Si no se configura, queda
 deshabilitada y el índice solo puede construirse mediante `python build_index.py`.
@@ -319,7 +393,10 @@ habilita la página de Administración.
 4. Configurar los secretos desde el panel de Streamlit, nunca en GitHub.
 5. Esperar que **Pruebas** termine en verde.
 6. Ejecutar una vez **Actions → Construir índice → Run workflow**.
-7. Esperar el commit automático del índice y el nuevo despliegue de Streamlit.
+7. Seguir la cadena en **Actions** sin iniciar ejecuciones adicionales. Cada
+   segmento guarda su avance y programa el siguiente automáticamente.
+8. Esperar que el último resumen indique estado completo, cero pendientes y el
+   commit automático que activa el nuevo despliegue de Streamlit.
 
 El sistema de archivos de una aplicación alojada no debe considerarse una base
 de datos permanente. Para el piloto, la acción versiona el índice comprimido y
@@ -344,6 +421,12 @@ INVIMA**. Al terminar, este inicia **Construir índice** únicamente si detectó
 cambio o si quedan documentos pendientes. Desde línea de comandos también se
 puede usar `python sync_catalog.py` seguido de `python build_index.py
 --allow-partial`.
+
+Una vez completada la primera base 0.9.1, las ejecuciones posteriores reutilizan
+los embeddings cuyos textos conservan el mismo SHA-256. Por ello, la incorporación
+de una nueva acta normalmente requiere inferencia neuronal solo para sus
+fragmentos nuevos o para fragmentos cuyo texto haya cambiado; no vuelve a
+procesar todo el histórico.
 
 ### Edición manual excepcional
 
@@ -382,6 +465,7 @@ La página **Integridad** muestra:
 - claves foráneas, correspondencia entre fragmentos y FTS y posibles PDF
   duplicados por hash;
 - estado de construcción del índice semántico local;
+- avance confirmado de la capa neuronal y cantidad de embeddings pendientes;
 - tamaño de la base compactada.
 
 El esquema 6 conserva una copia comprimida del texto fuente por página para
@@ -390,7 +474,8 @@ buscar. El paquete
 `data/actas.db.package.json` registra tamaño y SHA-256 de la base y de cada
 fragmento, y la aplicación los valida antes de usar el índice. El índice
 semántico se distribuye del mismo modo mediante
-`data/semantic.db.package.json`.
+`data/semantic.db.package.json`. Un `semantic.checkpoint.db` incompleto nunca se
+incluye en ese paquete ni reemplaza la base semántica publicada.
 
 La extracción regulatoria es deliberadamente conservadora. Una ficha puede
 estar incompleta o mal clasificada por diferencias históricas de formato; por

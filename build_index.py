@@ -12,13 +12,17 @@ from config import (
     MANIFEST_PATH,
     PDF_CACHE_DIR,
     SEMANTIC_DISTRIBUTIONAL_DIMENSION,
+    SEMANTIC_CHECKPOINT_PATH,
     SEMANTIC_ENABLED,
     SEMANTIC_INDEX_PATH,
     SEMANTIC_LEXICAL_DIMENSION,
+    SEMANTIC_MAX_SECONDS,
+    SEMANTIC_MAX_UNIQUE,
     SEMANTIC_NEURAL_BATCH_SIZE,
     SEMANTIC_NEURAL_ENABLED,
     SEMANTIC_NEURAL_MODEL_ID,
     SEMANTIC_NEURAL_MODEL_REVISION,
+    SEMANTIC_PROGRESS_PATH,
     SEMANTIC_REPORT_PATH,
     ensure_directories,
 )
@@ -26,6 +30,7 @@ from services.database import sync_regulatory_extractions
 from services.indexing import rebuild_index, update_index, write_indexing_report
 from services.integrity import build_integrity_report, write_integrity_report
 from services.semantic import (
+    build_or_resume_semantic_index,
     build_semantic_index,
     semantic_build_spec,
     semantic_index_status,
@@ -60,23 +65,16 @@ def print_progress(current: int, total: int, title: str) -> None:
     print(f"[{current}/{total}] {title}", flush=True)
 
 
-def remove_semantic_artifacts() -> None:
-    """Evita publicar un índice anterior contra una base documental nueva."""
-    for path in (
-        SEMANTIC_INDEX_PATH,
-        SEMANTIC_INDEX_PATH.with_name(f"{SEMANTIC_INDEX_PATH.name}.gz"),
-        SEMANTIC_INDEX_PATH.with_name(
-            f"{SEMANTIC_INDEX_PATH.name}.package.json"
-        ),
-        SEMANTIC_INDEX_PATH.with_name(
-            f"{SEMANTIC_INDEX_PATH.name}.package-id"
-        ),
-    ):
-        path.unlink(missing_ok=True)
-    for part in SEMANTIC_INDEX_PATH.parent.glob(
-        f"{SEMANTIC_INDEX_PATH.name}.gz.part-*"
-    ):
-        part.unlink(missing_ok=True)
+def remove_semantic_checkpoint() -> None:
+    """Descarta solo la candidata; nunca toca el último índice publicado."""
+
+    SEMANTIC_CHECKPOINT_PATH.unlink(missing_ok=True)
+    SEMANTIC_CHECKPOINT_PATH.with_name(
+        f"{SEMANTIC_CHECKPOINT_PATH.name}-shm"
+    ).unlink(missing_ok=True)
+    SEMANTIC_CHECKPOINT_PATH.with_name(
+        f"{SEMANTIC_CHECKPOINT_PATH.name}-wal"
+    ).unlink(missing_ok=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -138,6 +136,15 @@ if __name__ == "__main__":
         "status": "disabled",
         "message": "La construcción semántica está deshabilitada.",
     }
+    semantic_progress = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "complete": not SEMANTIC_ENABLED,
+        "progress_made": False,
+        "before": 0,
+        "after": 0,
+        "remaining": 0,
+        "segments_completed": 0,
+    }
     if SEMANTIC_ENABLED:
         try:
             source_fingerprint = semantic_source_fingerprint(DATABASE_PATH)
@@ -172,6 +179,105 @@ if __name__ == "__main__":
                 report.semantic_documents_indexed = int(
                     current.get("documents", 0)
                 )
+                SEMANTIC_CHECKPOINT_PATH.unlink(missing_ok=True)
+                semantic_progress.update(
+                    {
+                        "complete": True,
+                        "before": int(current.get("documents", 0)),
+                        "after": int(current.get("documents", 0)),
+                        "remaining": 0,
+                        "source_fingerprint": source_fingerprint,
+                        "build_signature": desired_signature,
+                    }
+                )
+            elif SEMANTIC_NEURAL_ENABLED:
+                previous_segments = 0
+                try:
+                    previous_progress = json.loads(
+                        SEMANTIC_PROGRESS_PATH.read_text(encoding="utf-8")
+                    )
+                    if (
+                        isinstance(previous_progress, dict)
+                        and previous_progress.get("source_fingerprint")
+                        == source_fingerprint
+                        and previous_progress.get("build_signature")
+                        == desired_signature
+                    ):
+                        previous_segments = int(
+                            previous_progress.get("segments_completed", 0)
+                        )
+                except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                    pass
+
+                semantic = build_or_resume_semantic_index(
+                    DATABASE_PATH,
+                    SEMANTIC_INDEX_PATH,
+                    SEMANTIC_CHECKPOINT_PATH,
+                    lexical_dimension=SEMANTIC_LEXICAL_DIMENSION,
+                    semantic_dimension=SEMANTIC_DISTRIBUTIONAL_DIMENSION,
+                    neural_model_id=SEMANTIC_NEURAL_MODEL_ID,
+                    neural_model_revision=SEMANTIC_NEURAL_MODEL_REVISION,
+                    neural_batch_size=SEMANTIC_NEURAL_BATCH_SIZE,
+                    max_unique_texts=SEMANTIC_MAX_UNIQUE,
+                    max_seconds=SEMANTIC_MAX_SECONDS,
+                )
+                report.semantic_documents_indexed = semantic.documents_after
+                progress_made = semantic.progress_made
+                semantic_progress = {
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                    "complete": semantic.complete,
+                    "progress_made": progress_made,
+                    "before": semantic.documents_before,
+                    "after": semantic.documents_after,
+                    "remaining": semantic.documents_remaining,
+                    "unique_before": semantic.unique_texts_before,
+                    "unique_after": semantic.unique_texts_after,
+                    "unique_remaining": max(
+                        0,
+                        semantic.unique_texts_total
+                        - semantic.unique_texts_after,
+                    ),
+                    "segments_completed": previous_segments
+                    + (1 if progress_made else 0),
+                    "source_fingerprint": semantic.source_fingerprint,
+                    "build_signature": semantic.build_signature,
+                    "checkpoint_reused": semantic.checkpoint_reused,
+                }
+                if semantic.complete:
+                    built_state = semantic_index_status(
+                        SEMANTIC_INDEX_PATH,
+                        DATABASE_PATH,
+                    )
+                    if not built_state.get("available"):
+                        raise RuntimeError(
+                            "El índice neuronal final no quedó disponible"
+                        )
+                    semantic_report = {
+                        "generated_at": datetime.now(timezone.utc).isoformat(),
+                        "status": "built",
+                        "message": (
+                            "Índice semántico neuronal multilingüe construido."
+                        ),
+                        "neural_status": "ready",
+                        "documents": semantic.documents_total,
+                        "neural_documents": semantic.documents_after,
+                        **semantic.as_dict(),
+                    }
+                    report.semantic_index_status = "built"
+                else:
+                    semantic_report = {
+                        "generated_at": datetime.now(timezone.utc).isoformat(),
+                        "status": "building",
+                        "message": (
+                            "La construcción neuronal quedó confirmada y "
+                            "continuará automáticamente en otra ejecución."
+                        ),
+                        "neural_status": "building",
+                        "documents": semantic.documents_total,
+                        "neural_documents": semantic.documents_after,
+                        **semantic.as_dict(),
+                    }
+                    report.semantic_index_status = "building"
             else:
                 semantic = build_semantic_index(
                     DATABASE_PATH,
@@ -202,8 +308,17 @@ if __name__ == "__main__":
                 }
                 report.semantic_index_status = "built"
                 report.semantic_documents_indexed = semantic.documents_indexed
+                semantic_progress.update(
+                    {
+                        "complete": True,
+                        "before": semantic.documents_indexed,
+                        "after": semantic.documents_indexed,
+                        "remaining": 0,
+                        "source_fingerprint": semantic.source_fingerprint,
+                        "build_signature": desired_signature,
+                    }
+                )
         except Exception as exc:
-            remove_semantic_artifacts()
             report.semantic_index_status = "error"
             semantic_report = {
                 "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -215,7 +330,15 @@ if __name__ == "__main__":
                 f"fue posible actualizar el índice semántico: {exc}",
                 flush=True,
             )
+            semantic_progress.update(
+                {
+                    "complete": False,
+                    "progress_made": False,
+                    "error": str(exc),
+                }
+            )
     write_json_report(semantic_report, SEMANTIC_REPORT_PATH)
+    write_json_report(semantic_progress, SEMANTIC_PROGRESS_PATH)
     write_indexing_report(report, INDEXING_REPORT_PATH)
     print(json.dumps(report.as_dict(), ensure_ascii=False, indent=2))
 
@@ -249,10 +372,14 @@ if __name__ == "__main__":
             "pendientes y se reintentarán en la siguiente ejecución.",
             flush=True,
         )
-    semantic_unusable = semantic_report.get("status") not in {"built", "reused"}
+    semantic_unusable = semantic_report.get("status") not in {
+        "built",
+        "reused",
+        "building",
+    }
     neural_unavailable = (
         SEMANTIC_NEURAL_ENABLED
-        and semantic_report.get("neural_status") != "ready"
+        and semantic_report.get("neural_status") not in {"ready", "building"}
     )
     if arguments.fail_on_semantic_error and (
         semantic_unusable or neural_unavailable

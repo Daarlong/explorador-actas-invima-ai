@@ -28,6 +28,18 @@ RAW_SEMANTIC_INDEX_PATH = Path(
     os.getenv("ACTAS_SEMANTIC_INDEX_PATH", DATA_DIR / "semantic.db")
 )
 SEMANTIC_INDEX_PATH = resolve_database_path(RAW_SEMANTIC_INDEX_PATH)
+SEMANTIC_CHECKPOINT_PATH = Path(
+    os.getenv(
+        "ACTAS_SEMANTIC_CHECKPOINT_PATH",
+        RAW_SEMANTIC_INDEX_PATH.with_name("semantic.checkpoint.db"),
+    )
+)
+SEMANTIC_PROGRESS_PATH = Path(
+    os.getenv(
+        "ACTAS_SEMANTIC_PROGRESS_PATH",
+        DATA_DIR / "semantic-progress.json",
+    )
+)
 INTEGRITY_REPORT_PATH = Path(
     os.getenv("ACTAS_INTEGRITY_REPORT_PATH", DATA_DIR / "integrity-report.json")
 )
@@ -99,6 +111,14 @@ SEMANTIC_NEURAL_MODEL_REVISION = os.getenv(
 SEMANTIC_NEURAL_BATCH_SIZE = max(
     1,
     int(os.getenv("ACTAS_SEMANTIC_NEURAL_BATCH_SIZE", "64")),
+)
+SEMANTIC_MAX_UNIQUE = max(
+    0,
+    int(os.getenv("ACTAS_SEMANTIC_MAX_UNIQUE", "0")),
+)
+SEMANTIC_MAX_SECONDS = max(
+    0.0,
+    float(os.getenv("ACTAS_SEMANTIC_MAX_SECONDS", "0")),
 )
 REPROCESS_BATCH_SIZE = max(1, int(os.getenv("ACTAS_REPROCESS_BATCH_SIZE", "50")))
 REPROCESS_MIN_FREE_MIB = max(

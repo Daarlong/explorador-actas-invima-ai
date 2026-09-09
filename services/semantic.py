@@ -34,6 +34,7 @@ import re
 import sqlite3
 import struct
 import tempfile
+import time
 from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -44,10 +45,11 @@ from typing import Iterable, Iterator, Mapping, Protocol, Sequence
 from services.text_utils import SPANISH_STOPWORDS, normalize_text
 
 
-SEMANTIC_INDEX_FORMAT_VERSION = 1
+SEMANTIC_INDEX_FORMAT_VERSION = 2
+SUPPORTED_SEMANTIC_INDEX_FORMATS = frozenset({1, 2})
 SEMANTIC_METHOD = "hashed_tfidf+distributional_random_indexing"
 SEMANTIC_BUILD_SIGNATURE = (
-    "tokenizer-v1-random-indexing-v1-int8-source-fingerprint-v2"
+    "tokenizer-v1-random-indexing-v1-int8-source-fingerprint-v2-content-hash-v1"
 )
 NEURAL_SEMANTIC_METHOD = f"{SEMANTIC_METHOD}+multilingual_fastembed"
 DEFAULT_NEURAL_MODEL_ID = (
@@ -57,6 +59,7 @@ DEFAULT_NEURAL_MODEL_ID = (
 # versión junto al índice para no mezclar vectores de registros distintos.
 DEFAULT_NEURAL_MODEL_REVISION = "fastembed-0.8.0-registry"
 NEURAL_VECTOR_ENCODING = "signed_int8_unit_vector"
+NEURAL_INPUT_SIGNATURE = "exact-utf8-v1|fastembed-0.8.0-mean-pooling"
 _TOKEN_PATTERN = re.compile(r"\b[\w-]+\b", flags=re.UNICODE)
 _ITEM_BATCH_SIZE = 800
 
@@ -111,9 +114,44 @@ class SemanticBuildSummary:
     neural_model_id: str | None = None
     neural_model_revision: str | None = None
     neural_error: str | None = None
+    neural_unique_texts: int = 0
+    neural_documents_reused: int = 0
+    neural_documents_encoded: int = 0
+    neural_documents_remaining: int = 0
+    checkpoint_reused: bool = False
 
     def as_dict(self) -> dict:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class ResumableSemanticBuildSummary:
+    """Avance durable de una construcción neuronal por segmentos."""
+
+    complete: bool
+    checkpoint_reused: bool
+    documents_total: int
+    documents_before: int
+    documents_after: int
+    documents_encoded: int
+    documents_reused: int
+    documents_remaining: int
+    unique_texts_total: int
+    unique_texts_before: int
+    unique_texts_after: int
+    unique_texts_encoded: int
+    neural_dimension: int | None
+    source_fingerprint: str
+    method: str
+    build_signature: str
+    index_size_bytes: int
+
+    @property
+    def progress_made(self) -> bool:
+        return self.documents_after > self.documents_before
+
+    def as_dict(self) -> dict:
+        return {**asdict(self), "progress_made": self.progress_made}
 
 
 @dataclass(frozen=True)
@@ -228,6 +266,15 @@ def _validated_dense_vector(vector: Sequence[float]) -> list[float]:
             "El modelo neuronal devolvió un vector sin información"
         )
     return normalized
+
+
+def semantic_content_hash(text: str) -> bytes:
+    """Identifica exactamente el texto que recibe el codificador neuronal."""
+
+    digest = hashlib.sha256()
+    digest.update(b"invima-neural-input-v1\0")
+    digest.update(text.encode("utf-8"))
+    return digest.digest()
 
 
 def _pack_vector(vector: Sequence[float]) -> bytes:
@@ -361,7 +408,7 @@ def semantic_build_spec(
         )
     signature = (
         f"{SEMANTIC_BUILD_SIGNATURE}|dense-int8-v1|"
-        f"{model_id}@{revision}"
+        f"{NEURAL_INPUT_SIGNATURE}|{model_id}@{revision}"
     )
     return NEURAL_SEMANTIC_METHOD, signature
 
@@ -421,9 +468,16 @@ def _create_schema(connection: sqlite3.Connection) -> None:
 
         CREATE TABLE items (
             item_id INTEGER PRIMARY KEY,
+            content_hash BLOB NOT NULL,
             lexical_vector BLOB NOT NULL,
-            distributional_vector BLOB NOT NULL,
-            neural_vector BLOB
+            distributional_vector BLOB NOT NULL
+        );
+
+        CREATE INDEX idx_items_content_hash ON items(content_hash);
+
+        CREATE TABLE neural_embeddings (
+            content_hash BLOB PRIMARY KEY,
+            neural_vector BLOB NOT NULL
         );
         """
     )
@@ -432,6 +486,19 @@ def _create_schema(connection: sqlite3.Connection) -> None:
 def _write_metadata(connection: sqlite3.Connection, values: Mapping[str, object]) -> None:
     connection.executemany(
         "INSERT INTO metadata (key, value) VALUES (?, ?)",
+        ((key, json.dumps(value, ensure_ascii=False)) for key, value in values.items()),
+    )
+
+
+def _upsert_metadata(
+    connection: sqlite3.Connection,
+    values: Mapping[str, object],
+) -> None:
+    connection.executemany(
+        """
+        INSERT INTO metadata (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
         ((key, json.dumps(value, ensure_ascii=False)) for key, value in values.items()),
     )
 
@@ -447,7 +514,7 @@ def _read_metadata(connection: sqlite3.Connection) -> dict[str, object]:
             result[str(key)] = json.loads(value)
         except (TypeError, json.JSONDecodeError) as exc:
             raise SemanticIndexError("Los metadatos del índice están dañados") from exc
-    if result.get("format_version") != SEMANTIC_INDEX_FORMAT_VERSION:
+    if result.get("format_version") not in SUPPORTED_SEMANTIC_INDEX_FORMATS:
         raise SemanticIndexError("La versión del índice semántico no es compatible")
     required = {
         "documents",
@@ -646,7 +713,7 @@ def build_semantic_documents_index(
                 ),
             )
             default_idf = _idf(documents_indexed, 0)
-            for item_id, tokens, _ in _spooled_documents(spool_path):
+            for item_id, tokens, text in _spooled_documents(spool_path):
                 counts = Counter(tokens)
                 lexical = _lexical_vector(
                     counts, idf_by_term, lexical_dimension, default_idf
@@ -660,11 +727,13 @@ def build_semantic_documents_index(
                 connection.execute(
                     """
                     INSERT INTO items (
-                        item_id, lexical_vector, distributional_vector
-                    ) VALUES (?, ?, ?)
+                        item_id, content_hash, lexical_vector,
+                        distributional_vector
+                    ) VALUES (?, ?, ?, ?)
                     """,
                     (
                         item_id,
+                        semantic_content_hash(text),
                         _pack_vector(lexical),
                         _pack_vector(distributional),
                     ),
@@ -672,23 +741,24 @@ def build_semantic_documents_index(
 
             if neural_enabled and requested_encoder is not None:
                 try:
-                    batch_ids: list[int] = []
+                    batch_hashes: list[bytes] = []
                     batch_texts: list[str] = []
+                    seen_hashes: set[bytes] = set()
 
                     def flush_neural_batch() -> None:
                         nonlocal neural_dimension, neural_documents_indexed
-                        if not batch_ids:
+                        if not batch_hashes:
                             return
                         vectors = requested_encoder.encode_passages(
                             batch_texts,
                             batch_size=neural_batch_size,
                         )
-                        if len(vectors) != len(batch_ids):
+                        if len(vectors) != len(batch_hashes):
                             raise NeuralSemanticUnavailable(
                                 "El modelo neuronal no devolvió un vector por texto"
                             )
-                        rows: list[tuple[bytes, int]] = []
-                        for item_id, vector in zip(batch_ids, vectors):
+                        rows: list[tuple[bytes, bytes]] = []
+                        for content_hash, vector in zip(batch_hashes, vectors):
                             normalized = _validated_dense_vector(vector)
                             if neural_dimension is None:
                                 neural_dimension = len(normalized)
@@ -696,12 +766,25 @@ def build_semantic_documents_index(
                                 raise NeuralSemanticUnavailable(
                                     "El modelo neuronal cambió de dimensión"
                                 )
-                            rows.append((_pack_vector(normalized), item_id))
+                            rows.append((content_hash, _pack_vector(normalized)))
                         connection.executemany(
-                            "UPDATE items SET neural_vector = ? WHERE item_id = ?",
+                            """
+                            INSERT INTO neural_embeddings (
+                                content_hash, neural_vector
+                            ) VALUES (?, ?)
+                            ON CONFLICT(content_hash) DO UPDATE SET
+                                neural_vector = excluded.neural_vector
+                            """,
                             rows,
                         )
-                        neural_documents_indexed += len(rows)
+                        placeholders = ",".join("?" for _ in batch_hashes)
+                        neural_documents_indexed += int(
+                            connection.execute(
+                                "SELECT COUNT(*) FROM items "
+                                f"WHERE content_hash IN ({placeholders})",
+                                batch_hashes,
+                            ).fetchone()[0]
+                        )
                         progress_interval = max(neural_batch_size * 50, 5_000)
                         if (
                             neural_documents_indexed == documents_indexed
@@ -712,13 +795,17 @@ def build_semantic_documents_index(
                                 f"{neural_documents_indexed}/{documents_indexed}",
                                 flush=True,
                             )
-                        batch_ids.clear()
+                        batch_hashes.clear()
                         batch_texts.clear()
 
-                    for item_id, _, text in _spooled_documents(spool_path):
-                        batch_ids.append(item_id)
+                    for _, _, text in _spooled_documents(spool_path):
+                        content_hash = semantic_content_hash(text)
+                        if content_hash in seen_hashes:
+                            continue
+                        seen_hashes.add(content_hash)
+                        batch_hashes.append(content_hash)
                         batch_texts.append(text)
-                        if len(batch_ids) >= neural_batch_size:
+                        if len(batch_hashes) >= neural_batch_size:
                             flush_neural_batch()
                     flush_neural_batch()
                     if neural_documents_indexed != documents_indexed:
@@ -729,7 +816,7 @@ def build_semantic_documents_index(
                 except Exception as exc:
                     # Una descarga, dependencia o inferencia neuronal nunca
                     # invalida las señales locales ya construidas.
-                    connection.execute("UPDATE items SET neural_vector = NULL")
+                    connection.execute("DELETE FROM neural_embeddings")
                     neural_status = "fallback"
                     neural_error = str(exc)
                     neural_documents_indexed = 0
@@ -760,6 +847,11 @@ def build_semantic_documents_index(
                     "source_fingerprint": source_fingerprint,
                     "neural_status": neural_status,
                     "neural_documents": neural_documents_indexed,
+                    "neural_unique_texts": int(
+                        connection.execute(
+                            "SELECT COUNT(*) FROM neural_embeddings"
+                        ).fetchone()[0]
+                    ),
                     "neural_dimension": neural_dimension,
                     "neural_model_id": (
                         neural_model_id if neural_enabled else None
@@ -794,6 +886,18 @@ def build_semantic_documents_index(
                 neural_model_revision if neural_enabled else None
             ),
             neural_error=neural_error,
+            neural_unique_texts=(
+                len(seen_hashes)
+                if neural_enabled and requested_encoder is not None
+                and neural_status == "ready"
+                else 0
+            ),
+            neural_documents_encoded=neural_documents_indexed,
+            neural_documents_remaining=(
+                max(0, documents_indexed - neural_documents_indexed)
+                if neural_enabled
+                else 0
+            ),
         )
     finally:
         spool_path.unlink(missing_ok=True)
@@ -867,6 +971,599 @@ def build_semantic_index(
         raise SemanticIndexError(
             "No fue posible leer los fragmentos de la base principal"
         ) from exc
+
+
+def _neural_coverage(
+    connection: sqlite3.Connection,
+    neural_dimension: int | None,
+) -> tuple[int, int, int]:
+    """Devuelve elementos cubiertos, textos únicos cubiertos y textos totales."""
+
+    unique_total = int(
+        connection.execute(
+            "SELECT COUNT(DISTINCT content_hash) FROM items"
+        ).fetchone()[0]
+    )
+    if not neural_dimension:
+        return 0, 0, unique_total
+    unique_covered = int(
+        connection.execute(
+            """
+            SELECT COUNT(DISTINCT neural.content_hash)
+            FROM neural_embeddings AS neural
+            JOIN items AS item ON item.content_hash = neural.content_hash
+            WHERE length(neural.neural_vector) = ?
+            """,
+            (neural_dimension,),
+        ).fetchone()[0]
+    )
+    documents_covered = int(
+        connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM items AS item
+            JOIN neural_embeddings AS neural
+              ON neural.content_hash = item.content_hash
+            WHERE length(neural.neural_vector) = ?
+            """,
+            (neural_dimension,),
+        ).fetchone()[0]
+    )
+    return documents_covered, unique_covered, unique_total
+
+
+def _validate_items_against_source(
+    semantic_index_path: Path,
+    database_path: Path,
+) -> None:
+    """Comprueba que cada elemento semántico representa el texto fuente real."""
+
+    try:
+        with sqlite3.connect(
+            f"file:{semantic_index_path}?mode=ro", uri=True
+        ) as semantic, sqlite3.connect(
+            f"file:{database_path}?mode=ro", uri=True
+        ) as source:
+            indexed_rows = iter(
+                semantic.execute(
+                    "SELECT item_id, content_hash FROM items ORDER BY item_id"
+                )
+            )
+            indexed = next(indexed_rows, None)
+            for item_id, text in source.execute(
+                "SELECT id, text FROM chunks ORDER BY id"
+            ):
+                value = str(text)
+                if not _tokenize(value):
+                    continue
+                if indexed is None:
+                    raise SemanticIndexError(
+                        "El índice semántico omite fragmentos de la base fuente"
+                    )
+                indexed_id, content_hash = indexed
+                if int(indexed_id) != int(item_id) or bytes(
+                    content_hash
+                ) != semantic_content_hash(value):
+                    raise SemanticIndexError(
+                        "El índice semántico no coincide con los fragmentos fuente"
+                    )
+                indexed = next(indexed_rows, None)
+            if indexed is not None:
+                raise SemanticIndexError(
+                    "El índice semántico contiene fragmentos ajenos a la base fuente"
+                )
+    except SemanticIndexError:
+        raise
+    except sqlite3.Error as exc:
+        raise SemanticIndexError(
+            "No fue posible validar el índice contra la base fuente"
+        ) from exc
+
+
+def _resumable_checkpoint_is_compatible(
+    checkpoint_path: Path,
+    *,
+    database_path: Path,
+    source_fingerprint: str,
+    lexical_dimension: int,
+    semantic_dimension: int,
+    method: str,
+    build_signature: str,
+    neural_model_id: str,
+    neural_model_revision: str,
+) -> bool:
+    if not checkpoint_path.exists():
+        return False
+    try:
+        with sqlite3.connect(
+            f"file:{checkpoint_path}?mode=ro", uri=True
+        ) as connection:
+            metadata = _read_metadata(connection)
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            item_columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(items)")
+            }
+            if not {"items", "neural_embeddings"}.issubset(tables):
+                return False
+            if "content_hash" not in item_columns:
+                return False
+            if str(connection.execute("PRAGMA quick_check").fetchone()[0]).lower() != "ok":
+                return False
+            if any(
+                (
+                    int(metadata.get("format_version", 0)) != 2,
+                    metadata.get("source_fingerprint") != source_fingerprint,
+                    int(metadata.get("lexical_dimension", -1))
+                    != lexical_dimension,
+                    int(metadata.get("semantic_dimension", -1))
+                    != semantic_dimension,
+                    metadata.get("method") != method,
+                    metadata.get("build_signature") != build_signature,
+                    metadata.get("neural_model_id") != neural_model_id,
+                    metadata.get("neural_model_revision")
+                    != neural_model_revision,
+                    metadata.get("neural_vector_encoding")
+                    != NEURAL_VECTOR_ENCODING,
+                    metadata.get("neural_status") not in {"building", "ready"},
+                )
+            ):
+                return False
+            document_count = int(
+                connection.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+            )
+            if document_count != int(metadata.get("documents", -1)):
+                return False
+            if int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM items WHERE length(content_hash) != 32"
+                ).fetchone()[0]
+            ):
+                return False
+            neural_dimension = int(metadata.get("neural_dimension") or 0)
+            if neural_dimension:
+                invalid = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM neural_embeddings "
+                        "WHERE length(neural_vector) != ?",
+                        (neural_dimension,),
+                    ).fetchone()[0]
+                )
+                if invalid:
+                    return False
+            elif int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM neural_embeddings"
+                ).fetchone()[0]
+            ):
+                return False
+    except (OSError, TypeError, ValueError, sqlite3.Error, SemanticIndexError):
+        return False
+    try:
+        _validate_items_against_source(checkpoint_path, database_path)
+    except (OSError, SemanticIndexError):
+        return False
+    return True
+
+
+def _reuse_neural_embeddings(
+    target: sqlite3.Connection,
+    source_path: Path,
+    *,
+    method: str,
+    build_signature: str,
+    neural_model_id: str,
+    neural_model_revision: str,
+    expected_dimension: int | None,
+) -> int | None:
+    """Copia vectores compatibles por hash, sin confiar en ``item_id``."""
+
+    source_path = Path(source_path)
+    if not source_path.exists():
+        return expected_dimension
+    try:
+        with sqlite3.connect(
+            f"file:{source_path}?mode=ro", uri=True
+        ) as source:
+            metadata = _read_metadata(source)
+            tables = {
+                str(row[0])
+                for row in source.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            if int(metadata.get("format_version", 0)) < 2:
+                return expected_dimension
+            if "neural_embeddings" not in tables:
+                return expected_dimension
+            if any(
+                (
+                    metadata.get("method") != method,
+                    metadata.get("build_signature") != build_signature,
+                    metadata.get("neural_model_id") != neural_model_id,
+                    metadata.get("neural_model_revision")
+                    != neural_model_revision,
+                    metadata.get("neural_vector_encoding")
+                    != NEURAL_VECTOR_ENCODING,
+                )
+            ):
+                return expected_dimension
+            source_dimension = int(metadata.get("neural_dimension") or 0)
+            if source_dimension < 1:
+                return expected_dimension
+            if expected_dimension not in {None, source_dimension}:
+                return expected_dimension
+
+        alias = "reusable_neural"
+        target.execute(f"ATTACH DATABASE ? AS {alias}", (str(source_path),))
+        changes_before = target.total_changes
+        try:
+            target.execute(
+                f"""
+                INSERT OR IGNORE INTO neural_embeddings (
+                    content_hash, neural_vector
+                )
+                SELECT reusable.content_hash, reusable.neural_vector
+                FROM {alias}.neural_embeddings AS reusable
+                WHERE length(reusable.content_hash) = 32
+                  AND length(reusable.neural_vector) = ?
+                  AND EXISTS (
+                      SELECT 1 FROM main.items AS item
+                      WHERE item.content_hash = reusable.content_hash
+                  )
+                """,
+                (source_dimension,),
+            )
+            target.commit()
+        except Exception:
+            target.rollback()
+            raise
+        finally:
+            target.execute(f"DETACH DATABASE {alias}")
+        if target.total_changes > changes_before or expected_dimension is not None:
+            return source_dimension
+        return expected_dimension
+    except (OSError, TypeError, ValueError, sqlite3.Error, SemanticIndexError):
+        # Una caché vieja o dañada nunca invalida la construcción nueva.
+        return expected_dimension
+
+
+def _prepare_resumable_semantic_checkpoint(
+    database_path: Path,
+    published_index_path: Path,
+    checkpoint_path: Path,
+    *,
+    lexical_dimension: int,
+    semantic_dimension: int,
+    neural_model_id: str,
+    neural_model_revision: str,
+) -> tuple[bool, str, str, str]:
+    source_fingerprint = semantic_source_fingerprint(database_path)
+    method, build_signature = semantic_build_spec(
+        neural_enabled=True,
+        neural_model_id=neural_model_id,
+        neural_model_revision=neural_model_revision,
+    )
+    if _resumable_checkpoint_is_compatible(
+        checkpoint_path,
+        database_path=database_path,
+        source_fingerprint=source_fingerprint,
+        lexical_dimension=lexical_dimension,
+        semantic_dimension=semantic_dimension,
+        method=method,
+        build_signature=build_signature,
+        neural_model_id=neural_model_id,
+        neural_model_revision=neural_model_revision,
+    ):
+        return True, source_fingerprint, method, build_signature
+
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = checkpoint_path.with_name(
+        f".{checkpoint_path.name}.preparing-{os.getpid()}"
+    )
+    temporary_path.unlink(missing_ok=True)
+    reuse_paths = tuple(
+        path
+        for path in (checkpoint_path, published_index_path)
+        if path.exists() and path.resolve() != temporary_path.resolve()
+    )
+    try:
+        build_semantic_index(
+            database_path,
+            temporary_path,
+            lexical_dimension=lexical_dimension,
+            semantic_dimension=semantic_dimension,
+            neural_enabled=False,
+        )
+        with sqlite3.connect(temporary_path) as connection:
+            neural_dimension: int | None = None
+            for reuse_path in reuse_paths:
+                neural_dimension = _reuse_neural_embeddings(
+                    connection,
+                    reuse_path,
+                    method=method,
+                    build_signature=build_signature,
+                    neural_model_id=neural_model_id,
+                    neural_model_revision=neural_model_revision,
+                    expected_dimension=neural_dimension,
+                )
+            documents_covered, unique_covered, unique_total = _neural_coverage(
+                connection,
+                neural_dimension,
+            )
+            _upsert_metadata(
+                connection,
+                {
+                    "method": method,
+                    "build_signature": build_signature,
+                    "source_fingerprint": source_fingerprint,
+                    "neural_status": (
+                        "ready"
+                        if documents_covered
+                        == int(
+                            connection.execute(
+                                "SELECT COUNT(*) FROM items"
+                            ).fetchone()[0]
+                        )
+                        else "building"
+                    ),
+                    "neural_documents": documents_covered,
+                    "neural_unique_texts": unique_covered,
+                    "neural_unique_texts_total": unique_total,
+                    "neural_dimension": neural_dimension,
+                    "neural_model_id": neural_model_id,
+                    "neural_model_revision": neural_model_revision,
+                    "neural_vector_encoding": NEURAL_VECTOR_ENCODING,
+                    "neural_input_signature": NEURAL_INPUT_SIGNATURE,
+                    "neural_error": None,
+                },
+            )
+            connection.commit()
+            if str(connection.execute("PRAGMA quick_check").fetchone()[0]).lower() != "ok":
+                raise SemanticIndexError(
+                    "La candidata semántica no supera la comprobación SQLite"
+                )
+        os.replace(temporary_path, checkpoint_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return False, source_fingerprint, method, build_signature
+
+
+def build_or_resume_semantic_index(
+    database_path: Path,
+    published_index_path: Path,
+    checkpoint_path: Path,
+    *,
+    lexical_dimension: int = 256,
+    semantic_dimension: int = 64,
+    neural_model_id: str = DEFAULT_NEURAL_MODEL_ID,
+    neural_model_revision: str = DEFAULT_NEURAL_MODEL_REVISION,
+    neural_batch_size: int = 64,
+    max_unique_texts: int = 0,
+    max_seconds: float = 0,
+    neural_encoder: DenseTextEncoder | None = None,
+) -> ResumableSemanticBuildSummary:
+    """Avanza un índice neuronal durable y solo lo publica al completarlo.
+
+    El checkpoint se confirma después de cada lote. Los vectores se identifican
+    por el hash del texto exacto, por lo que se reutilizan aunque cambien los
+    identificadores SQLite durante una reconstrucción.
+    """
+
+    database_path = Path(database_path)
+    published_index_path = Path(published_index_path)
+    checkpoint_path = Path(checkpoint_path)
+    resolved_paths = {
+        database_path.resolve(),
+        published_index_path.resolve(),
+        checkpoint_path.resolve(),
+    }
+    if len(resolved_paths) != 3:
+        raise ValueError(
+            "La base fuente, el índice publicado y el checkpoint deben ser distintos"
+        )
+    if neural_batch_size < 1:
+        raise ValueError("neural_batch_size debe ser mayor que cero")
+    if max_unique_texts < 0 or max_seconds < 0:
+        raise ValueError("Los límites de la construcción no pueden ser negativos")
+    if neural_encoder is not None and (
+        neural_encoder.model_id != neural_model_id
+        or neural_encoder.model_revision != neural_model_revision
+    ):
+        raise ValueError(
+            "El codificador inyectado no coincide con el modelo fijado"
+        )
+
+    checkpoint_reused, source_fingerprint, method, build_signature = (
+        _prepare_resumable_semantic_checkpoint(
+            database_path,
+            published_index_path,
+            checkpoint_path,
+            lexical_dimension=lexical_dimension,
+            semantic_dimension=semantic_dimension,
+            neural_model_id=neural_model_id,
+            neural_model_revision=neural_model_revision,
+        )
+    )
+    started = time.monotonic()
+    with sqlite3.connect(checkpoint_path) as checkpoint:
+        metadata = _read_metadata(checkpoint)
+        neural_dimension = int(metadata.get("neural_dimension") or 0) or None
+        documents_before, unique_before, unique_total = _neural_coverage(
+            checkpoint,
+            neural_dimension,
+        )
+        documents_total = int(metadata["documents"])
+        if documents_total < 1:
+            raise SemanticIndexError(
+                "La base fuente no contiene fragmentos semánticos indexables"
+            )
+        documents_reused = documents_before if not checkpoint_reused else 0
+        documents_confirmed = documents_before
+        unique_confirmed = unique_before
+
+        remaining_unique = max(0, unique_total - unique_before)
+        if remaining_unique:
+            encoder = neural_encoder or _fastembed_encoder(
+                neural_model_id,
+                neural_model_revision,
+            )
+            limit_clause = ""
+            parameters: tuple[int, ...] = ()
+            if max_unique_texts:
+                limit_clause = "LIMIT ?"
+                parameters = (max_unique_texts,)
+            pending = checkpoint.execute(
+                f"""
+                SELECT item.content_hash, MIN(item.item_id), COUNT(*)
+                FROM items AS item
+                LEFT JOIN neural_embeddings AS neural
+                  ON neural.content_hash = item.content_hash
+                WHERE neural.content_hash IS NULL
+                GROUP BY item.content_hash
+                ORDER BY MIN(item.item_id)
+                {limit_clause}
+                """,
+                parameters,
+            ).fetchall()
+            with sqlite3.connect(
+                f"file:{database_path}?mode=ro", uri=True
+            ) as source:
+                for offset in range(0, len(pending), neural_batch_size):
+                    if max_seconds and time.monotonic() - started >= max_seconds:
+                        break
+                    batch = pending[offset : offset + neural_batch_size]
+                    item_ids = [int(row[1]) for row in batch]
+                    placeholders = ",".join("?" for _ in item_ids)
+                    texts = {
+                        int(item_id): str(text)
+                        for item_id, text in source.execute(
+                            "SELECT id, text FROM chunks "
+                            f"WHERE id IN ({placeholders})",
+                            item_ids,
+                        )
+                    }
+                    ordered_texts = [texts[item_id] for item_id in item_ids]
+                    for (content_hash, _, _), text in zip(batch, ordered_texts):
+                        if bytes(content_hash) != semantic_content_hash(text):
+                            raise SemanticIndexError(
+                                "El checkpoint no coincide con el texto fuente"
+                            )
+                    vectors = encoder.encode_passages(
+                        ordered_texts,
+                        batch_size=neural_batch_size,
+                    )
+                    if len(vectors) != len(batch):
+                        raise NeuralSemanticUnavailable(
+                            "El modelo neuronal no devolvió un vector por texto"
+                        )
+                    rows: list[tuple[bytes, bytes]] = []
+                    for (content_hash, _, _), vector in zip(batch, vectors):
+                        normalized = _validated_dense_vector(vector)
+                        if neural_dimension is None:
+                            neural_dimension = len(normalized)
+                        elif len(normalized) != neural_dimension:
+                            raise NeuralSemanticUnavailable(
+                                "El modelo neuronal cambió de dimensión"
+                            )
+                        rows.append((bytes(content_hash), _pack_vector(normalized)))
+                    try:
+                        checkpoint.executemany(
+                            """
+                            INSERT INTO neural_embeddings (
+                                content_hash, neural_vector
+                            ) VALUES (?, ?)
+                            ON CONFLICT(content_hash) DO UPDATE SET
+                                neural_vector = excluded.neural_vector
+                            """,
+                            rows,
+                        )
+                        covered_now = sum(int(row[2]) for row in batch)
+                        documents_confirmed += covered_now
+                        unique_confirmed += len(batch)
+                        _upsert_metadata(
+                            checkpoint,
+                            {
+                                "neural_status": "building",
+                                "neural_documents": documents_confirmed,
+                                "neural_unique_texts": unique_confirmed,
+                                "neural_unique_texts_total": unique_total,
+                                "neural_dimension": neural_dimension,
+                            },
+                        )
+                        checkpoint.commit()
+                    except Exception:
+                        checkpoint.rollback()
+                        raise
+                    current_documents = documents_confirmed
+                    if (
+                        current_documents == documents_total
+                        or current_documents % 5_000 < covered_now
+                    ):
+                        print(
+                            "Embeddings neuronales confirmados: "
+                            f"{current_documents}/{documents_total}",
+                            flush=True,
+                        )
+
+        documents_after, unique_after, unique_total = _neural_coverage(
+            checkpoint,
+            neural_dimension,
+        )
+        remaining = max(0, documents_total - documents_after)
+        complete = remaining == 0
+        if complete:
+            _upsert_metadata(
+                checkpoint,
+                {
+                    "neural_status": "ready",
+                    "neural_documents": documents_total,
+                    "neural_unique_texts": unique_total,
+                    "neural_unique_texts_total": unique_total,
+                    "neural_dimension": neural_dimension,
+                    "neural_error": None,
+                },
+            )
+            checkpoint.commit()
+            if str(checkpoint.execute("PRAGMA quick_check").fetchone()[0]).lower() != "ok":
+                raise SemanticIndexError(
+                    "El índice neuronal completo no supera integridad SQLite"
+                )
+
+    if complete:
+        # La validación estricta ocurre antes de tocar el índice publicado.
+        semantic_index_info(checkpoint_path)
+        _validate_items_against_source(checkpoint_path, database_path)
+        published_index_path.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(checkpoint_path, published_index_path)
+        result_path = published_index_path
+    else:
+        result_path = checkpoint_path
+
+    return ResumableSemanticBuildSummary(
+        complete=complete,
+        checkpoint_reused=checkpoint_reused,
+        documents_total=documents_total,
+        documents_before=documents_before,
+        documents_after=documents_after,
+        documents_encoded=max(0, documents_after - documents_before),
+        documents_reused=documents_reused,
+        documents_remaining=remaining,
+        unique_texts_total=unique_total,
+        unique_texts_before=unique_before,
+        unique_texts_after=unique_after,
+        unique_texts_encoded=max(0, unique_after - unique_before),
+        neural_dimension=neural_dimension,
+        source_fingerprint=source_fingerprint,
+        method=method,
+        build_signature=build_signature,
+        index_size_bytes=result_path.stat().st_size,
+    )
 
 
 @lru_cache(maxsize=8)
@@ -1012,10 +1709,6 @@ def semantic_index_info(index_path: Path) -> dict[str, object]:
                     str(row[1])
                     for row in connection.execute("PRAGMA table_info(items)")
                 }
-                if "neural_vector" not in item_columns:
-                    raise SemanticIndexError(
-                        "El índice declara embeddings neuronales pero no los contiene"
-                    )
                 try:
                     neural_dimension = int(info["neural_dimension"])
                     neural_documents = int(info["neural_documents"])
@@ -1023,13 +1716,58 @@ def semantic_index_info(index_path: Path) -> dict[str, object]:
                     raise SemanticIndexError(
                         "Los metadatos neuronales del índice son inválidos"
                     ) from exc
-                neural_count = int(
-                    connection.execute(
-                        "SELECT COUNT(*) FROM items "
-                        "WHERE length(neural_vector) = ?",
-                        (neural_dimension,),
-                    ).fetchone()[0]
-                )
+                if int(info.get("format_version", 1)) >= 2:
+                    if (
+                        "content_hash" not in item_columns
+                        or "neural_embeddings" not in tables
+                    ):
+                        raise SemanticIndexError(
+                            "El índice neuronal no contiene su caché por contenido"
+                        )
+                    invalid_hashes = int(
+                        connection.execute(
+                            "SELECT COUNT(*) FROM items "
+                            "WHERE length(content_hash) != 32"
+                        ).fetchone()[0]
+                    )
+                    missing_neural = int(
+                        connection.execute(
+                            """
+                            SELECT COUNT(*)
+                            FROM items AS item
+                            LEFT JOIN neural_embeddings AS neural
+                              ON neural.content_hash = item.content_hash
+                            WHERE neural.neural_vector IS NULL
+                               OR length(neural.neural_vector) != ?
+                            """,
+                            (neural_dimension,),
+                        ).fetchone()[0]
+                    )
+                    neural_count = declared_documents - missing_neural
+                    unique_texts = int(
+                        connection.execute(
+                            "SELECT COUNT(DISTINCT content_hash) FROM items"
+                        ).fetchone()[0]
+                    )
+                    declared_unique = int(
+                        info.get("neural_unique_texts", unique_texts)
+                    )
+                    if invalid_hashes or declared_unique != unique_texts:
+                        raise SemanticIndexError(
+                            "La identidad de contenido del índice es inválida"
+                        )
+                else:
+                    if "neural_vector" not in item_columns:
+                        raise SemanticIndexError(
+                            "El índice declara embeddings neuronales pero no los contiene"
+                        )
+                    neural_count = int(
+                        connection.execute(
+                            "SELECT COUNT(*) FROM items "
+                            "WHERE length(neural_vector) = ?",
+                            (neural_dimension,),
+                        ).fetchone()[0]
+                    )
                 if (
                     neural_dimension < 1
                     or neural_documents != declared_documents
@@ -1137,11 +1875,24 @@ def _item_rows(
     *,
     include_neural: bool = False,
 ) -> Iterator[tuple[int, bytes, bytes, bytes | None]]:
-    neural_column = "neural_vector" if include_neural else "NULL AS neural_vector"
+    has_neural_table = connection.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type='table' AND name='neural_embeddings'"
+    ).fetchone() is not None
+    if include_neural and has_neural_table:
+        neural_column = "neural.neural_vector"
+        join_clause = (
+            "LEFT JOIN neural_embeddings AS neural "
+            "ON neural.content_hash = item.content_hash"
+        )
+    else:
+        neural_column = "item.neural_vector" if include_neural else "NULL"
+        join_clause = ""
     if candidate_ids is None:
         yield from connection.execute(
-            "SELECT item_id, lexical_vector, distributional_vector, "
-            f"{neural_column} FROM items"
+            "SELECT item.item_id, item.lexical_vector, "
+            "item.distributional_vector, "
+            f"{neural_column} FROM items AS item {join_clause}"
         )
         return
     unique_ids = list(dict.fromkeys(int(item_id) for item_id in candidate_ids))
@@ -1150,9 +1901,11 @@ def _item_rows(
         placeholders = ",".join("?" for _ in batch)
         yield from connection.execute(
             f"""
-            SELECT item_id, lexical_vector, distributional_vector,
+            SELECT item.item_id, item.lexical_vector,
+                   item.distributional_vector,
                    {neural_column}
-            FROM items WHERE item_id IN ({placeholders})
+            FROM items AS item {join_clause}
+            WHERE item.item_id IN ({placeholders})
             """,
             batch,
         )

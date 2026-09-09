@@ -105,6 +105,13 @@ class ReprocessCorpusTests(unittest.TestCase):
             (resume / "candidate/data/semantic.db").write_bytes(
                 b"semantic-candidate"
             )
+            (resume / "candidate/data/semantic.checkpoint.db").write_bytes(
+                b"semantic-checkpoint"
+            )
+            (resume / "candidate/data/semantic-progress.json").write_text(
+                '{"complete": false}',
+                encoding="utf-8",
+            )
             _atomic_json(
                 resume / "candidate/checkpoint.json",
                 {
@@ -131,6 +138,22 @@ class ReprocessCorpusTests(unittest.TestCase):
             self.assertEqual(
                 (resumed_workspace / "candidate/data/semantic.db").read_bytes(),
                 b"semantic-candidate",
+            )
+            self.assertEqual(
+                (
+                    resumed_workspace
+                    / "candidate/data/semantic.checkpoint.db"
+                ).read_bytes(),
+                b"semantic-checkpoint",
+            )
+            self.assertEqual(
+                json.loads(
+                    (
+                        resumed_workspace
+                        / "candidate/data/semantic-progress.json"
+                    ).read_text(encoding="utf-8")
+                )["complete"],
+                False,
             )
 
             with sqlite3.connect(published / "actas.db") as connection:
@@ -573,6 +596,11 @@ class ReprocessCorpusTests(unittest.TestCase):
         self.assertIn("--github-summary \"$GITHUB_STEP_SUMMARY\"", workflow)
         self.assertIn("path: .reprocess/export/", workflow)
         self.assertIn(".reprocess/candidate/data/semantic.db", workflow)
+        self.assertIn(
+            ".reprocess/candidate/data/semantic.checkpoint.db",
+            workflow,
+        )
+        self.assertIn("steps.semantic.outputs.complete", workflow)
         self.assertEqual(
             workflow.count("python reprocess_corpus.py validate"),
             1,

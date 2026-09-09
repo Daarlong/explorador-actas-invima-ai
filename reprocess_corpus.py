@@ -68,6 +68,10 @@ WORKFLOW_REPORT_EXPORTS = (
     ("candidate/data/integrity-report.json", "candidate-integrity-report.json"),
     ("candidate/data/semantic-report.json", "candidate-semantic-report.json"),
     (
+        "candidate/data/semantic-progress.json",
+        "candidate-semantic-progress.json",
+    ),
+    (
         "candidate/data/reconciliation-report.json",
         "candidate-reconciliation-report.json",
     ),
@@ -390,6 +394,12 @@ def prepare_workspace(
         resume_checkpoint_path = resume_root / "candidate" / "checkpoint.json"
         resume_database = resume_root / "candidate" / "data" / "actas.db"
         resume_semantic = resume_root / "candidate" / "data" / "semantic.db"
+        resume_semantic_checkpoint = (
+            resume_root / "candidate" / "data" / "semantic.checkpoint.db"
+        )
+        resume_semantic_progress = (
+            resume_root / "candidate" / "data" / "semantic-progress.json"
+        )
         resume_state = _load_json(resume_state_path)
         resume_checkpoint = _load_json(resume_checkpoint_path)
         if (
@@ -421,6 +431,16 @@ def prepare_workspace(
         if resume_semantic.exists():
             shutil.copy2(resume_semantic, candidate_data / "semantic.db")
             resumed_semantic = True
+        if resume_semantic_checkpoint.exists():
+            shutil.copy2(
+                resume_semantic_checkpoint,
+                candidate_data / "semantic.checkpoint.db",
+            )
+        if resume_semantic_progress.exists():
+            shutil.copy2(
+                resume_semantic_progress,
+                candidate_data / "semantic-progress.json",
+            )
         shutil.copy2(resume_checkpoint_path, candidate_dir / "checkpoint.json")
         resumed = True
 

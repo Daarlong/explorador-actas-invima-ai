@@ -5,28 +5,28 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from build_index import remove_semantic_artifacts
+from build_index import remove_semantic_checkpoint
 
 
 class BuildIndexTests(unittest.TestCase):
-    def test_removes_stale_semantic_package_after_failure(self) -> None:
+    def test_removes_only_checkpoint_and_preserves_published_index(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            database = Path(temporary) / "semantic.db"
-            paths = [
-                database,
-                Path(temporary) / "semantic.db.gz",
-                Path(temporary) / "semantic.db.package.json",
-                Path(temporary) / "semantic.db.package-id",
-                Path(temporary) / "semantic.db.gz.part-000",
-                Path(temporary) / "semantic.db.gz.part-001",
+            published = Path(temporary) / "semantic.db"
+            checkpoint = Path(temporary) / "semantic.checkpoint.db"
+            checkpoint_paths = [
+                checkpoint,
+                Path(temporary) / "semantic.checkpoint.db-shm",
+                Path(temporary) / "semantic.checkpoint.db-wal",
             ]
-            for path in paths:
+            published.write_bytes(b"published")
+            for path in checkpoint_paths:
                 path.write_bytes(b"stale")
 
-            with patch("build_index.SEMANTIC_INDEX_PATH", database):
-                remove_semantic_artifacts()
+            with patch("build_index.SEMANTIC_CHECKPOINT_PATH", checkpoint):
+                remove_semantic_checkpoint()
 
-            self.assertTrue(all(not path.exists() for path in paths))
+            self.assertTrue(all(not path.exists() for path in checkpoint_paths))
+            self.assertEqual(published.read_bytes(), b"published")
 
 
 if __name__ == "__main__":
