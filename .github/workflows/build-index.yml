@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: write
   contents: write
 
 concurrency:
@@ -18,6 +19,13 @@ jobs:
       ACTAS_DISABLE_DATABASE_PACKAGE: "1"
       ACTAS_DATABASE_PATH: data/actas.db
       ACTAS_SEMANTIC_INDEX_PATH: data/semantic.db
+      ACTAS_SEMANTIC_CHECKPOINT_PATH: data/semantic.checkpoint.db
+      ACTAS_SEMANTIC_PROGRESS_PATH: data/semantic-progress.json
+      ACTAS_SEMANTIC_BACKEND: neural
+      ACTAS_SEMANTIC_MODEL_CACHE: local_cache/fastembed
+      ACTAS_SEMANTIC_MAX_SECONDS: "7200"
+      ACTAS_SEMANTIC_MAX_UNIQUE: "50000"
+      ACTAS_SEMANTIC_NEURAL_BATCH_SIZE: "128"
       ACTAS_INDEX_START_YEAR: "2013"
       ACTAS_OCR_ENABLED: "1"
       ACTAS_OCR_LANGUAGES: "spa+eng"
@@ -25,6 +33,15 @@ jobs:
     steps:
       - name: Descargar código
         uses: actions/checkout@v7
+
+      - name: Recuperar último avance neuronal
+        id: semantic-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: .index-checkpoint
+          key: semantic-resume-v2-${{ runner.os }}-${{ github.ref_name }}-${{ hashFiles('documents_manifest.csv') }}-${{ hashFiles('data/actas.db.package.json') }}-${{ hashFiles('services/database.py', 'services/indexing.py', 'services/pdf_reader.py', 'services/regulatory.py', 'services/text_utils.py', 'config.py', 'requirements.txt') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            semantic-resume-v2-${{ runner.os }}-${{ github.ref_name }}-${{ hashFiles('documents_manifest.csv') }}-${{ hashFiles('data/actas.db.package.json') }}-${{ hashFiles('services/database.py', 'services/indexing.py', 'services/pdf_reader.py', 'services/regulatory.py', 'services/text_utils.py', 'config.py', 'requirements.txt') }}-
 
       - name: Configurar Python
         uses: actions/setup-python@v7
@@ -40,8 +57,43 @@ jobs:
           restore-keys: |
             actas-pdf-${{ runner.os }}-
 
+      - name: Restaurar modelo semántico multilingüe
+        uses: actions/cache@v6
+        with:
+          path: local_cache/fastembed
+          key: fastembed-0.8.0-paraphrase-multilingual-minilm-l12-v2
+
       - name: Instalar dependencias
         run: python -m pip install --requirement requirements.txt
+
+      - name: Restaurar bases de una ejecución incompleta
+        id: checkpoint-state
+        shell: bash
+        run: |
+          state=.index-checkpoint/semantic-progress.json
+          source_database=.index-checkpoint/actas.db
+          semantic_checkpoint=.index-checkpoint/semantic.checkpoint.db
+          restored=false
+
+          if [ -s "$state" ] && [ -s "$source_database" ] && [ -s "$semantic_checkpoint" ]; then
+            complete=$(python -c \
+              'import json, sys; value=json.load(open(sys.argv[1], encoding="utf-8")); print("true" if value.get("complete") is True else "false")' \
+              "$state")
+            if [ "$complete" = "false" ]; then
+              mkdir -p data
+              cp "$source_database" data/actas.db
+              cp "$semantic_checkpoint" data/semantic.checkpoint.db
+              cp "$state" data/semantic-progress.json
+              restored=true
+            fi
+          fi
+
+          echo "restored=$restored" >> "$GITHUB_OUTPUT"
+          if [ "$restored" = "true" ]; then
+            echo "Se recuperó un tramo neuronal incompleto; continuará sin repetirlo."
+          else
+            echo "No hay un tramo incompleto compatible; se usará la base publicada."
+          fi
 
       - name: Instalar reconocimiento óptico en español
         run: |
@@ -52,48 +104,256 @@ jobs:
         run: python -m unittest discover -v
 
       - name: Restaurar índice anterior
+        env:
+          CHECKPOINT_RESTORED: ${{ steps.checkpoint-state.outputs.restored }}
+        shell: bash
         run: |
-          python package_index.py restore --database data/actas.db
+          if [ "$CHECKPOINT_RESTORED" != "true" ]; then
+            python package_index.py restore --database data/actas.db
+          else
+            echo "Se conserva actas.db del checkpoint para garantizar la misma fuente."
+          fi
           python package_index.py restore --database data/semantic.db
 
       - name: Construir o actualizar base de búsqueda
-        run: python build_index.py --allow-partial
+        id: build
+        run: python build_index.py --allow-partial --fail-on-semantic-error
+
+      - name: Preparar recuperación tras un fallo neuronal
+        id: failed-checkpoint
+        if: ${{ failure() && steps.build.outcome == 'failure' }}
+        shell: bash
+        run: |
+          echo "ready=false" >> "$GITHUB_OUTPUT"
+          set +e
+          python - <<'PY'
+          import json
+          import sqlite3
+          from pathlib import Path
+
+          required = (
+              Path("data/actas.db"),
+              Path("data/semantic.checkpoint.db"),
+              Path("data/semantic-progress.json"),
+          )
+          if not all(path.is_file() and path.stat().st_size > 0 for path in required):
+              raise SystemExit(1)
+          try:
+              progress = json.loads(required[2].read_text(encoding="utf-8"))
+          except (OSError, json.JSONDecodeError):
+              raise SystemExit(1)
+          if progress.get("complete") is not False:
+              raise SystemExit(1)
+          for database in required[:2]:
+              try:
+                  with sqlite3.connect(database) as connection:
+                      integrity = connection.execute(
+                          "PRAGMA integrity_check"
+                      ).fetchone()[0]
+              except sqlite3.Error:
+                  raise SystemExit(1)
+              if str(integrity).lower() != "ok":
+                  raise SystemExit(1)
+          PY
+          validation_status=$?
+          set -e
+          if [ "$validation_status" -ne 0 ]; then
+            echo "No hay un checkpoint íntegro que conservar tras el fallo."
+            exit 0
+          fi
+
+          rm -rf .index-checkpoint
+          mkdir -p .index-checkpoint
+          cp data/actas.db .index-checkpoint/actas.db
+          cp data/semantic.checkpoint.db .index-checkpoint/semantic.checkpoint.db
+          cp data/semantic-progress.json .index-checkpoint/semantic-progress.json
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+          echo "Se conservará el último lote confirmado para el reintento."
+
+      - name: Conservar recuperación tras un fallo neuronal
+        if: >-
+          ${{ failure() &&
+              steps.build.outcome == 'failure' &&
+              steps.failed-checkpoint.outputs.ready == 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: .index-checkpoint
+          key: semantic-resume-v2-${{ runner.os }}-${{ github.ref_name }}-${{ hashFiles('documents_manifest.csv') }}-${{ hashFiles('data/actas.db.package.json') }}-${{ hashFiles('services/database.py', 'services/indexing.py', 'services/pdf_reader.py', 'services/regulatory.py', 'services/text_utils.py', 'config.py', 'requirements.txt') }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Leer avance de embeddings
+        id: semantic-state
+        shell: bash
+        run: |
+          python - "$GITHUB_OUTPUT" "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          report_path = Path("data/semantic-progress.json")
+          if not report_path.is_file():
+              raise SystemExit("No se generó data/semantic-progress.json")
+          try:
+              report = json.loads(report_path.read_text(encoding="utf-8"))
+          except (OSError, json.JSONDecodeError) as exc:
+              raise SystemExit(f"El informe de avance neuronal no es válido: {exc}")
+
+          required = {
+              "complete",
+              "progress_made",
+              "before",
+              "after",
+              "remaining",
+              "segments_completed",
+          }
+          missing = sorted(required.difference(report))
+          if missing:
+              raise SystemExit(
+                  "El informe de avance no contiene: " + ", ".join(missing)
+              )
+          if not isinstance(report["complete"], bool):
+              raise SystemExit("complete debe ser booleano")
+          if not isinstance(report["progress_made"], bool):
+              raise SystemExit("progress_made debe ser booleano")
+          for field in ("before", "after", "remaining", "segments_completed"):
+              value = report[field]
+              if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                  raise SystemExit(f"{field} debe ser un entero no negativo")
+          if report["after"] < report["before"]:
+              raise SystemExit("El avance neuronal retrocedió")
+          if report["complete"] and report["remaining"] != 0:
+              raise SystemExit("Un índice completo no puede conservar pendientes")
+
+          with Path(sys.argv[1]).open("a", encoding="utf-8") as output:
+              for field in required:
+                  value = report[field]
+                  if isinstance(value, bool):
+                      value = str(value).lower()
+                  output.write(f"{field}={value}\n")
+
+          status = "completo" if report["complete"] else "en construcción"
+          with Path(sys.argv[2]).open("a", encoding="utf-8") as summary:
+              summary.write("## Avance del índice neuronal\n\n")
+              summary.write(f"- Estado: **{status}**\n")
+              summary.write(
+                  f"- Embeddings disponibles: **{report['after']}**\n"
+              )
+              summary.write(f"- Pendientes: **{report['remaining']}**\n")
+              summary.write(
+                  f"- Segmentos terminados: **{report['segments_completed']}**\n"
+              )
+          PY
 
       - name: Comprimir, verificar y dividir los índices
+        if: ${{ steps.semantic-state.outputs.complete == 'true' }}
         shell: bash
         run: |
           python package_index.py create --database data/actas.db --part-size-mib 90 --delete-source
-          if [ -f data/semantic.db ]; then
-            python package_index.py create --database data/semantic.db --part-size-mib 90 --delete-source
-          fi
+          python package_index.py create --database data/semantic.db --part-size-mib 90 --delete-source
 
       - name: Restaurar y verificar los paquetes generados
+        if: ${{ steps.semantic-state.outputs.complete == 'true' }}
         shell: bash
         run: |
           python package_index.py verify \
             --database data/actas.db \
             --target .package-smoke/actas.db
-          if [ -f data/semantic.db.package.json ]; then
-            python package_index.py verify \
-              --database data/semantic.db \
-              --target .package-smoke/semantic.db
-          fi
+          python package_index.py verify \
+            --database data/semantic.db \
+            --target .package-smoke/semantic.db
 
       - name: Guardar índice e informe en el repositorio privado
+        if: ${{ steps.semantic-state.outputs.complete == 'true' }}
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm -f --ignore-unmatch pages/8_Revision_Fichas.py
           git add -u data
-          git add data/actas.db.package.json data/integrity-report.json data/indexing-report.json data/semantic-report.json
+          git add \
+            data/actas.db.package.json \
+            data/integrity-report.json \
+            data/indexing-report.json \
+            data/semantic-progress.json \
+            data/semantic-report.json
           git add -f data/actas.db.gz.part-*
-          if [ -f data/semantic.db.package.json ]; then
-            git add data/semantic.db.package.json
-            git add -f data/semantic.db.gz.part-*
-          fi
+          git add data/semantic.db.package.json
+          git add -f data/semantic.db.gz.part-*
           if git diff --cached --quiet; then
             echo "El índice ya estaba actualizado."
           else
             git commit -m "Actualizar índice e integridad de actas"
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
+
+      - name: Preparar checkpoint reanudable
+        if: ${{ steps.semantic-state.outputs.complete != 'true' }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import sqlite3
+          from pathlib import Path
+
+          for database in (
+              Path("data/actas.db"),
+              Path("data/semantic.checkpoint.db"),
+          ):
+              if not database.is_file():
+                  raise SystemExit(f"Falta la base requerida para continuar: {database}")
+              with sqlite3.connect(database) as connection:
+                  integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+              if str(integrity).lower() != "ok":
+                  raise SystemExit(f"El checkpoint no supera integridad: {database}")
+          PY
+
+          rm -rf .index-checkpoint
+          mkdir -p .index-checkpoint
+          cp data/actas.db .index-checkpoint/actas.db
+          cp data/semantic.checkpoint.db .index-checkpoint/semantic.checkpoint.db
+          cp data/semantic-progress.json .index-checkpoint/semantic-progress.json
+
+      - name: Conservar avance neuronal
+        if: ${{ steps.semantic-state.outputs.complete != 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: .index-checkpoint
+          key: semantic-resume-v2-${{ runner.os }}-${{ github.ref_name }}-${{ hashFiles('documents_manifest.csv') }}-${{ hashFiles('data/actas.db.package.json') }}-${{ hashFiles('services/database.py', 'services/indexing.py', 'services/pdf_reader.py', 'services/regulatory.py', 'services/text_utils.py', 'config.py', 'requirements.txt') }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Validar continuación automática
+        if: ${{ steps.semantic-state.outputs.complete != 'true' }}
+        env:
+          PROGRESS_MADE: ${{ steps.semantic-state.outputs.progress_made }}
+          SEGMENTS_COMPLETED: ${{ steps.semantic-state.outputs.segments_completed }}
+        shell: bash
+        run: |
+          if [ "$PROGRESS_MADE" != "true" ]; then
+            echo "No se calculó ningún embedding nuevo; se detiene para evitar un ciclo."
+            exit 1
+          fi
+          if [ "$SEGMENTS_COMPLETED" -ge 20 ]; then
+            echo "Se alcanzó el límite de 20 segmentos automáticos."
+            exit 1
+          fi
+
+      - name: Programar el siguiente segmento
+        if: ${{ steps.semantic-state.outputs.complete != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh workflow run build-index.yml --ref "$GITHUB_REF_NAME"
+          echo "La siguiente ejecución quedó en cola y restaurará este avance."
+
+      - name: Preparar marcador de finalización
+        if: ${{ steps.semantic-state.outputs.complete == 'true' }}
+        shell: bash
+        run: |
+          rm -rf .index-checkpoint
+          mkdir -p .index-checkpoint
+          cp data/semantic-progress.json .index-checkpoint/semantic-progress.json
+
+      - name: Cerrar cadena de checkpoints
+        if: ${{ steps.semantic-state.outputs.complete == 'true' }}
+        uses: actions/cache/save@v6
+        with:
+          path: .index-checkpoint
+          key: semantic-resume-v2-${{ runner.os }}-${{ github.ref_name }}-${{ hashFiles('documents_manifest.csv') }}-${{ hashFiles('data/actas.db.package.json') }}-${{ hashFiles('services/database.py', 'services/indexing.py', 'services/pdf_reader.py', 'services/regulatory.py', 'services/text_utils.py', 'config.py', 'requirements.txt') }}-${{ github.run_id }}-${{ github.run_attempt }}

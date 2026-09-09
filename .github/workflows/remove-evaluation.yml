@@ -1,4 +1,4 @@
-name: Retirar módulo de evaluación
+name: Retirar módulos de evaluación y corrección
 
 on:
   workflow_dispatch:
@@ -22,6 +22,7 @@ jobs:
         run: |
           git rm -f --ignore-unmatch \
             pages/6_Evaluacion.py \
+            pages/8_Revision_Fichas.py \
             services/evaluation.py \
             evaluate_search.py \
             evaluation_cases.csv \
@@ -35,8 +36,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           if git diff --cached --quiet; then
-            echo "El módulo de evaluación ya no estaba presente."
+            echo "Los módulos de evaluación y corrección ya no estaban presentes."
           else
-            git commit -m "Retirar módulo de evaluación"
+            git commit -m "Retirar módulos de evaluación y corrección"
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi

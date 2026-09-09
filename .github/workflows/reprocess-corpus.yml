@@ -38,6 +38,13 @@ jobs:
       ACTAS_DISABLE_DATABASE_PACKAGE: "1"
       ACTAS_DATABASE_PATH: .reprocess/candidate/data/actas.db
       ACTAS_SEMANTIC_INDEX_PATH: .reprocess/candidate/data/semantic.db
+      ACTAS_SEMANTIC_CHECKPOINT_PATH: .reprocess/candidate/data/semantic.checkpoint.db
+      ACTAS_SEMANTIC_PROGRESS_PATH: .reprocess/candidate/data/semantic-progress.json
+      ACTAS_SEMANTIC_BACKEND: neural
+      ACTAS_SEMANTIC_MODEL_CACHE: local_cache/fastembed
+      ACTAS_SEMANTIC_MAX_SECONDS: "7200"
+      ACTAS_SEMANTIC_MAX_UNIQUE: "50000"
+      ACTAS_SEMANTIC_NEURAL_BATCH_SIZE: "128"
       ACTAS_INDEXING_REPORT_PATH: .reprocess/candidate/data/indexing-report.json
       ACTAS_INTEGRITY_REPORT_PATH: .reprocess/candidate/data/integrity-report.json
       ACTAS_SEMANTIC_REPORT_PATH: .reprocess/candidate/data/semantic-report.json
@@ -66,6 +73,12 @@ jobs:
           restore-keys: |
             actas-pdf-${{ runner.os }}-${{ hashFiles('documents_manifest.csv') }}-
             actas-pdf-${{ runner.os }}-
+
+      - name: Restaurar modelo semántico multilingüe
+        uses: actions/cache@v6
+        with:
+          path: local_cache/fastembed
+          key: fastembed-0.8.0-paraphrase-multilingual-minilm-l12-v2
 
       - name: Instalar dependencias
         run: python -m pip install --requirement requirements.txt
@@ -157,11 +170,25 @@ jobs:
           para continuar sin repetir los lotes terminados."
 
       - name: Finalizar fichas, índice semántico e integridad
+        id: semantic
         if: ${{ steps.batches.outputs.complete == 'true' }}
-        run: python build_index.py --fail-on-semantic-error
+        shell: bash
+        run: |
+          python build_index.py --fail-on-semantic-error
+          complete=$(python -c 'import json; print(str(json.load(open(".reprocess/candidate/data/semantic-progress.json"))["complete"]).lower())')
+          echo "complete=$complete" >> "$GITHUB_OUTPUT"
+
+      - name: Informar continuación neuronal pendiente
+        if: >-
+          ${{ steps.batches.outputs.complete == 'true' &&
+              steps.semantic.outputs.complete != 'true' }}
+        run: >-
+          echo "::notice title=Embeddings confirmados::La candidata neuronal quedó
+          guardada. Ejecuta nuevamente este workflow con
+          resume_run_id=${{ github.run_id }} para continuar sin repetir vectores."
 
       - name: Reconciliar identidades y revisiones con la base publicada
-        if: ${{ steps.batches.outputs.complete == 'true' }}
+        if: ${{ steps.semantic.outputs.complete == 'true' }}
         run: >-
           python reprocess_corpus.py reconcile
           --workspace .reprocess
@@ -169,7 +196,7 @@ jobs:
           --review-log data/regulatory-review-log.csv
 
       - name: Empaquetar candidata sin borrar las bases de trabajo
-        if: ${{ steps.batches.outputs.complete == 'true' }}
+        if: ${{ steps.semantic.outputs.complete == 'true' }}
         shell: bash
         run: |
           python package_index.py create \
@@ -180,7 +207,7 @@ jobs:
             --part-size-mib 90
 
       - name: Restaurar paquetes, ejecutar smoke test y validar publicación
-        if: ${{ steps.batches.outputs.complete == 'true' }}
+        if: ${{ steps.semantic.outputs.complete == 'true' }}
         env:
           MODE: ${{ inputs.mode }}
         shell: bash
@@ -192,7 +219,7 @@ jobs:
             --mode "$MODE"
 
       - name: Publicar la base aprobada
-        if: ${{ inputs.mode == 'publish' && steps.batches.outputs.complete == 'true' }}
+        if: ${{ inputs.mode == 'publish' && steps.semantic.outputs.complete == 'true' }}
         run: >-
           python reprocess_corpus.py publish
           --workspace .reprocess
@@ -200,7 +227,7 @@ jobs:
           --review-log data/regulatory-review-log.csv
 
       - name: Guardar publicación en el repositorio privado
-        if: ${{ inputs.mode == 'publish' && steps.batches.outputs.complete == 'true' }}
+        if: ${{ inputs.mode == 'publish' && steps.semantic.outputs.complete == 'true' }}
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
@@ -242,7 +269,8 @@ jobs:
         if: >-
           ${{ always() && (
             failure() || cancelled() || inputs.mode == 'diagnostic' ||
-            steps.batches.outputs.complete != 'true'
+            steps.batches.outputs.complete != 'true' ||
+            steps.semantic.outputs.complete != 'true'
           ) }}
         uses: actions/upload-artifact@v7
         with:
@@ -252,6 +280,8 @@ jobs:
             .reprocess/candidate/checkpoint.json
             .reprocess/candidate/data/actas.db
             .reprocess/candidate/data/semantic.db
+            .reprocess/candidate/data/semantic.checkpoint.db
+            .reprocess/candidate/data/semantic-progress.json
           if-no-files-found: warn
           compression-level: 6
           include-hidden-files: true
