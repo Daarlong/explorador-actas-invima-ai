@@ -15,7 +15,7 @@ from services.semantic import (
     semantic_index_status,
     semantic_search,
 )
-from services.text_utils import normalize_text
+from services.text_utils import normalize_phrase, normalize_text
 
 
 SEARCH_MODES = ("hybrid", "textual", "semantic")
@@ -61,6 +61,32 @@ def _exact_identifier_bonus(query: str, result: SearchResult) -> float:
     )
 
 
+def _literal_phrase_bonus(query: str, result: SearchResult) -> float:
+    phrase = normalize_phrase(query)
+    if len(phrase.split()) < 2:
+        return 0.0
+    return (
+        2.0
+        if phrase in normalize_phrase(result.title)
+        or phrase in normalize_phrase(result.text)
+        else 0.0
+    )
+
+
+def _merge_lexical_candidates(
+    regular: list[SearchResult],
+    literal: list[SearchResult],
+) -> list[SearchResult]:
+    """Une candidatos conservando la mejor puntuación de cada fragmento."""
+
+    by_id: dict[int, SearchResult] = {}
+    for result in [*literal, *regular]:
+        previous = by_id.get(result.chunk_id)
+        if previous is None or result.score > previous.score:
+            by_id[result.chunk_id] = result
+    return sorted(by_id.values(), key=lambda item: (-item.score, item.chunk_id))
+
+
 def search_corpus(
     database_path: Path,
     semantic_index_path: Path,
@@ -93,6 +119,7 @@ def search_corpus(
     candidate_limit = max(top_k * 3, 120)
     max_per_document = 5 if top_k <= 20 else 3
     lexical_results: list[SearchResult] = []
+    literal_results: list[SearchResult] = []
     if used_mode in {"textual", "hybrid"}:
         lexical_results = search_chunks(
             database_path,
@@ -102,6 +129,23 @@ def search_corpus(
             exact_phrase=exact_phrase,
             max_chunks_per_document=max_per_document,
         )
+        # Una consulta de varias palabras no debe perder una cita textual
+        # conocida por aplicar el LIMIT del ranking OR antes de calcular el
+        # bono literal o hacer el reranking neuronal. Una sonda compatible con
+        # FTS detail=column incorpora esos fragmentos al conjunto candidato.
+        if not exact_phrase and len(normalize_phrase(query).split()) >= 2:
+            literal_results = search_chunks(
+                database_path,
+                query,
+                top_k=candidate_limit,
+                filters=filters,
+                exact_phrase=True,
+                max_chunks_per_document=max_per_document,
+            )
+            lexical_results = _merge_lexical_candidates(
+                lexical_results,
+                literal_results,
+            )
     if used_mode == "textual":
         return SearchResponse(
             results=_diversify_results(
@@ -169,9 +213,22 @@ def search_corpus(
     fused_scores = {item.item_id: item.score for item in fused}
     lexical_normalized = {item.item_id: item.lexical_score for item in fused}
     semantic_normalized = {item.item_id: item.semantic_score for item in fused}
+    fused_ids = [item.item_id for item in fused]
+    fused_id_set = set(fused_ids)
+    # Una coincidencia literal es evidencia más fuerte que una paráfrasis. Si
+    # el truncado de RRF la desplazara, se reintroduce antes de hidratarla; el
+    # bonus literal posterior determina su posición final de forma explícita.
+    for result in literal_results:
+        if result.chunk_id in fused_id_set:
+            continue
+        fused_ids.append(result.chunk_id)
+        fused_id_set.add(result.chunk_id)
+        fused_scores[result.chunk_id] = 0.0
+        lexical_normalized[result.chunk_id] = 0.0
+        semantic_normalized[result.chunk_id] = 0.0
     hydrated = get_chunks_by_ids(
         database_path,
-        [item.item_id for item in fused],
+        fused_ids,
         filters=filters,
         scores=fused_scores,
     )
@@ -179,7 +236,9 @@ def search_corpus(
         replace(
             result,
             score=round(
-                result.score + _exact_identifier_bonus(query, result),
+                result.score
+                + _exact_identifier_bonus(query, result)
+                + _literal_phrase_bonus(query, result),
                 6,
             ),
             lexical_score=lexical_normalized.get(result.chunk_id),

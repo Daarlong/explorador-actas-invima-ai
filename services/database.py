@@ -17,7 +17,7 @@ from services.regulatory import (
     extract_regulatory_records,
     normalize_field_evidence_ordinals,
 )
-from services.text_utils import normalize_text, tokenize_query
+from services.text_utils import normalize_phrase, normalize_text, tokenize_query
 
 
 DATABASE_SCHEMA_VERSION = 6
@@ -2727,15 +2727,15 @@ def _filter_sql(filters: dict[str, list] | None) -> tuple[str, list]:
 
 
 def _rows_to_results(rows: list[sqlite3.Row], query: str) -> list[SearchResult]:
-    normalized_query = normalize_text(query)
+    normalized_query = normalize_phrase(query)
     ranked: list[SearchResult] = []
     row_count = max(len(rows), 1)
     for position, row in enumerate(rows):
         base_score = 1.0 - (position / row_count)
-        exact_bonus = (
-            2.0 if normalized_query in normalize_text(row["text"]) else 0.0
-        )
-        title_bonus = 0.75 if normalized_query in row["normalized_title"] else 0.0
+        phrase_in_text = normalized_query in normalize_phrase(row["text"])
+        phrase_in_title = normalized_query in normalize_phrase(row["title"])
+        exact_bonus = 2.0 if phrase_in_text or phrase_in_title else 0.0
+        title_bonus = 0.75 if phrase_in_title else 0.0
         score = round(base_score + exact_bonus + title_bonus, 3)
         ranked.append(
             SearchResult(
@@ -2850,17 +2850,41 @@ def search_chunks(
     if not query or not database_path.exists():
         return []
 
-    terms = tokenize_query(query)
+    normalized_phrase = normalize_phrase(query)
+    if not normalized_phrase:
+        return []
+    terms = list(
+        dict.fromkeys(
+            atom
+            for term in tokenize_query(query)
+            for atom in re.findall(r"[^\W_]+", term, flags=re.UNICODE)
+        )
+    )
     if not terms:
-        terms = [normalize_text(query)]
+        terms = normalized_phrase.split()
     if exact_phrase:
-        clean_phrase = normalize_text(query).replace('"', "")
-        fts_query = f'"{clean_phrase}"'
+        # ``chunks_fts`` usa detail=column para mantener compacta la base.
+        # Ese formato no conserva posiciones y por tanto rechaza una frase
+        # FTS como ``"varias palabras"``. Se obtiene primero un conjunto
+        # candidato con términos individuales y luego una función determinista
+        # confirma la secuencia literal antes de aplicar los límites SQL.
+        exact_terms = list(dict.fromkeys(normalized_phrase.split()))
+        if not exact_terms:
+            return []
+        fts_query = " AND ".join(f'"{term}"' for term in exact_terms)
     else:
         fts_query = " OR ".join(
             f'"{term.replace(chr(34), "")}"' for term in terms
         )
     filter_clause, filter_parameters = _filter_sql(filters)
+    exact_clause = ""
+    exact_parameters: list[str] = []
+    if exact_phrase:
+        exact_clause = (
+            " AND (normalized_phrase_contains(d.title, ?) = 1"
+            " OR normalized_phrase_contains(c.text, ?) = 1)"
+        )
+        exact_parameters = [normalized_phrase, normalized_phrase]
     if max_chunks_per_document < 1:
         raise ValueError("max_chunks_per_document debe ser mayor que cero")
 
@@ -2884,7 +2908,7 @@ def search_chunks(
             JOIN chunks c ON c.id = chunks_fts.rowid
             JOIN pages p ON p.id = c.page_id
             JOIN documents d ON d.id = p.document_id
-            WHERE chunks_fts MATCH ? {filter_clause}
+            WHERE chunks_fts MATCH ? {filter_clause} {exact_clause}
         ), ranked AS (
             SELECT *,
                    ROW_NUMBER() OVER (
@@ -2901,11 +2925,22 @@ def search_chunks(
     """
 
     with connect(database_path) as connection:
+        if exact_phrase:
+            connection.create_function(
+                "normalized_phrase_contains",
+                2,
+                lambda value, phrase: int(
+                    bool(phrase)
+                    and str(phrase) in normalize_phrase(str(value or ""))
+                ),
+                deterministic=True,
+            )
         rows = connection.execute(
             sql,
             [
                 fts_query,
                 *filter_parameters,
+                *exact_parameters,
                 max_chunks_per_document,
                 top_k,
             ],
@@ -2913,10 +2948,10 @@ def search_chunks(
 
     results = _rows_to_results(rows, query)
     if exact_phrase:
-        normalized_query = normalize_text(query)
         results = [
             result
             for result in results
-            if normalized_query in normalize_text(f"{result.title} {result.text}")
+            if normalized_phrase in normalize_phrase(result.title)
+            or normalized_phrase in normalize_phrase(result.text)
         ]
     return results[:top_k]

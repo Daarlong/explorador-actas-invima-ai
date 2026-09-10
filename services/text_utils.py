@@ -27,6 +27,23 @@ def normalize_text(text: str) -> str:
     return text.strip()
 
 
+def normalize_phrase(text: str) -> str:
+    """Normaliza una frase para compararla como secuencia literal de palabras.
+
+    La búsqueda de frase completa debe tolerar diferencias que no cambian el
+    contenido (mayúsculas, tildes, signos y saltos de línea), pero conservar el
+    orden exacto de las palabras.
+    """
+
+    # ``unicode61`` (tokenizador de FTS5) trata el guion bajo y la puntuación
+    # como separadores. ``[^\W_]+`` replica esa parte del contrato mejor que
+    # ``\w+``, que conservaría ``_`` y volvería a crear una frase multitérmino
+    # dentro de una sola comilla FTS.
+    return " ".join(
+        re.findall(r"[^\W_]+", normalize_text(text), flags=re.UNICODE)
+    )
+
+
 def tokenize_query(query: str) -> list[str]:
     tokens = re.findall(r"\b[\w-]+\b", normalize_text(query), flags=re.UNICODE)
     useful = [
@@ -79,4 +96,3 @@ def chunk_text(text: str, chunk_size: int = 1200, overlap: int = 180) -> list[st
         start = next_start
 
     return chunks
-

@@ -68,6 +68,26 @@ filtros estructurados y búsqueda semántica local.
 
 No contiene funcionalidades relacionadas con un monitor de transparencia.
 
+## Corrección incorporada en la versión 0.9.2
+
+La 0.9.2 corrige la búsqueda de frases sin modificar las bases ya publicadas.
+La opción **Exigir frase completa** ahora es compatible con el índice FTS5
+compacto (`detail=column`): preselecciona por términos individuales y confirma
+la secuencia literal antes de aplicar los límites de resultados.
+
+Las búsquedas textual e híbrida también incorporan un carril literal. Si la
+consulta aparece palabra por palabra en un fragmento, esa evidencia no se
+pierde detrás de coincidencias que solo contienen los términos dispersos; en
+modo híbrido se conserva y prioriza frente a las paráfrasis neuronales. La
+comparación ignora mayúsculas, tildes, puntuación y saltos de línea, y las
+consultas con guiones, barras o guion bajo ya no generan frases FTS inválidas.
+
+Esta entrega es un overlay de código. No incluye ni reemplaza `data/`,
+`documents_manifest.csv` o `actas_catalog.csv`, y **no requiere ejecutar
+Construir índice ni recalcular embeddings**. Basta con subir el contenido del
+ZIP, esperar que **Pruebas** termine en verde y dejar que Streamlit se
+redespliegue. El alcance cerrado está en `ALCANCE_V0.9.2.md`.
+
 ## Corrección incorporada en la versión 0.9.1
 
 La 0.9.1 corrige la primera construcción del índice neuronal para corpus que no
@@ -230,6 +250,7 @@ todo el histórico visible desde 2013; el año inicial se configura con
 ├── ALCANCE_V0.8.md
 ├── ALCANCE_V0.9.md
 ├── ALCANCE_V0.9.1.md
+├── ALCANCE_V0.9.2.md
 ├── INSTRUCCIONES_ACTUALIZACION.md
 └── requirements.txt
 ```
