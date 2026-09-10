@@ -1,0 +1,15 @@
+{
+  "after": 321246,
+  "before": 287098,
+  "build_signature": "tokenizer-v1-random-indexing-v1-int8-source-fingerprint-v2-content-hash-v1|dense-int8-v1|exact-utf8-v1|fastembed-0.8.0-mean-pooling|sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2@fastembed-0.8.0-registry",
+  "checkpoint_reused": true,
+  "complete": true,
+  "generated_at": "2026-09-10T05:06:39.417353+00:00",
+  "progress_made": true,
+  "remaining": 0,
+  "segments_completed": 7,
+  "source_fingerprint": "839dedf73f0e7e0e2ef4a3ab2fdad06255ec9376f087cd2698cc5dd34f3e4bbe",
+  "unique_after": 307310,
+  "unique_before": 275280,
+  "unique_remaining": 0
+}
