@@ -460,7 +460,12 @@ def render_home() -> None:
         '<div class="section-kicker">Más recursos</div>',
         unsafe_allow_html=True,
     )
-    resource_catalog, resource_integrity, resource_admin = st.columns(3)
+    resource_analytics, resource_catalog, resource_integrity, resource_admin = st.columns(4)
+    resource_analytics.page_link(
+        "pages/6_Analitica.py",
+        label="Analítica del corpus",
+        icon="📊",
+    )
     resource_catalog.page_link(
         "pages/5_Catalogo.py",
         label="Consultar catálogo",
@@ -513,6 +518,11 @@ navigation = st.navigation(
                 "pages/2_Analista_IA.py",
                 title="Analizar fuentes",
                 icon=":material/auto_awesome:",
+            ),
+            st.Page(
+                "pages/6_Analitica.py",
+                title="Analítica",
+                icon=":material/monitoring:",
             ),
         ],
         "Corpus": [

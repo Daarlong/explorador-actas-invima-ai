@@ -1,4 +1,43 @@
-# Actualización a la versión 0.10.0
+# Actualización a la versión 0.11.0
+
+La 0.11.0 incorpora validación técnica sobre el corpus publicado, expansión
+segura con un diccionario regulatorio local, facetas con conteos globales y un
+tablero analítico descriptivo. No incorpora IA generativa ni un módulo de
+evaluación o corrección de actas.
+
+## Actualizar desde la versión 0.10.0
+
+1. Conserva `data/`, `documents_manifest.csv` y `actas_catalog.csv`.
+2. Descomprime `explorador-actas-invima-ai-v0.11.0-overlay.zip`.
+3. En el repositorio privado abre **Code → Add file → Upload files** y arrastra
+   el contenido de la carpeta descomprimida, no la carpeta exterior.
+4. Confirma el commit en `main` y espera que **Actions → Pruebas** quede verde.
+5. Espera el redespliegue de Streamlit y confirma la versión `v0.11.0`.
+6. Abre **Actions → Validar búsquedas publicadas → Run workflow**. Revisa que
+   los contratos técnicos terminen correctamente; las sondas de relevancia son
+   informativas y no bloquean la publicación.
+7. Comprueba una consulta con sinónimos, los conteos de las facetas y la
+   navegación desde el tablero hasta un PDF oficial.
+
+Esta actualización utiliza las tres bases ya publicadas por la 0.10.0. No
+ejecutes **Construir índice** únicamente por instalarla y no recalcules los
+embeddings: el diccionario se aplica al consultar y las agregaciones leen el
+esquema existente. El workflow de construcción seguirá ejecutándose de forma
+automática cuando el catálogo detecte una acta nueva o un documento pendiente.
+
+Mantén esta configuración:
+
+```toml
+LLM_PROVIDER = "prompt_only"
+```
+
+El alcance cerrado está en `ALCANCE_V0.11.md`. Las instrucciones siguientes se
+conservan para instalaciones que todavía deban preparar los índices de la
+versión 0.10.0.
+
+---
+
+## Preparación de los índices de la versión 0.10.0
 
 Esta versión añade recuperación híbrida global, índice ANN local, búsqueda por
 campo, frases sobre la página completa, transparencia del motor, paginación en

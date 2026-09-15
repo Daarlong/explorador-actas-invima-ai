@@ -3000,6 +3000,38 @@ def _fts_query_terms(query: str, *, exact_phrase: bool) -> tuple[str, str]:
     return operator.join(f'"{term}"' for term in escaped), normalized_phrase
 
 
+def _fts_with_query_alternatives(
+    base_query: str,
+    alternatives: Iterable[str],
+) -> str:
+    """Añade equivalencias como ramas conjuntivas, nunca como palabras sueltas.
+
+    ``bpm`` puede ampliar a ``buenas prácticas de manufactura``. Exigir todos
+    los términos útiles de esa equivalencia evita que una palabra genérica
+    como ``prácticas`` ensanche por sí sola el universo de resultados.
+    """
+
+    clauses = [f"({base_query})"] if base_query else []
+    seen: set[tuple[str, ...]] = set()
+    for alternative in alternatives:
+        normalized = normalize_phrase(str(alternative or ""))
+        terms = tuple(
+            dict.fromkeys(
+                atom
+                for term in tokenize_query(normalized)
+                for atom in re.findall(r"[^\W_]+", term, flags=re.UNICODE)
+            )
+        )
+        if not terms:
+            terms = tuple(dict.fromkeys(normalized.split()))
+        if not terms or terms in seen:
+            continue
+        seen.add(terms)
+        escaped = [term.replace('"', "") for term in terms]
+        clauses.append("(" + " AND ".join(f'\"{term}\"' for term in escaped) + ")")
+    return " OR ".join(clauses)
+
+
 def search_regulatory_fields(
     database_path: Path,
     query: str,
@@ -3009,6 +3041,7 @@ def search_regulatory_fields(
     filters: dict[str, list] | None = None,
     exact_phrase: bool = False,
     max_records_per_document: int = 5,
+    query_alternatives: Iterable[str] = (),
 ) -> list[SearchResult]:
     """Busca texto real dentro de campos regulatorios ya persistidos.
 
@@ -3032,6 +3065,11 @@ def search_regulatory_fields(
     )
     if not fts_terms:
         return []
+    if not exact_phrase:
+        fts_terms = _fts_with_query_alternatives(
+            fts_terms,
+            query_alternatives,
+        )
 
     fts_column = _REGULATORY_FTS_COLUMNS[scope]
     field_text_sql = _REGULATORY_FIELD_TEXT_SQL[scope]
@@ -3502,6 +3540,7 @@ def search_chunks(
     filters: dict[str, list] | None = None,
     exact_phrase: bool = False,
     max_chunks_per_document: int = 5,
+    query_alternatives: Iterable[str] = (),
 ) -> list[SearchResult]:
     query = query.strip()
     if not query or not database_path.exists():
@@ -3532,6 +3571,10 @@ def search_chunks(
     else:
         fts_query = " OR ".join(
             f'"{term.replace(chr(34), "")}"' for term in terms
+        )
+        fts_query = _fts_with_query_alternatives(
+            fts_query,
+            query_alternatives,
         )
     filter_clause, filter_parameters = _filter_sql(filters)
     exact_clause = ""
@@ -3623,6 +3666,7 @@ def search_chunks_document_page(
     order: str = "relevance",
     filters: dict[str, list] | None = None,
     fragments_per_document: int = 3,
+    query_alternatives: Iterable[str] = (),
 ) -> tuple[list[SearchResult], int, int]:
     """Pagina coincidencias textuales por acta con totales globales SQL.
 
@@ -3655,6 +3699,10 @@ def search_chunks_document_page(
     if not terms:
         return [], 0, 0
     fts_query = " OR ".join(f'"{term.replace(chr(34), "")}"' for term in terms)
+    fts_query = _fts_with_query_alternatives(
+        fts_query,
+        query_alternatives,
+    )
     filter_clause, filter_parameters = _filter_sql(filters)
     if order == "newest":
         ordering = (

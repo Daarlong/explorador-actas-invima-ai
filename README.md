@@ -80,6 +80,32 @@ filtros estructurados y búsqueda semántica local.
 
 No contiene funcionalidades relacionadas con un monitor de transparencia.
 
+## Cambios incorporados en la versión 0.11.0
+
+La 0.11.0 añade una capa de análisis descriptivo y control técnico sobre la
+recuperación terminada en la 0.10.0. Puede ampliar consultas mediante un
+diccionario regulatorio local, calcular facetas sobre el conjunto global y
+navegar desde un tablero agregado hasta las evidencias. La validación incluida
+comprueba el funcionamiento del corpus publicado; no evalúa ni corrige el
+contenido de las actas.
+
+| Área | Mejora |
+|---|---|
+| Validación real | Comprobaciones reproducibles de índices, cobertura, modos de búsqueda, paginación, exportación y trazabilidad sobre las bases publicadas |
+| Terminología | Sinónimos y variantes regulatorias locales, versionados y aplicados de forma segura en tiempo de consulta |
+| Facetas | Conteos de actas distintas por año, sala, resultado, solicitud, principio activo, interesado y producto; exactos o acotados según el motor |
+| Analítica | Tablero descriptivo que separa documentos, actas y fichas, muestra cobertura y tendencias y permite navegar a la fuente oficial |
+| Compatibilidad | Actualización de código que conserva los índices 0.10.0 y la incorporación automática de nuevas actas |
+
+Esta entrega no requiere reconstruir las bases ni recalcular embeddings. Después
+de subir el código, espera **Actions → Pruebas**, permite el redespliegue de
+Streamlit y ejecuta manualmente **Actions → Validar búsquedas publicadas**. Sus
+contratos técnicos pueden fallar la ejecución; los casos de relevancia quedan
+como observaciones y no bloquean el despliegue. **Construir índice** solo se usa
+si existe una nueva acta o un documento pendiente. Mantén
+`LLM_PROVIDER = "prompt_only"`. El alcance cerrado y las exclusiones están en
+`ALCANCE_V0.11.md`.
+
 ## Cambios incorporados en la versión 0.10.0
 
 La 0.10.0 completa la capa de recuperación y consulta. La búsqueda híbrida
@@ -297,6 +323,7 @@ todo el histórico visible desde 2013; el año inicial se configura con
 ├── ALCANCE_V0.9.1.md
 ├── ALCANCE_V0.9.2.md
 ├── ALCANCE_V0.10.md
+├── ALCANCE_V0.11.md
 ├── INSTRUCCIONES_ACTUALIZACION.md
 └── requirements.txt
 ```

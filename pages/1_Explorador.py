@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import sqlite3
 from dataclasses import replace
 from pathlib import Path
 
@@ -42,6 +43,7 @@ from services.exports import (
     ExportUnavailableError,
     export_search_results,
 )
+from services.facets import FacetSummary, get_search_facets
 from services.pdf_viewer import (
     render_pdf_page,
     search_pdf_page_text,
@@ -116,6 +118,32 @@ def cached_search(
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
+def cached_search_facets(
+    query: str,
+    exact_phrase: bool,
+    field_scope: str,
+    filters_json: str,
+    candidate_chunk_ids: tuple[int, ...] | None,
+    query_alternatives: tuple[str, ...],
+    database_identity: tuple[int, int],
+) -> FacetSummary:
+    """Calcula distribuciones coherentes con el universo de la búsqueda."""
+
+    del database_identity
+    return get_search_facets(
+        DATABASE_PATH,
+        query,
+        filters=json.loads(filters_json),
+        exact_phrase=exact_phrase,
+        field_scope=field_scope,
+        candidate_chunk_ids=candidate_chunk_ids,
+        query_alternatives=query_alternatives,
+        counts_exact=(candidate_chunk_ids is None),
+        max_values=20,
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
 def cached_pdf_page(
     title: str,
     url: str,
@@ -170,6 +198,45 @@ def reset_explorer_filters() -> None:
     }
     for key, value in defaults.items():
         st.session_state[key] = value
+
+
+def apply_suggested_filter(target_key: str, source_key: str) -> None:
+    """Aplica una sugerencia facetada al filtro de texto correspondiente."""
+
+    value = str(st.session_state.get(source_key) or "").strip()
+    if value:
+        st.session_state[target_key] = value
+
+
+def _state_list(key: str) -> list:
+    """Lee listas de widgets sin asumir que Streamlit ya los creó."""
+
+    value = st.session_state.get(key, [])
+    return list(value) if isinstance(value, (list, tuple, set)) else []
+
+
+def _facet_counts(
+    summary: FacetSummary | None,
+    dimension: str,
+) -> dict[object, int]:
+    if summary is None:
+        return {}
+    return {item.value: int(item.count) for item in summary.facets.get(dimension, ())}
+
+
+def _facet_option_label(
+    value: object,
+    *,
+    counts: dict[object, int],
+    exact: bool,
+    label: str | None = None,
+    show_count: bool = True,
+) -> str:
+    visible = label or str(value)
+    if not show_count:
+        return visible
+    marker = "" if exact else "≈"
+    return f"{visible} ({marker}{counts.get(value, 0)} actas)"
 
 
 def metadata_tag(value: object) -> str:
@@ -544,6 +611,135 @@ provenance_options = {
     "No extraído": "not_extracted",
 }
 
+# Las facetas se preparan con el estado confirmado de la ejecución anterior.
+# Los callbacks de Streamlit actualizan ese estado antes del rerun, por lo que
+# los conteos ya están disponibles cuando se crean los controles laterales.
+facet_summary: FacetSummary | None = None
+facet_query = str(st.session_state.get("explorer_query") or "").strip()
+state_mode_label = str(
+    st.session_state.get("explorer_search_mode") or "Híbrida (recomendada)"
+)
+if state_mode_label not in mode_labels:
+    state_mode_label = "Híbrida (recomendada)"
+state_field_label = str(
+    st.session_state.get("explorer_field_scope") or "Todo el contenido"
+)
+if state_field_label not in field_scope_labels:
+    state_field_label = "Todo el contenido"
+state_order_label = str(
+    st.session_state.get("explorer_order") or "Mayor relevancia"
+)
+if state_order_label not in order_labels:
+    state_order_label = "Mayor relevancia"
+state_page_size = int(st.session_state.get("explorer_page_size") or 10)
+if state_page_size not in {5, 10, 15, 20}:
+    state_page_size = 10
+state_filters = {
+    "years": _state_list("explorer_years"),
+    "acta_numbers": _state_list("explorer_acta_numbers"),
+    "sections": _state_list("explorer_sections"),
+    "parts": _state_list("explorer_parts"),
+    "outcomes": _state_list("explorer_outcomes"),
+    "request_types": _state_list("explorer_request_types"),
+    "products": (
+        [str(st.session_state.get("explorer_product") or "").strip()]
+        if str(st.session_state.get("explorer_product") or "").strip()
+        else []
+    ),
+    "active_ingredients": (
+        [str(st.session_state.get("explorer_active_ingredient") or "").strip()]
+        if str(st.session_state.get("explorer_active_ingredient") or "").strip()
+        else []
+    ),
+    "interested_parties": (
+        [str(st.session_state.get("explorer_interested_party") or "").strip()]
+        if str(st.session_state.get("explorer_interested_party") or "").strip()
+        else []
+    ),
+    "identifiers": (
+        [str(st.session_state.get("explorer_identifier") or "").strip()]
+        if str(st.session_state.get("explorer_identifier") or "").strip()
+        else []
+    ),
+}
+facet_suppressed_reason: str | None = None
+facet_uses_post_filters = bool(
+    st.session_state.get("explorer_missing_active_ingredient", False)
+    or _state_list("explorer_provenance")
+    or str(st.session_state.get("explorer_confidence") or "Cualquiera")
+    != "Cualquiera"
+    or (
+        review_events
+        and any(
+            state_filters.get(key)
+            for key in (
+                "outcomes",
+                "request_types",
+                "products",
+                "active_ingredients",
+                "interested_parties",
+                "identifiers",
+            )
+        )
+    )
+)
+if facet_uses_post_filters:
+    facet_suppressed_reason = (
+        "Los conteos no están disponibles con esta combinación porque algunos "
+        "filtros se aplican después de recuperar las evidencias."
+    )
+elif facet_query:
+    try:
+        # El pool se obtiene sin filtros: luego `get_search_facets` aplica todos
+        # salvo el de la dimensión que cuenta. Así un resultado seleccionado no
+        # oculta las alternativas disponibles en esa misma dimensión.
+        facet_search_has_filters = any(state_filters.values())
+        facet_search_filters = (
+            {key: [] for key in state_filters}
+            if facet_search_has_filters
+            else state_filters
+        )
+        facet_response = cached_search(
+            facet_query,
+            mode_labels[state_mode_label],
+            bool(st.session_state.get("explorer_exact_phrase", False)),
+            field_scope_labels[state_field_label],
+            (
+                1
+                if facet_search_has_filters
+                else max(1, int(st.session_state.get("explorer_page", 1)))
+            ),
+            100 if facet_search_has_filters else state_page_size,
+            "relevance" if facet_search_has_filters else order_labels[state_order_label],
+            json.dumps(
+                facet_search_filters,
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            _file_identity(DATABASE_PATH),
+            _file_identity(SEMANTIC_INDEX_PATH),
+            _file_identity(ANN_INDEX_PATH),
+        )
+        facet_summary = cached_search_facets(
+            facet_query,
+            bool(st.session_state.get("explorer_exact_phrase", False)),
+            field_scope_labels[state_field_label],
+            json.dumps(state_filters, ensure_ascii=False, sort_keys=True),
+            facet_response.facet_candidate_ids,
+            facet_response.query_terms_expanded,
+            _file_identity(DATABASE_PATH),
+        )
+    except (OSError, RuntimeError, ValueError, sqlite3.Error):
+        # La búsqueda principal mostrará el error completo si también falla.
+        # La ausencia temporal de facetas no debe impedir consultar el corpus.
+        facet_summary = None
+
+facet_exact = bool(facet_summary and facet_summary.exact)
+year_counts = _facet_counts(facet_summary, "years")
+section_counts = _facet_counts(facet_summary, "sections")
+outcome_counts = _facet_counts(facet_summary, "outcomes")
+request_type_counts = _facet_counts(facet_summary, "request_types")
+
 with st.sidebar:
     st.header("Opciones de búsqueda")
     st.caption("Ajusta la recuperación y acota el conjunto de actas.")
@@ -574,9 +770,31 @@ with st.sidebar:
         )
 
     with st.expander("Acta y publicación", expanded=True):
+        if facet_summary is not None:
+            if facet_exact:
+                st.caption("Conteos exactos de actas para la consulta actual.")
+            elif facet_summary.scope in {"bounded_textual", "bounded_phrase"}:
+                st.caption(
+                    "Conteos aproximados (≈) sobre una muestra determinista: "
+                    "la consulta textual es demasiado amplia para contarla "
+                    "completa de forma interactiva."
+                )
+            else:
+                st.caption(
+                    "Conteos aproximados (≈) dentro del conjunto recuperado "
+                    "por la búsqueda neuronal; no son un total exhaustivo."
+                )
+        elif facet_suppressed_reason:
+            st.caption(facet_suppressed_reason)
         years = st.multiselect(
             "Año",
             options["years"],
+            format_func=lambda value: _facet_option_label(
+                value,
+                counts=year_counts,
+                exact=facet_exact,
+                show_count=facet_summary is not None,
+            ),
             key="explorer_years",
             placeholder="Todos los años",
         )
@@ -589,6 +807,12 @@ with st.sidebar:
         sections = st.multiselect(
             "Sala o sección",
             options["sections"],
+            format_func=lambda value: _facet_option_label(
+                value,
+                counts=section_counts,
+                exact=facet_exact,
+                show_count=facet_summary is not None,
+            ),
             key="explorer_sections",
             placeholder="Todas las secciones",
         )
@@ -609,14 +833,26 @@ with st.sidebar:
             outcomes = st.multiselect(
                 "Resultado extraído",
                 options.get("outcomes", []),
-                format_func=lambda value: outcome_labels.get(value, value),
+                format_func=lambda value: _facet_option_label(
+                    value,
+                    counts=outcome_counts,
+                    exact=facet_exact,
+                    label=outcome_labels.get(value, value),
+                    show_count=facet_summary is not None,
+                ),
                 key="explorer_outcomes",
                 placeholder="Todos los resultados",
             )
             request_types = st.multiselect(
                 "Tipo de solicitud",
                 options.get("request_types", []),
-                format_func=lambda value: str(value).replace("_", " ").capitalize(),
+                format_func=lambda value: _facet_option_label(
+                    value,
+                    counts=request_type_counts,
+                    exact=facet_exact,
+                    label=str(value).replace("_", " ").capitalize(),
+                    show_count=facet_summary is not None,
+                ),
                 key="explorer_request_types",
                 placeholder="Todos los tipos",
             )
@@ -654,6 +890,59 @@ with st.sidebar:
                 "Los campos son extraídos automáticamente y deben verificarse "
                 "contra el acta."
             )
+            high_cardinality_facets = {
+                "Principio activo": (
+                    "active_ingredients",
+                    "explorer_active_ingredient",
+                ),
+                "Interesado": (
+                    "interested_parties",
+                    "explorer_interested_party",
+                ),
+                "Producto": ("products", "explorer_product"),
+            }
+            if facet_summary is not None and any(
+                facet_summary.facets.get(key)
+                for key, _ in high_cardinality_facets.values()
+            ):
+                st.markdown("**Valores frecuentes en esta consulta**")
+                suggestion_dimension = st.selectbox(
+                    "Mostrar sugerencias de",
+                    list(high_cardinality_facets),
+                    key="explorer_facet_suggestion_dimension",
+                )
+                facet_key, target_key = high_cardinality_facets[
+                    suggestion_dimension
+                ]
+                suggestions = list(facet_summary.facets.get(facet_key, ()))[:10]
+                if suggestions:
+                    suggestion_key = f"explorer_facet_suggestion_{facet_key}"
+                    suggestion_counts = {
+                        item.value: item.count for item in suggestions
+                    }
+                    suggestion_labels = {
+                        item.value: item.label or str(item.value)
+                        for item in suggestions
+                    }
+                    selected_suggestion = st.selectbox(
+                        "Valor sugerido",
+                        [item.value for item in suggestions],
+                        format_func=lambda value: _facet_option_label(
+                            value,
+                            counts=suggestion_counts,
+                            exact=facet_exact,
+                            label=suggestion_labels.get(value),
+                        ),
+                        key=suggestion_key,
+                    )
+                    st.button(
+                        f"Aplicar a {suggestion_dimension.lower()}",
+                        key=f"apply_{suggestion_key}",
+                        on_click=apply_suggested_filter,
+                        args=(target_key, suggestion_key),
+                        disabled=not selected_suggestion,
+                        use_container_width=True,
+                    )
 
     with st.expander("Presentación", expanded=False):
         selected_order_label = st.selectbox(
@@ -662,7 +951,7 @@ with st.sidebar:
             key="explorer_order",
         )
         page_size = st.select_slider(
-            "Actas por página",
+            "PDF/partes por página",
             [5, 10, 15, 20],
             value=10,
             key="explorer_page_size",
@@ -1105,7 +1394,7 @@ with result_heading:
     )
     st.caption(
         f"**{displayed_documents if displayed_documents is not None else len(groups)} "
-        f"acta(s)** · {displayed_fragments if displayed_fragments is not None else len(response.results)} "
+        f"PDF/parte(s)** · {displayed_fragments if displayed_fragments is not None else len(response.results)} "
         f"fragmento(s) · {total_label} · página {current_page} de {total_pages}"
     )
     st.markdown(
@@ -1128,6 +1417,17 @@ with result_heading:
     )
     if response.fallback_reason:
         st.warning(response.fallback_reason)
+    if response.query_terms_expanded:
+        with st.expander("También se buscaron equivalencias regulatorias"):
+            st.caption(
+                "Estas expresiones amplían únicamente el carril textual. La "
+                "consulta que escribiste y el carril semántico no se modifican."
+            )
+            st.write(", ".join(response.query_terms_expanded))
+            if response.query_expansion_version:
+                st.caption(
+                    f"Diccionario regulatorio: {response.query_expansion_version}"
+                )
     with st.expander("¿Cómo se obtuvieron y ordenaron estos resultados?"):
         st.write(
             search_ranking_explanation(
@@ -1335,7 +1635,7 @@ if groups:
             st.session_state["explorer_page"] = current_page - 1
             st.rerun()
         nav_middle.markdown(
-            f"Actas **{start + 1}–{min(start + len(groups), response.total_documents or start + len(groups))}** "
+            f"PDF/partes **{start + 1}–{min(start + len(groups), response.total_documents or start + len(groups))}** "
             f"de **{response.total_documents if response.total_documents is not None else start + len(groups)}**"
         )
         if nav_right.button(
@@ -1630,7 +1930,7 @@ if groups and total_pages > 1:
         st.rerun()
     bottom_status.markdown(
         f"Página **{current_page}** de **{total_pages}** · "
-        f"{len(groups)} acta(s) encontrada(s)"
+        f"{len(groups)} PDF/parte(s) en esta página"
     )
     if bottom_next.button(
         "Página siguiente →",

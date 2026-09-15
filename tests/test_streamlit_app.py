@@ -33,6 +33,7 @@ class StreamlitSmokeTests(unittest.TestCase):
             "pages/3_Administracion.py",
             "pages/4_Integridad.py",
             "pages/5_Catalogo.py",
+            "pages/6_Analitica.py",
             "pages/7_Comparar.py",
         )
         for page_path in registered_pages:

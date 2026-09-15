@@ -14,6 +14,65 @@ from services.text_utils import tokenize_query
 
 _BADGE_TONES = frozenset({"neutral", "info", "success", "warning", "danger"})
 
+_ANALYTICS_EXPLORER_FIELDS = {
+    "outcome": "Resultado derivado del concepto",
+    "request_type": "Ficha estructurada",
+    "active_ingredient": "Principio activo",
+    "interested_party": "Interesado",
+}
+
+
+def analytics_explorer_state(
+    filters: dict[str, object],
+    *,
+    dimension: str,
+    query_value: object,
+) -> dict[str, object]:
+    """Traduce un drill-down analítico al estado compatible del Explorador.
+
+    El tablero y el Explorador no comparten todas sus dimensiones. Esta
+    traducción copia solo filtros equivalentes y restablece explícitamente los
+    demás para que una selección previa no cambie silenciosamente el universo.
+    """
+
+    if dimension not in _ANALYTICS_EXPLORER_FIELDS:
+        raise ValueError("La dimensión no puede abrirse como búsqueda de campo")
+    query = str(query_value or "").strip()
+    if not query:
+        raise ValueError("La categoría analítica no contiene un valor consultable")
+
+    def values(name: str) -> list:
+        raw = filters.get(name, [])
+        if isinstance(raw, (list, tuple, set)):
+            return [value for value in raw if value not in (None, "")]
+        return []
+
+    def first(name: str) -> str:
+        candidates = values(name)
+        return str(candidates[0]).strip() if candidates else ""
+
+    return {
+        "explorer_query": query,
+        "explorer_search_mode": "Híbrida (recomendada)",
+        "explorer_exact_phrase": False,
+        "explorer_field_scope": _ANALYTICS_EXPLORER_FIELDS[dimension],
+        "explorer_years": values("years"),
+        "explorer_acta_numbers": values("acta_numbers"),
+        "explorer_sections": values("sections"),
+        "explorer_parts": [],
+        "explorer_outcomes": values("outcomes"),
+        "explorer_request_types": values("request_types"),
+        "explorer_product": "",
+        "explorer_active_ingredient": first("active_ingredients"),
+        "explorer_interested_party": first("interested_parties"),
+        "explorer_identifier": "",
+        "explorer_missing_active_ingredient": False,
+        "explorer_provenance": [],
+        "explorer_confidence": "Cualquiera",
+        "explorer_order": "Mayor relevancia",
+        "explorer_page": 1,
+    }
+
 
 def app_style_css() -> str:
     """Return the shared, theme-aware presentation layer for the application.

@@ -334,6 +334,7 @@ class SearchPaginationAcceptanceTests(_SearchFixture):
         self.assertEqual(first.total_pages, 3)
         self.assertTrue(first.has_next)
         self.assertTrue(first.totals_exact)
+        self.assertIsNone(first.facet_candidate_ids)
         self.assertEqual(first.page, 1)
         self.assertEqual(first.page_size, 10)
 
@@ -390,6 +391,7 @@ class SearchPaginationAcceptanceTests(_SearchFixture):
             )
 
         self.assertFalse(page.totals_exact)
+        self.assertEqual(set(page.facet_candidate_ids or ()), {1, 3, 5})
 
 
 if __name__ == "__main__":

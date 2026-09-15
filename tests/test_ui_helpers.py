@@ -4,6 +4,7 @@ import unittest
 
 from services.models import SearchResult
 from services.ui_helpers import (
+    analytics_explorer_state,
     app_style_css,
     badge_html,
     group_search_results,
@@ -31,6 +32,53 @@ def result(title: str, year: int, chunk_id: int, score: float) -> SearchResult:
 
 
 class UiHelperTests(unittest.TestCase):
+    def test_analytics_context_transfers_compatible_filters_and_clears_others(
+        self,
+    ) -> None:
+        selected_item = {
+            "value": "semaglutida",
+            "label": "Semaglutida 1 mg",
+        }
+        state = analytics_explorer_state(
+            {
+                "years": [2024, 2025],
+                "sections": ["SEMPB"],
+                "acta_numbers": ["08"],
+                "outcomes": ["favorable"],
+                "request_types": ["indicaciones"],
+                "active_ingredients": ["semaglutida"],
+                "interested_parties": ["Novo Nordisk"],
+            },
+            dimension="active_ingredient",
+            query_value=selected_item["value"],
+        )
+
+        self.assertEqual(state["explorer_query"], "semaglutida")
+        self.assertNotEqual(state["explorer_query"], selected_item["label"])
+        self.assertEqual(state["explorer_field_scope"], "Principio activo")
+        self.assertEqual(state["explorer_years"], [2024, 2025])
+        self.assertEqual(state["explorer_sections"], ["SEMPB"])
+        self.assertEqual(state["explorer_acta_numbers"], ["08"])
+        self.assertEqual(state["explorer_outcomes"], ["favorable"])
+        self.assertEqual(state["explorer_request_types"], ["indicaciones"])
+        self.assertEqual(state["explorer_active_ingredient"], "semaglutida")
+        self.assertEqual(state["explorer_interested_party"], "Novo Nordisk")
+        self.assertEqual(state["explorer_parts"], [])
+        self.assertEqual(state["explorer_product"], "")
+        self.assertEqual(state["explorer_identifier"], "")
+        self.assertFalse(state["explorer_missing_active_ingredient"])
+        self.assertEqual(state["explorer_provenance"], [])
+        self.assertEqual(state["explorer_confidence"], "Cualquiera")
+        self.assertEqual(state["explorer_page"], 1)
+
+    def test_analytics_context_rejects_non_searchable_or_empty_category(self) -> None:
+        with self.assertRaises(ValueError):
+            analytics_explorer_state({}, dimension="year", query_value=2026)
+        with self.assertRaises(ValueError):
+            analytics_explorer_state(
+                {}, dimension="active_ingredient", query_value="  "
+            )
+
     def test_app_style_uses_semantic_hooks_and_respects_active_theme(self) -> None:
         css = app_style_css()
         self.assertIn('[data-testid="stAppViewContainer"]', css)

@@ -1,0 +1,80 @@
+{
+  "version": "2026.09.1",
+  "language": "es-CO",
+  "description": "Equivalencias regulatorias conservadoras para las actas de la Sala Especializada de Medicamentos de Síntesis Química y Biológica.",
+  "entries": [
+    {
+      "id": "sempb",
+      "preferred": "sala especializada de medicamentos de síntesis química y biológica",
+      "variants": [
+        "SEMPB",
+        "sala especializada de medicamentos de síntesis y productos biológicos"
+      ]
+    },
+    {
+      "id": "invima",
+      "preferred": "Instituto Nacional de Vigilancia de Medicamentos y Alimentos",
+      "variants": ["INVIMA"]
+    },
+    {
+      "id": "bpm",
+      "preferred": "buenas prácticas de manufactura",
+      "variants": ["BPM", "B.P.M."]
+    },
+    {
+      "id": "bpc",
+      "preferred": "buenas prácticas clínicas",
+      "variants": ["BPC", "B.P.C."]
+    },
+    {
+      "id": "ifa",
+      "preferred": "ingrediente farmacéutico activo",
+      "variants": ["IFA", "principio activo", "ingrediente activo"]
+    },
+    {
+      "id": "dci",
+      "preferred": "denominación común internacional",
+      "variants": ["DCI", "D.C.I."]
+    },
+    {
+      "id": "neq",
+      "preferred": "nueva entidad química",
+      "variants": ["NEQ", "N.E.Q."]
+    },
+    {
+      "id": "mvnd",
+      "preferred": "medicamento vital no disponible",
+      "variants": ["MVND", "M.V.N.D."]
+    },
+    {
+      "id": "renovacion_registro",
+      "preferred": "renovación del registro sanitario",
+      "variants": ["renovación de registro sanitario"]
+    },
+    {
+      "id": "modificacion_registro",
+      "preferred": "modificación del registro sanitario",
+      "variants": ["modificación de registro sanitario"]
+    },
+    {
+      "id": "beneficio_riesgo",
+      "preferred": "balance beneficio riesgo",
+      "variants": ["relación beneficio riesgo", "perfil beneficio riesgo"]
+    },
+    {
+      "id": "informacion_prescribir",
+      "preferred": "información para prescribir",
+      "variants": ["IPP"]
+    },
+    {
+      "id": "biosimilar",
+      "preferred": "medicamento biosimilar",
+      "variants": ["producto biológico similar", "medicamento biológico similar"]
+    },
+    {
+      "id": "ensayo_clinico",
+      "preferred": "ensayo clínico",
+      "variants": ["estudio clínico"]
+    }
+  ]
+}

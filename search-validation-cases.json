@@ -1,0 +1,97 @@
+{
+  "format_version": 1,
+  "schema": {
+    "expected_version": 7,
+    "allowed_document_hosts": [
+      "invima.gov.co",
+      "www.invima.gov.co",
+      "img.lalr.co"
+    ],
+    "temporal_coverage": {
+      "start_year_at_most": 2013,
+      "end_year_at_least": 2026,
+      "minimum_span_years": 14,
+      "minimum_distinct_years": 14
+    },
+    "required_tables": [
+      "app_metadata",
+      "documents",
+      "pages",
+      "chunks",
+      "chunks_fts",
+      "regulatory_records",
+      "regulatory_field_evidence",
+      "regulatory_records_fts"
+    ],
+    "minimum_rows": {
+      "documents": 1,
+      "pages": 1,
+      "chunks": 1,
+      "regulatory_records": 1
+    },
+    "fts_cardinality": {
+      "enabled": true
+    },
+    "regulatory_relationships": {
+      "enabled": true
+    }
+  },
+  "packages": {
+    "required": ["actas.db", "semantic.db", "semantic-ann.db"],
+    "verify_sha256": true
+  },
+  "manifest": {
+    "enabled": true,
+    "start_year": 2013,
+    "require_no_missing": true,
+    "temporal_coverage": {
+      "start_year_at_most": 2013,
+      "end_year_at_least": 2026,
+      "minimum_distinct_years": 14
+    }
+  },
+  "semantic": {
+    "required": true,
+    "require_neural_ready": true,
+    "ann_required": true
+  },
+  "probes": {
+    "candidate_rows": 240,
+    "textual": {
+      "enabled": true
+    },
+    "hybrid": {
+      "enabled": true,
+      "candidate_limit": 200
+    },
+    "phrase": {
+      "enabled": true,
+      "words": 4
+    },
+    "fields": {
+      "enabled": true,
+      "scopes": [
+        "product",
+        "active_ingredient",
+        "interested_party",
+        "expediente",
+        "radicado",
+        "request",
+        "concept",
+        "outcome"
+      ],
+      "minimum_successful_scopes": 3
+    },
+    "pagination": {
+      "enabled": true,
+      "page_size": 1,
+      "minimum_documents": 2
+    },
+    "export": {
+      "enabled": true,
+      "formats": ["csv", "xlsx"],
+      "maximum_results": 5
+    }
+  },
+  "explicit_cases": []
+}

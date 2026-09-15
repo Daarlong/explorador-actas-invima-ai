@@ -14,6 +14,11 @@ from services.database import (
     search_chunks_document_page,
 )
 from services.models import SearchResult
+from services.query_expansion import (
+    MAX_EXPANSIONS,
+    QueryExpansion,
+    expand_regulatory_query,
+)
 from services.semantic import (
     reciprocal_rank_fusion,
     semantic_index_status,
@@ -46,6 +51,16 @@ class SearchResponse:
     page_size: int | None = None
     total_pages: int | None = None
     has_next: bool = False
+    # Universo recuperado que sustenta facetas aproximadas. ``None`` indica
+    # que las facetas pueden calcularse directamente sobre el universo textual
+    # completo; nunca se expone este detalle como una lista visible al usuario.
+    facet_candidate_ids: tuple[int, ...] | None = None
+    # Traza reproducible de expansión regulatoria. Las expresiones añadidas
+    # solo alimentan el carril textual; la consulta original nunca se altera.
+    query_terms_original: tuple[str, ...] = ()
+    query_terms_expanded: tuple[str, ...] = ()
+    query_expansion_version: str | None = None
+    query_expansion_skipped_reason: str | None = None
 
 
 SEARCH_FIELD_SCOPES = (
@@ -64,6 +79,19 @@ SEARCH_FIELD_SCOPES = (
 
 def _response_totals(results: list[SearchResult]) -> tuple[int, int]:
     return len({(item.title, item.url) for item in results}), len(results)
+
+
+def _with_expansion_trace(
+    response: SearchResponse,
+    expansion: QueryExpansion,
+) -> SearchResponse:
+    return replace(
+        response,
+        query_terms_original=expansion.original_terms,
+        query_terms_expanded=expansion.expanded_terms,
+        query_expansion_version=expansion.dictionary_version,
+        query_expansion_skipped_reason=expansion.skipped_reason,
+    )
 
 
 def _backend_from_state(
@@ -171,6 +199,15 @@ def search_corpus(
         used_mode = "textual"
     if mode in {"hybrid", "semantic"} and not semantic_available:
         used_mode = "textual"
+    expansion = expand_regulatory_query(
+        query,
+        exact_phrase=exact_phrase,
+        max_expansions=(
+            MAX_EXPANSIONS
+            if used_mode in {"textual", "hybrid"} or field_scope != "all"
+            else 0
+        ),
+    )
 
     # Las fichas estructuradas tienen un índice textual propio. No se afirma
     # semántica sobre un campo si los embeddings fueron creados por fragmento.
@@ -182,20 +219,24 @@ def search_corpus(
             top_k=top_k,
             filters=filters,
             exact_phrase=exact_phrase,
+            query_alternatives=expansion.expanded_terms,
         )
         total_documents, total_fragments = _response_totals(field_results)
-        return SearchResponse(
-            results=field_results,
-            requested_mode=mode,
-            used_mode="textual",
-            semantic_available=semantic_available,
-            semantic_message=semantic_message,
-            semantic_backend="none",
-            retrieval_backend="structured_fts",
-            fallback_reason=None,
-            field_scope=field_scope,
-            total_documents=total_documents,
-            total_fragments=total_fragments,
+        return _with_expansion_trace(
+            SearchResponse(
+                results=field_results,
+                requested_mode=mode,
+                used_mode="textual",
+                semantic_available=semantic_available,
+                semantic_message=semantic_message,
+                semantic_backend="none",
+                retrieval_backend="structured_fts",
+                fallback_reason=None,
+                field_scope=field_scope,
+                total_documents=total_documents,
+                total_fragments=total_fragments,
+            ),
+            expansion,
         )
 
     candidate_limit = max(top_k * 3, 120)
@@ -219,6 +260,7 @@ def search_corpus(
                 filters=filters,
                 exact_phrase=False,
                 max_chunks_per_document=max_per_document,
+                query_alternatives=expansion.expanded_terms,
             )
         # Una consulta de varias palabras no debe perder una cita textual
         # conocida por aplicar el LIMIT del ranking OR antes de calcular el
@@ -239,22 +281,25 @@ def search_corpus(
             )
     if used_mode == "textual":
         total_documents, total_fragments = _response_totals(lexical_results)
-        return SearchResponse(
-            results=_diversify_results(
-                lexical_results,
-                top_k=top_k,
-                max_per_document=max_per_document,
+        return _with_expansion_trace(
+            SearchResponse(
+                results=_diversify_results(
+                    lexical_results,
+                    top_k=top_k,
+                    max_per_document=max_per_document,
+                ),
+                requested_mode=mode,
+                used_mode="textual",
+                semantic_available=semantic_available,
+                semantic_message=semantic_message,
+                semantic_backend="none",
+                retrieval_backend=("page_phrase" if exact_phrase else "fts5"),
+                fallback_reason=(fallback_reason if mode != "textual" else None),
+                field_scope=field_scope,
+                total_documents=total_documents,
+                total_fragments=total_fragments,
             ),
-            requested_mode=mode,
-            used_mode="textual",
-            semantic_available=semantic_available,
-            semantic_message=semantic_message,
-            semantic_backend="none",
-            retrieval_backend=("page_phrase" if exact_phrase else "fts5"),
-            fallback_reason=(fallback_reason if mode != "textual" else None),
-            field_scope=field_scope,
-            total_documents=total_documents,
-            total_fragments=total_fragments,
+            expansion,
         )
 
     # El carril semántico es independiente del carril textual. Sin filtros se
@@ -307,25 +352,30 @@ def search_corpus(
                 max_per_document=max_per_document,
             )
         total_documents, total_fragments = _response_totals(final_results)
-        return SearchResponse(
-            results=final_results,
-            requested_mode=mode,
-            used_mode="semantic",
-            semantic_available=True,
-            semantic_message=semantic_message,
-            semantic_backend=semantic_backend,
-            retrieval_backend=(
-                "neural_ann" if semantic_backend == "neural_ann" else "semantic"
+        return _with_expansion_trace(
+            SearchResponse(
+                results=final_results,
+                requested_mode=mode,
+                used_mode="semantic",
+                semantic_available=True,
+                semantic_message=semantic_message,
+                semantic_backend=semantic_backend,
+                retrieval_backend=(
+                    "neural_ann"
+                    if semantic_backend == "neural_ann"
+                    else "semantic"
+                ),
+                fallback_reason=fallback_reason,
+                neural_used=neural_used,
+                ann_used=bool(semantic_trace.get("ann_used")),
+                candidate_count=int(
+                    semantic_trace.get("candidates_scored") or len(semantic_hits)
+                ),
+                field_scope=field_scope,
+                total_documents=total_documents,
+                total_fragments=total_fragments,
             ),
-            fallback_reason=fallback_reason,
-            neural_used=neural_used,
-            ann_used=bool(semantic_trace.get("ann_used")),
-            candidate_count=int(
-                semantic_trace.get("candidates_scored") or len(semantic_hits)
-            ),
-            field_scope=field_scope,
-            total_documents=total_documents,
-            total_fragments=total_fragments,
+            expansion,
         )
 
     lexical_scores = {result.chunk_id: result.score for result in lexical_results}
@@ -381,25 +431,28 @@ def search_corpus(
             max_per_document=max_per_document,
         )
     total_documents, total_fragments = _response_totals(final_results)
-    return SearchResponse(
-        results=final_results,
-        requested_mode=mode,
-        used_mode="hybrid",
-        semantic_available=True,
-        semantic_message=semantic_message,
-        semantic_backend=semantic_backend,
-        retrieval_backend=(
-            "hybrid_ann" if semantic_backend == "neural_ann" else "hybrid"
+    return _with_expansion_trace(
+        SearchResponse(
+            results=final_results,
+            requested_mode=mode,
+            used_mode="hybrid",
+            semantic_available=True,
+            semantic_message=semantic_message,
+            semantic_backend=semantic_backend,
+            retrieval_backend=(
+                "hybrid_ann" if semantic_backend == "neural_ann" else "hybrid"
+            ),
+            fallback_reason=fallback_reason,
+            neural_used=neural_used,
+            ann_used=bool(semantic_trace.get("ann_used")),
+            candidate_count=int(
+                semantic_trace.get("candidates_scored") or len(semantic_hits)
+            ),
+            field_scope=field_scope,
+            total_documents=total_documents,
+            total_fragments=total_fragments,
         ),
-        fallback_reason=fallback_reason,
-        neural_used=neural_used,
-        ann_used=bool(semantic_trace.get("ann_used")),
-        candidate_count=int(
-            semantic_trace.get("candidates_scored") or len(semantic_hits)
-        ),
-        field_scope=field_scope,
-        total_documents=total_documents,
-        total_fragments=total_fragments,
+        expansion,
     )
 
 
@@ -479,6 +532,7 @@ def search_corpus_page(
         mode in {"hybrid", "semantic"} and not semantic_state.get("available")
     )
     if effective_textual and not exact_phrase and field_scope == "all":
+        expansion = expand_regulatory_query(query)
         results, total_documents, total_fragments = search_chunks_document_page(
             database_path,
             query,
@@ -487,29 +541,33 @@ def search_corpus_page(
             order=order,
             filters=filters,
             fragments_per_document=fragments_per_document,
+            query_alternatives=expansion.expanded_terms,
         )
         total_pages = max(1, math.ceil(total_documents / page_size))
-        return SearchResponse(
-            results=results,
-            requested_mode=mode,
-            used_mode="textual",
-            semantic_available=bool(semantic_state.get("available")),
-            semantic_message=str(semantic_state.get("message") or ""),
-            semantic_backend="none",
-            retrieval_backend="fts5",
-            fallback_reason=(
-                str(semantic_state.get("message") or "") or None
-                if mode != "textual"
-                else None
+        return _with_expansion_trace(
+            SearchResponse(
+                results=results,
+                requested_mode=mode,
+                used_mode="textual",
+                semantic_available=bool(semantic_state.get("available")),
+                semantic_message=str(semantic_state.get("message") or ""),
+                semantic_backend="none",
+                retrieval_backend="fts5",
+                fallback_reason=(
+                    str(semantic_state.get("message") or "") or None
+                    if mode != "textual"
+                    else None
+                ),
+                field_scope=field_scope,
+                total_documents=total_documents,
+                total_fragments=total_fragments,
+                totals_exact=True,
+                page=page,
+                page_size=page_size,
+                total_pages=total_pages,
+                has_next=page < total_pages,
             ),
-            field_scope=field_scope,
-            total_documents=total_documents,
-            total_fragments=total_fragments,
-            totals_exact=True,
-            page=page,
-            page_size=page_size,
-            total_pages=total_pages,
-            has_next=page < total_pages,
+            expansion,
         )
 
     # Recupera un pool global estable y pagina por documento después de
@@ -556,4 +614,9 @@ def search_corpus_page(
         page_size=page_size,
         total_pages=total_pages,
         has_next=page < total_pages,
+        facet_candidate_ids=(
+            None
+            if exact_totals
+            else tuple(result.chunk_id for result in response.results)
+        ),
     )
