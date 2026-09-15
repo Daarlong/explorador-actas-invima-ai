@@ -414,3 +414,94 @@ def group_search_results(
     else:
         values.sort(key=lambda item: item["score"], reverse=True)
     return values
+
+
+SEARCH_SCOPE_LABELS = {
+    "all": "Todo el contenido",
+    "request": "Solicitud",
+    "concept": "Concepto / decisión",
+    "product": "Producto",
+    "active_ingredient": "Principio activo",
+    "interested_party": "Interesado",
+    "expediente": "Expediente",
+    "radicado": "Radicado",
+    "record": "Ficha estructurada",
+    "outcome": "Resultado derivado",
+}
+
+
+SEARCH_BACKEND_LABELS = {
+    "fts5": "Texto FTS5",
+    "page_phrase": "Frase literal",
+    "structured_fts": "Campo estructurado",
+    "neural_ann": "Semántica neuronal global",
+    "hybrid_ann": "Texto + neuronal global",
+    "hybrid": "Texto + semántica",
+    "semantic": "Búsqueda semántica",
+    "neural": "Semántica neuronal",
+    "local": "Semántica local",
+    "local_fallback": "Semántica local · respaldo",
+    "none": "Texto FTS5 · respaldo",
+}
+
+
+def search_scope_label(scope: str) -> str:
+    """Etiqueta estable y legible para el alcance real de una consulta."""
+
+    return SEARCH_SCOPE_LABELS.get(str(scope), str(scope).replace("_", " ").title())
+
+
+def search_backend_label(backend: str, *, mode: str = "") -> str:
+    """Describe el motor ejecutado sin inferirlo del botón seleccionado."""
+
+    backend = str(backend or "none")
+    if mode == "hybrid" and backend in {"neural", "neural_ann"}:
+        return "Texto + neuronal" + (" global" if backend == "neural_ann" else "")
+    return SEARCH_BACKEND_LABELS.get(backend, backend.replace("_", " ").title())
+
+
+def search_ranking_explanation(
+    *,
+    mode: str,
+    backend: str,
+    exact_phrase: bool = False,
+) -> str:
+    """Explicación breve del ranking para la interfaz de consulta."""
+
+    if exact_phrase or backend == "page_phrase":
+        lead = (
+            "Se confirmó la frase en el texto completo de cada página, incluso "
+            "cuando cruza el límite entre dos fragmentos."
+        )
+    elif backend == "structured_fts":
+        lead = (
+            "La consulta se resolvió dentro del campo extraído seleccionado "
+            "mediante FTS5/BM25."
+        )
+    elif backend == "neural_ann" and mode == "hybrid":
+        lead = (
+            "Se combinaron candidatos textuales con vecinos neuronales globales "
+            "mediante fusión recíproca de rangos."
+        )
+    elif backend == "neural_ann":
+        lead = "Los resultados se recuperaron globalmente por similitud neuronal."
+    elif backend == "local_fallback":
+        lead = (
+            "El modelo neuronal no pudo ejecutarse y se usaron señales locales "
+            "basadas en términos y contexto."
+        )
+    elif mode == "hybrid":
+        lead = (
+            "Se combinaron coincidencias textuales con recuperación semántica; "
+            "las frases literales y los identificadores exactos reciben prioridad."
+        )
+    else:
+        lead = (
+            "Los fragmentos se recuperaron mediante FTS5/BM25; las frases "
+            "literales y los identificadores exactos reciben prioridad."
+        )
+    return (
+        lead
+        + " La posición expresa relevancia dentro de esta consulta; no representa "
+        "certeza ni calidad regulatoria."
+    )

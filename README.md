@@ -21,6 +21,18 @@ filtros estructurados y búsqueda semántica local.
   las series adicionales que encuentre en la página.
 - Explorador de actas con búsqueda textual, híbrida, semántica local y frases
   exactas, sin enviar las consultas a servicios externos.
+- Recuperación híbrida global: reúne candidatos textuales y neuronales en todo
+  el corpus antes de ordenarlos, en vez de limitar la semántica a los primeros
+  resultados FTS5.
+- Índice ANN local e independiente para consultar los embeddings neuronales sin
+  recorrer todos los vectores en cada búsqueda. Si todavía no está publicado,
+  el buscador usa automáticamente la ruta compatible anterior.
+- Búsqueda acotada por campo regulatorio y búsqueda literal sobre el texto
+  completo de la página, incluidas frases que atraviesan dos fragmentos.
+- Paginación desde SQLite, totales declarados como exactos o acotados según el
+  motor utilizado y exportación de resultados en CSV o XLSX.
+- Indicador visible del motor realmente usado, cobertura neuronal y motivo de
+  cualquier degradación o ruta de respaldo.
 - Filtros por año, número de acta, sala/sección, parte, resultado, producto,
   principio activo, interesado, expediente y radicado.
 - Resultados agrupados por acta, paginados, ordenables y con términos
@@ -67,6 +79,36 @@ filtros estructurados y búsqueda semántica local.
 - Página de Catálogo con estado indexado, pendiente, sin enlace o ya no listado.
 
 No contiene funcionalidades relacionadas con un monitor de transparencia.
+
+## Cambios incorporados en la versión 0.10.0
+
+La 0.10.0 completa la capa de recuperación y consulta. La búsqueda híbrida
+combina candidatos textuales y neuronales globales; el nuevo paquete
+`semantic-ann.db` acelera la recuperación neuronal reutilizando los embeddings
+ya calculados. No activa IA generativa ni envía consultas o actas a terceros.
+
+| Área | Mejora |
+|---|---|
+| Recuperación | Unión global de resultados FTS5, literales y neuronales antes del orden final |
+| Rendimiento | Índice ANN local, versionado y verificable como tercera base SQLite |
+| Campos | Alcance explícito por campo regulatorio, además de la búsqueda general |
+| Frases | Confirmación literal contra el texto completo de la página, incluso entre fragmentos |
+| Transparencia | La interfaz informa el motor real, la ruta de respaldo y si el total es exacto o acotado |
+| Navegación | Paginación estable ejecutada en la capa de datos, sin truncar primero a 360 fragmentos |
+| Exportación | Descarga de la consulta y su trazabilidad en CSV o XLSX |
+
+Esta versión requiere una actualización aditiva al esquema 7 y la construcción
+del paquete ANN. Después de subir el código, ejecuta una sola vez **Actions →
+Construir índice → Run workflow**. Mientras esa ejecución termina, la aplicación
+puede seguir consultando la base anterior: si no encuentra el esquema 7 o
+`semantic-ann.db`, oculta las funciones dependientes y usa una ruta compatible
+sin impedir las búsquedas ya disponibles.
+
+El workflow diario de **Actualizar catálogo desde INVIMA** permanece activo. Al
+detectar una publicación nueva inicia **Construir índice**, reutiliza los
+embeddings existentes y vuelve a generar el ANN con el corpus vigente. Mantén
+`LLM_PROVIDER = "prompt_only"`. El alcance cerrado y las exclusiones están en
+`ALCANCE_V0.10.md`.
 
 ## Corrección incorporada en la versión 0.9.2
 
@@ -217,6 +259,7 @@ todo el histórico visible desde 2013; el año inicial se configura con
 │   ├── 5_Catalogo.py
 │   └── 7_Comparar.py
 ├── services/
+│   ├── ann.py
 │   ├── catalog.py
 │   ├── corpus_status.py
 │   ├── database.py
@@ -231,6 +274,7 @@ todo el histórico visible desde 2013; el año inicial se configura con
 │   ├── regulatory.py
 │   ├── ingredients.py
 │   ├── effective_records.py
+│   ├── exports.py
 │   ├── reviews.py
 │   ├── comparison.py
 │   ├── retrieval.py
@@ -242,6 +286,7 @@ todo el histórico visible desde 2013; el año inicial se configura con
 ├── actas_catalog.csv
 ├── documents_manifest.csv
 ├── build_index.py
+├── build_ann.py
 ├── check_index_pending.py
 ├── reprocess_corpus.py
 ├── package_index.py
@@ -251,6 +296,7 @@ todo el histórico visible desde 2013; el año inicial se configura con
 ├── ALCANCE_V0.9.md
 ├── ALCANCE_V0.9.1.md
 ├── ALCANCE_V0.9.2.md
+├── ALCANCE_V0.10.md
 ├── INSTRUCCIONES_ACTUALIZACION.md
 └── requirements.txt
 ```
@@ -303,10 +349,12 @@ El flujo de construcción del índice:
 6. construye o actualiza el índice semántico local y avanza el complemento
    neuronal multilingüe en un segmento de hasta 7.200 segundos o 50.000 textos
    únicos;
-7. genera informes de ejecución, integridad y cobertura por año;
-8. si quedan embeddings, guarda `semantic.checkpoint.db` y
+7. cuando los embeddings están completos, construye `semantic-ann.db` a partir
+   de `semantic.db`, sin volver a inferir los textos;
+8. genera informes de ejecución, integridad y cobertura por año;
+9. si quedan embeddings, guarda `semantic.checkpoint.db` y
    `semantic-progress.json` en Actions Cache y programa el siguiente segmento;
-9. al alcanzar el 100 %, comprime ambas bases, calcula hashes, las divide en
+10. al alcanzar el 100 %, comprime las tres bases, calcula hashes, las divide en
    fragmentos de 90 MiB y guarda los índices y los informes automáticamente en
    el repositorio privado.
 
@@ -358,11 +406,11 @@ destinada a incorporar actas nuevas.
 
 ## Configuración sin IA generativa
 
-La versión 0.9.1 se opera con `LLM_PROVIDER = "prompt_only"`. El buscador recupera
+La versión 0.10.0 se opera con `LLM_PROVIDER = "prompt_only"`. El buscador recupera
 fuentes sin enviar la consulta a un LLM y el complemento semántico se ejecuta
 localmente. No hace falta configurar una clave de OpenAI ni de Azure OpenAI.
 
-### Índice neuronal multilingüe
+### Índice neuronal multilingüe y ANN
 
 El backend predeterminado es `ACTAS_SEMANTIC_BACKEND=neural`. Usa
 `fastembed==0.8.0` y el modelo ONNX cuantizado
@@ -399,6 +447,13 @@ reutilice todos los textos que no cambiaron. La capa TF-IDF/distribucional sí s
 recalcula para representar el corpus vigente, pero normalmente la inferencia
 neuronal costosa queda limitada a los textos nuevos o modificados.
 
+`semantic-ann.db` es un índice de recuperación aproximada derivado de los
+vectores completos de `semantic.db`. Se reconstruye después de una actualización
+exitosa sin recalcular embeddings y se distribuye mediante
+`data/semantic-ann.db.package.json`. Si falta, no coincide con el corpus o no se
+puede restaurar, la aplicación informa la degradación y conserva la búsqueda
+compatible; nunca presenta el ANN como activo si no lo utilizó.
+
 La página de Administración exige `ADMIN_PASSWORD`. Si no se configura, queda
 deshabilitada y el índice solo puede construirse mediante `python build_index.py`.
 
@@ -413,7 +468,8 @@ habilita la página de Administración.
 3. Crear una aplicación en Streamlit Community Cloud usando `home.py`.
 4. Configurar los secretos desde el panel de Streamlit, nunca en GitHub.
 5. Esperar que **Pruebas** termine en verde.
-6. Ejecutar una vez **Actions → Construir índice → Run workflow**.
+6. Ejecutar una vez **Actions → Construir índice → Run workflow** para migrar al
+   esquema 7 y publicar el índice ANN.
 7. Seguir la cadena en **Actions** sin iniciar ejecuciones adicionales. Cada
    segmento guarda su avance y programa el siguiente automáticamente.
 8. Esperar que el último resumen indique estado completo, cero pendientes y el
@@ -489,14 +545,17 @@ La página **Integridad** muestra:
 - avance confirmado de la capa neuronal y cantidad de embeddings pendientes;
 - tamaño de la base compactada.
 
-El esquema 6 conserva una copia comprimida del texto fuente por página para
+El esquema 7 conserva una copia comprimida del texto fuente por página para
 permitir reextracciones auditables, además de los fragmentos necesarios para
-buscar. El paquete
+buscar, y añade las estructuras que permiten consultar por campo y confirmar
+frases sobre la página completa. El paquete
 `data/actas.db.package.json` registra tamaño y SHA-256 de la base y de cada
 fragmento, y la aplicación los valida antes de usar el índice. El índice
 semántico se distribuye del mismo modo mediante
 `data/semantic.db.package.json`. Un `semantic.checkpoint.db` incompleto nunca se
 incluye en ese paquete ni reemplaza la base semántica publicada.
+El complemento ANN se empaqueta y valida por separado en
+`data/semantic-ann.db.package.json`.
 
 La extracción regulatoria es deliberadamente conservadora. Una ficha puede
 estar incompleta o mal clasificada por diferencias históricas de formato; por

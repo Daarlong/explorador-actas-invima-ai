@@ -1922,6 +1922,7 @@ def query_semantic_index(
     neural_weight: float = 0.0,
     neural_encoder: DenseTextEncoder | None = None,
     min_score: float = 0.01,
+    trace: dict[str, object] | None = None,
 ) -> list[SemanticHit]:
     """Consulta el índice o reordena ``candidate_ids``.
 
@@ -1929,6 +1930,17 @@ def query_semantic_index(
     puede aportar la señal léxica principal fuera de este módulo. Si la consulta
     no contiene términos presentes en el corpus, no devuelve coincidencias.
     """
+    if trace is not None:
+        trace.clear()
+        trace.update(
+            {
+                "backend": "local_semantic",
+                "neural_requested": neural_weight > 0,
+                "neural_used": False,
+                "fallback_reason": None,
+                "candidates_scored": 0,
+            }
+        )
     if top_k < 1:
         raise ValueError("top_k debe ser mayor que cero")
     if lexical_weight < 0 or distributional_weight < 0 or neural_weight < 0:
@@ -1994,10 +2006,18 @@ def query_semantic_index(
                         raise NeuralSemanticUnavailable(
                             "La dimensión de consulta no coincide con el índice"
                         )
-                except Exception:
+                    if trace is not None:
+                        trace["backend"] = "neural_exact"
+                        trace["neural_used"] = True
+                except Exception as exc:
                     # Fallar al cargar/consultar el modelo no debe romper el
                     # modo semántico local ni el explorador textual.
                     query_neural = []
+                    if trace is not None:
+                        trace["fallback_reason"] = (
+                            "No se pudo ejecutar el codificador neuronal: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
             has_distributional_signal = any(query_distributional)
             effective_distributional_weight = (
                 distributional_weight if has_distributional_signal else 0.0
@@ -2020,6 +2040,10 @@ def query_semantic_index(
                 candidate_ids,
                 include_neural=bool(query_neural),
             ):
+                if trace is not None:
+                    trace["candidates_scored"] = int(
+                        trace.get("candidates_scored", 0)
+                    ) + 1
                 lexical = max(
                     0.0,
                     min(
@@ -2083,6 +2107,8 @@ def semantic_search(
     query: str,
     top_k: int = 20,
     allowed_ids: Sequence[int] | None = None,
+    trace: dict[str, object] | None = None,
+    ann_index_path: Path | None = None,
 ) -> list[tuple[int, float]]:
     """API compacta para la capa de recuperación de la aplicación.
 
@@ -2091,6 +2117,81 @@ def semantic_search(
     Para auditoría de cada señal, use :func:`query_semantic_index`.
     """
     candidate_ids = allowed_ids
+    if trace is not None:
+        trace.clear()
+        trace.update(
+            {
+                "backend": "local_semantic",
+                "neural_requested": True,
+                "neural_used": False,
+                "fallback_reason": None,
+                "candidate_source": (
+                    "filtered" if allowed_ids is not None else "global_preselection"
+                ),
+                "candidates_scored": 0,
+            }
+        )
+
+    # El ANN reutiliza los embeddings ya guardados y recupera vecinos
+    # neuronales de todo el corpus sin depender de que FTS5 comparta palabras.
+    # Cualquier indisponibilidad degrada de forma explícita al índice local
+    # histórico; nunca deja el explorador inutilizable.
+    if ann_index_path is not None:
+        try:
+            from services.ann import ann_index_status, query_ann_index
+
+            ann_state = ann_index_status(Path(ann_index_path), Path(index_path))
+            if ann_state.get("available"):
+                with sqlite3.connect(
+                    f"file:{Path(index_path)}?mode=ro", uri=True
+                ) as connection:
+                    metadata = _read_metadata(connection)
+                encoder = _fastembed_encoder(
+                    str(metadata.get("neural_model_id") or ""),
+                    str(metadata.get("neural_model_revision") or ""),
+                )
+                query_vector = _validated_dense_vector(encoder.encode_query(query))
+                ann_result = query_ann_index(
+                    Path(ann_index_path),
+                    Path(index_path),
+                    query_vector,
+                    top_k=top_k,
+                    allowed_ids=allowed_ids,
+                    minimum_candidates=max(top_k * 4, 1_200),
+                )
+                if trace is not None:
+                    trace.update(
+                        {
+                            "backend": "neural_ann",
+                            "neural_used": True,
+                            "ann_used": True,
+                            "fallback_reason": (
+                                ann_result.trace.message
+                                if ann_result.trace.degraded
+                                else None
+                            ),
+                            "candidate_source": "ann_global",
+                            "candidates_scored": ann_result.trace.candidates_scored,
+                            "candidates_returned": len(ann_result.hits),
+                            "ann_probe_radius": ann_result.trace.probe_radius,
+                            "ann_candidate_cap_applied": (
+                                ann_result.trace.candidate_cap_applied
+                            ),
+                        }
+                    )
+                return [(hit.item_id, hit.score) for hit in ann_result.hits]
+            if trace is not None:
+                trace["fallback_reason"] = str(
+                    ann_state.get("message") or "Índice ANN no disponible"
+                )
+                trace["ann_used"] = False
+        except Exception as exc:
+            if trace is not None:
+                trace["fallback_reason"] = (
+                    "No se pudo usar el índice ANN: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                trace["ann_used"] = False
     # Comparar el vector neuronal de 384 dimensiones contra todo el corpus en
     # Python sería costoso en el modo semántico puro. La señal distribucional
     # liviana genera primero un conjunto amplio de candidatos y MiniLM los
@@ -2110,7 +2211,13 @@ def semantic_search(
         if preliminary:
             candidate_ids = [hit.item_id for hit in preliminary]
 
-    return [
+    ann_fallback_reason = (
+        str(trace.get("fallback_reason"))
+        if trace is not None and trace.get("fallback_reason")
+        else None
+    )
+    neural_trace: dict[str, object] = {}
+    hits = [
         (hit.item_id, hit.score)
         for hit in query_semantic_index(
             index_path,
@@ -2120,8 +2227,18 @@ def semantic_search(
             lexical_weight=0.15,
             distributional_weight=0.25,
             neural_weight=0.60,
+            trace=neural_trace,
         )
     ]
+    if trace is not None:
+        trace.update(neural_trace)
+        if ann_fallback_reason and not neural_trace.get("fallback_reason"):
+            trace["fallback_reason"] = ann_fallback_reason
+        trace["candidate_source"] = (
+            "filtered" if allowed_ids is not None else "global_preselection"
+        )
+        trace["candidates_returned"] = len(hits)
+    return hits
 
 
 def _normalized_scores(scores: Mapping[int, float]) -> dict[int, float]:

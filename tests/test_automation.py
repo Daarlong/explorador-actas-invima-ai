@@ -179,6 +179,50 @@ class AutomationTests(unittest.TestCase):
         self.assertIn("semantic_build_outdated", status["reasons"])
         self.assertIn("semantic_neural_pending", status["reasons"])
 
+    def test_combined_status_requires_ann_package_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            integrity = root / "integrity.json"
+            indexing = root / "indexing.json"
+            semantic = root / "semantic.json"
+            integrity.write_text(
+                json.dumps(
+                    {
+                        "missing_documents": [],
+                        "documents_without_pages": [],
+                        "documents_without_chunks": [],
+                        "regulatory_extraction_pending": [],
+                        "regulatory_extraction_errors": [],
+                        "page_inventory_pending": [],
+                        "schema_version": 7,
+                        "expected_schema_version": 7,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            indexing.write_text(
+                json.dumps({"documents_failed": 0}), encoding="utf-8"
+            )
+            semantic.write_text(
+                json.dumps({"status": "built"}), encoding="utf-8"
+            )
+            (root / "actas.db").write_bytes(b"database")
+            (root / "semantic.db").write_bytes(b"semantic")
+
+            status = build_pending_status(
+                integrity,
+                indexing,
+                semantic,
+                root / "actas.db",
+                root / "semantic.db",
+                ann_index_path=root / "semantic-ann.db",
+                require_ann=True,
+                semantic_enabled=True,
+            )
+
+        self.assertTrue(status["needs_update"])
+        self.assertIn("ann_package_missing_or_incomplete", status["reasons"])
+
 
 if __name__ == "__main__":
     unittest.main()

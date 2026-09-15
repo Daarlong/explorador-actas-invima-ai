@@ -3,12 +3,15 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from dataclasses import replace
 from pathlib import Path
 
 import streamlit as st
 
 from config import (
     ALLOWED_DOCUMENT_HOSTS,
+    ANN_ENABLED,
+    ANN_INDEX_PATH,
     DATABASE_PATH,
     MAX_PDF_BYTES,
     PDF_CACHE_DIR,
@@ -34,6 +37,11 @@ from services.effective_records import (
     matching_review_uids,
 )
 from services.models import SearchResult
+from services.exports import (
+    ExportLimitError,
+    ExportUnavailableError,
+    export_search_results,
+)
 from services.pdf_viewer import (
     render_pdf_page,
     search_pdf_page_text,
@@ -42,13 +50,16 @@ from services.pdf_viewer import (
     viewer_source_payload,
 )
 from services.reviews import apply_latest_reviews, latest_reviews, load_review_events
-from services.search import SearchResponse, search_corpus
+from services.search import SearchResponse, search_corpus_page
 from services.ui_helpers import (
     apply_app_style,
     badge_html,
     group_search_results,
     highlight_query,
     pdf_page_url,
+    search_backend_label,
+    search_ranking_explanation,
+    search_scope_label,
 )
 
 
@@ -79,19 +90,28 @@ def cached_search(
     query: str,
     mode: str,
     exact_phrase: bool,
+    field_scope: str,
+    page: int,
+    page_size: int,
+    order: str,
     filters_json: str,
     database_identity: tuple[int, int],
     semantic_identity: tuple[int, int],
+    ann_identity: tuple[int, int],
 ) -> SearchResponse:
-    del database_identity, semantic_identity
-    return search_corpus(
+    del database_identity, semantic_identity, ann_identity
+    return search_corpus_page(
         DATABASE_PATH,
         SEMANTIC_INDEX_PATH,
         query,
         mode=mode,
         exact_phrase=exact_phrase,
-        top_k=360,
+        field_scope=field_scope,
+        page=page,
+        page_size=page_size,
+        order=order,
         filters=json.loads(filters_json),
+        ann_index_path=ANN_INDEX_PATH if ANN_ENABLED else None,
     )
 
 
@@ -133,6 +153,7 @@ def reset_explorer_filters() -> None:
 
     defaults = {
         "explorer_exact_phrase": False,
+        "explorer_field_scope": "Todo el contenido",
         "explorer_years": [],
         "explorer_acta_numbers": [],
         "explorer_sections": [],
@@ -462,6 +483,7 @@ if stats["documents"] == 0:
     st.stop()
 
 has_structured_data = table_exists(DATABASE_PATH, "regulatory_records")
+has_regulatory_search = table_exists(DATABASE_PATH, "regulatory_records_fts")
 try:
     review_events = load_review_events(REVIEW_LOG_PATH)
 except ValueError:
@@ -481,6 +503,25 @@ mode_labels = {
     "Textual FTS5": "textual",
     "Semántica neuronal": "semantic",
 }
+field_scope_labels = {
+    "Todo el contenido": "all",
+}
+if has_regulatory_search:
+    field_scope_labels.update(
+        {
+            "Solicitud": "request",
+            "Concepto / decisión": "concept",
+            "Producto": "product",
+            "Principio activo": "active_ingredient",
+            "Interesado": "interested_party",
+            "Expediente": "expediente",
+            "Radicado": "radicado",
+            "Ficha estructurada": "record",
+            "Resultado derivado del concepto": "outcome",
+        }
+    )
+if st.session_state.get("explorer_field_scope") not in field_scope_labels:
+    st.session_state["explorer_field_scope"] = "Todo el contenido"
 order_labels = {
     "Mayor relevancia": "relevance",
     "Más recientes": "newest",
@@ -515,6 +556,15 @@ with st.sidebar:
             help=(
                 "La búsqueda híbrida combina FTS5 con representaciones "
                 "multilingües locales, sin enviar información a servicios externos."
+            ),
+        )
+        selected_field_scope_label = st.selectbox(
+            "Buscar en",
+            list(field_scope_labels),
+            key="explorer_field_scope",
+            help=(
+                "Limita la consulta a todo el documento o a un campo real de "
+                "las fichas extraídas. Los filtros siguen aplicándose."
             ),
         )
         exact_phrase = st.checkbox(
@@ -622,6 +672,7 @@ with st.sidebar:
         bool(value)
         for value in (
             exact_phrase,
+            field_scope_labels[selected_field_scope_label] != "all",
             years,
             acta_numbers,
             sections,
@@ -711,7 +762,7 @@ with st.container(border=True):
             type="primary",
             use_container_width=True,
         )
-    search_context = [selected_mode_label]
+    search_context = [selected_mode_label, selected_field_scope_label]
     if active_filter_count:
         search_context.append(f"{active_filter_count} filtro(s)")
     context_column, clear_query_column = st.columns(
@@ -825,6 +876,7 @@ signature = hashlib.sha256(
             query,
             selected_mode_label,
             exact_phrase,
+            field_scope_labels[selected_field_scope_label],
             filters,
             effective_filter_values,
             selected_order_label,
@@ -836,6 +888,7 @@ signature = hashlib.sha256(
 if st.session_state.get("explorer_search_signature") != signature:
     st.session_state["explorer_search_signature"] = signature
     st.session_state["explorer_page"] = 1
+current_page = max(1, int(st.session_state.get("explorer_page", 1)))
 
 with st.spinner("Consultando el corpus..."):
     try:
@@ -843,9 +896,14 @@ with st.spinner("Consultando el corpus..."):
             query.strip(),
             mode_labels[selected_mode_label],
             exact_phrase,
+            field_scope_labels[selected_field_scope_label],
+            current_page,
+            page_size,
+            order_labels[selected_order_label],
             json.dumps(search_filters, ensure_ascii=False, sort_keys=True),
             _file_identity(DATABASE_PATH),
             _file_identity(SEMANTIC_INDEX_PATH),
+            _file_identity(ANN_INDEX_PATH),
         )
         # Conserva también los candidatos que coinciden con los valores de la
         # extracción. El barrido sin filtros y esta segunda consulta evitan
@@ -855,23 +913,25 @@ with st.spinner("Consultando el corpus..."):
                 query.strip(),
                 mode_labels[selected_mode_label],
                 exact_phrase,
+                field_scope_labels[selected_field_scope_label],
+                current_page,
+                page_size,
+                order_labels[selected_order_label],
                 json.dumps(filters, ensure_ascii=False, sort_keys=True),
                 _file_identity(DATABASE_PATH),
                 _file_identity(SEMANTIC_INDEX_PATH),
+                _file_identity(ANN_INDEX_PATH),
             )
             candidates = {result.chunk_id: result for result in response.results}
             for result in automatic_response.results:
                 current = candidates.get(result.chunk_id)
                 if current is None or result.score > current.score:
                     candidates[result.chunk_id] = result
-            response = SearchResponse(
+            response = replace(
+                response,
                 results=sorted(
                     candidates.values(), key=lambda item: (-item.score, item.chunk_id)
                 ),
-                requested_mode=response.requested_mode,
-                used_mode=response.used_mode,
-                semantic_available=response.semantic_available,
-                semantic_message=response.semantic_message,
             )
     except Exception as exc:
         st.error(f"No fue posible completar la búsqueda: {exc}")
@@ -890,7 +950,8 @@ if post_filter_effective and response.results:
             for result in response.results
         },
     )
-    response = SearchResponse(
+    response = replace(
+        response,
         results=[
             result
             for result in response.results
@@ -899,13 +960,15 @@ if post_filter_effective and response.results:
                 for record in all_structured_by_chunk.get(result.chunk_id, [])
             )
         ],
-        requested_mode=response.requested_mode,
-        used_mode=response.used_mode,
-        semantic_available=response.semantic_available,
-        semantic_message=response.semantic_message,
+        totals_exact=False,
     )
 
-if exact_phrase and response.requested_mode != response.used_mode:
+if response.field_scope != "all" and response.requested_mode != response.used_mode:
+    st.info(
+        "La búsqueda por campo usa el índice textual de fichas para mantener "
+        "aislado el contenido del campo seleccionado."
+    )
+elif exact_phrase and response.requested_mode != response.used_mode:
     st.info(
         "La opción de frase completa utiliza búsqueda textual para respetar "
         "el orden exacto de las palabras."
@@ -984,7 +1047,7 @@ corrected_records = [
     if str(record.get("decision_uid") or "") not in regular_uids
 ]
 
-groups = group_search_results(response.results, order=order_labels[selected_order_label])
+groups = group_search_results(response.results, order="relevance")
 if not groups and not corrected_records:
     with st.container(border=True):
         st.warning("No encontramos coincidencias para esta combinación.")
@@ -1003,11 +1066,11 @@ if not groups and not corrected_records:
             )
     st.stop()
 
-total_pages = max(1, math.ceil(len(groups) / page_size))
-current_page = min(int(st.session_state.get("explorer_page", 1)), total_pages)
+total_pages = response.total_pages or max(1, math.ceil(len(groups) / page_size))
+current_page = min(response.page, total_pages)
 st.session_state["explorer_page"] = current_page
 start = (current_page - 1) * page_size
-visible_groups = groups[start : start + page_size]
+visible_groups = groups
 visible_results = [
     result for group in visible_groups for result in group["results"][:3]
 ]
@@ -1033,10 +1096,51 @@ else:
 result_heading, result_selection = st.columns([4, 1], vertical_alignment="bottom")
 with result_heading:
     st.subheader("Resultados")
-    st.caption(
-        f"**{len(groups)} acta(s)** · {len(response.results)} fragmento(s) · "
-        f"modo {response.used_mode} · página {current_page} de {total_pages}"
+    displayed_documents = response.total_documents
+    displayed_fragments = response.total_fragments
+    total_label = (
+        "coincidencias globales"
+        if response.totals_exact
+        else "resultados del conjunto recuperado"
     )
+    st.caption(
+        f"**{displayed_documents if displayed_documents is not None else len(groups)} "
+        f"acta(s)** · {displayed_fragments if displayed_fragments is not None else len(response.results)} "
+        f"fragmento(s) · {total_label} · página {current_page} de {total_pages}"
+    )
+    st.markdown(
+        " ".join(
+            (
+                badge_html(
+                    search_backend_label(
+                        response.retrieval_backend,
+                        mode=response.used_mode,
+                    ),
+                    tone="success",
+                ),
+                badge_html(
+                    f"Campo: {search_scope_label(response.field_scope)}",
+                    tone="info",
+                ),
+            )
+        ),
+        unsafe_allow_html=True,
+    )
+    if response.fallback_reason:
+        st.warning(response.fallback_reason)
+    with st.expander("¿Cómo se obtuvieron y ordenaron estos resultados?"):
+        st.write(
+            search_ranking_explanation(
+                mode=response.used_mode,
+                backend=response.retrieval_backend,
+                exact_phrase=exact_phrase,
+            )
+        )
+        if response.candidate_count is not None and not response.totals_exact:
+            st.caption(
+                f"Se evaluó un conjunto de {response.candidate_count:,} "
+                "candidatos; el total semántico es aproximado."
+            )
 with result_selection:
     st.markdown(
         badge_html(
@@ -1045,6 +1149,102 @@ with result_selection:
         ),
         unsafe_allow_html=True,
     )
+
+with st.expander("Exportar resultados", expanded=False):
+    export_options = ["Esta página"]
+    if response.totals_exact:
+        export_options.append("Todas las coincidencias")
+    export_choice, export_format = st.columns(2)
+    selected_export_scope = export_choice.radio(
+        "Alcance",
+        export_options,
+        horizontal=True,
+        key=f"export_scope_{signature}",
+    )
+    selected_export_format = export_format.radio(
+        "Formato",
+        ["CSV", "XLSX"],
+        horizontal=True,
+        key=f"export_format_{signature}",
+    )
+    if not response.totals_exact:
+        st.caption(
+            "La búsqueda semántica exporta la página visible porque su conjunto "
+            "de candidatos es aproximado."
+        )
+    if st.button(
+        "Preparar exportación",
+        key=f"prepare_export_{signature}",
+        use_container_width=True,
+    ):
+        try:
+            export_results = list(response.results)
+            if selected_export_scope == "Todas las coincidencias":
+                export_results = []
+                export_total_pages = max(
+                    1,
+                    math.ceil((response.total_documents or 0) / 100),
+                )
+                for export_page in range(1, export_total_pages + 1):
+                    export_response = cached_search(
+                        query.strip(),
+                        mode_labels[selected_mode_label],
+                        exact_phrase,
+                        field_scope_labels[selected_field_scope_label],
+                        export_page,
+                        100,
+                        order_labels[selected_order_label],
+                        json.dumps(
+                            search_filters,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                        _file_identity(DATABASE_PATH),
+                        _file_identity(SEMANTIC_INDEX_PATH),
+                        _file_identity(ANN_INDEX_PATH),
+                    )
+                    export_results.extend(export_response.results)
+            artifact = export_search_results(
+                export_results,
+                file_format=selected_export_format.lower(),
+                file_stem=f"consulta_actas_{signature}",
+                metadata={
+                    "consulta": query,
+                    "metodo_solicitado": mode_labels[selected_mode_label],
+                    "motor_real": response.retrieval_backend,
+                    "campo": response.field_scope,
+                    "filtros": json.dumps(
+                        filters,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    "frase_completa": exact_phrase,
+                    "ruta_respaldo": response.fallback_reason or "",
+                    "totales_exactos": response.totals_exact,
+                },
+            )
+            st.session_state["explorer_export_artifact"] = {
+                "signature": signature,
+                "scope": selected_export_scope,
+                "format": selected_export_format,
+                "name": artifact.file_name,
+                "mime": artifact.mime_type,
+                "data": artifact.data,
+                "rows": artifact.row_count,
+            }
+        except (ExportLimitError, ExportUnavailableError, ValueError) as exc:
+            st.error(str(exc))
+    prepared_export = st.session_state.get("explorer_export_artifact")
+    if prepared_export and prepared_export.get("signature") == signature:
+        st.download_button(
+            f"Descargar {prepared_export['format']} "
+            f"({prepared_export['rows']} filas)",
+            data=prepared_export["data"],
+            file_name=prepared_export["name"],
+            mime=prepared_export["mime"],
+            key=f"download_export_{signature}_{prepared_export['format']}",
+            use_container_width=True,
+        )
 
 if corrected_records:
     with st.expander(
@@ -1135,8 +1335,8 @@ if groups:
             st.session_state["explorer_page"] = current_page - 1
             st.rerun()
         nav_middle.markdown(
-            f"Actas **{start + 1}–{min(start + page_size, len(groups))}** "
-            f"de **{len(groups)}**"
+            f"Actas **{start + 1}–{min(start + len(groups), response.total_documents or start + len(groups))}** "
+            f"de **{response.total_documents if response.total_documents is not None else start + len(groups)}**"
         )
         if nav_right.button(
             "Siguiente →",
@@ -1156,7 +1356,7 @@ with results_column:
             )
             title_column.markdown(f"### {group_index}. {group['title']}")
             score_column.markdown(
-                badge_html(f"Puntaje {group['score']:.3f}", tone="success"),
+                badge_html(f"Posición {group_index}", tone="success"),
                 unsafe_allow_html=True,
             )
             metadata = []
@@ -1197,7 +1397,27 @@ with results_column:
                     f"#### Coincidencia {fragment_index} "
                     f"{metadata_tag(f'Página {result.page}')}"
                 )
-                st.markdown(highlight_query(result.text, query), unsafe_allow_html=True)
+                visible_text = result.match_excerpt or result.text
+                st.markdown(highlight_query(visible_text, query), unsafe_allow_html=True)
+                if result.match_type == "semantic" and not set(
+                    normalize_word
+                    for normalize_word in query.casefold().split()
+                ).intersection(visible_text.casefold().split()):
+                    st.caption(
+                        "Relacionado por significado; puede no contener las "
+                        "mismas palabras."
+                    )
+                with st.expander("Detalle técnico"):
+                    st.write(
+                        {
+                            "tipo": result.match_type,
+                            "puntaje_textual": result.lexical_score,
+                            "puntaje_semantico": result.semantic_score,
+                            "puntaje_fusionado": result.score,
+                            "motor": response.retrieval_backend,
+                            "campo": result.matched_field or response.field_scope,
+                        }
+                    )
                 controls = st.columns([1.2, 1, 1])
                 selection_key = f"select_evidence_{signature}_{result.chunk_id}"
                 controls[0].checkbox(

@@ -20,7 +20,7 @@ from services.regulatory import (
 from services.text_utils import normalize_phrase, normalize_text, tokenize_query
 
 
-DATABASE_SCHEMA_VERSION = 6
+DATABASE_SCHEMA_VERSION = 7
 
 REGULATORY_EXTRACTOR_VERSION = "6"
 PAGE_TEXT_CODEC = "zlib-utf8-v1"
@@ -32,6 +32,29 @@ UID_RECONCILIATION_KEYS = (
     "uids_ambiguous",
     "uids_orphaned",
 )
+
+REGULATORY_SEARCH_SCOPES = (
+    "request",
+    "concept",
+    "product",
+    "active_ingredient",
+    "interested_party",
+    "expediente",
+    "radicado",
+    "record",
+    "outcome",
+)
+_REGULATORY_FTS_COLUMNS = {
+    "request": "request_text",
+    "concept": "concept_text",
+    "product": "product_text",
+    "active_ingredient": "active_ingredient_text",
+    "interested_party": "interested_party_text",
+    "expediente": "expediente_text",
+    "radicado": "radicado_text",
+    "record": "record_text",
+    "outcome": "outcome_text",
+}
 
 FEATURE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS document_extractions (
@@ -98,6 +121,21 @@ CREATE TABLE IF NOT EXISTS regulatory_field_evidence (
     CHECK(page_number >= 1),
     CHECK(end_page_number >= page_number),
     CHECK(confidence IS NULL OR confidence BETWEEN 0 AND 1)
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS regulatory_records_fts USING fts5(
+    request_text,
+    concept_text,
+    product_text,
+    active_ingredient_text,
+    interested_party_text,
+    expediente_text,
+    radicado_text,
+    outcome_text,
+    record_text,
+    content='',
+    detail=column,
+    tokenize = 'unicode61 remove_diacritics 2'
 );
 
 CREATE INDEX IF NOT EXISTS idx_records_document
@@ -443,8 +481,96 @@ def _backfill_missing_decision_uids(connection: sqlite3.Connection) -> int:
     return updated
 
 
+def _regulatory_record_search_text(row: sqlite3.Row | tuple) -> str:
+    """Compone una ficha consultable usando solo valores persistidos."""
+
+    values = (
+        row[0],  # numeral
+        row[1],  # numeral_title
+        row[2],  # product_name
+        row[3],  # active_ingredient
+        row[4],  # interested_party
+        row[5],  # expediente
+        row[6],  # radicado
+        row[7],  # request_type_code
+        row[8],  # request_text
+        row[9],  # concept_text
+        row[10],  # outcome_code
+    )
+    return "\n".join(str(value).strip() for value in values if value).strip()
+
+
+def _rebuild_regulatory_search_index_connection(
+    connection: sqlite3.Connection,
+) -> int:
+    """Sincroniza el FTS de fichas dentro de la transacción activa."""
+
+    tables = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+        ).fetchall()
+    }
+    if not {"regulatory_records", "regulatory_records_fts"}.issubset(tables):
+        return 0
+    connection.execute(
+        "INSERT INTO regulatory_records_fts(regulatory_records_fts) "
+        "VALUES('delete-all')"
+    )
+    rows = connection.execute(
+        """
+        SELECT id, numeral, numeral_title, product_name, active_ingredient,
+               interested_party, expediente, radicado, request_type_code,
+               request_text, concept_text, outcome_code
+        FROM regulatory_records
+        ORDER BY id
+        """
+    ).fetchall()
+    connection.executemany(
+        """
+        INSERT INTO regulatory_records_fts (
+            rowid, request_text, concept_text, product_text,
+            active_ingredient_text, interested_party_text, expediente_text,
+            radicado_text, outcome_text, record_text
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            (
+                int(row[0]),
+                str(row[9] or ""),
+                str(row[10] or ""),
+                str(row[3] or ""),
+                str(row[4] or ""),
+                str(row[5] or ""),
+                str(row[6] or ""),
+                str(row[7] or ""),
+                "\n".join(
+                    value
+                    for value in (
+                        str(row[11] or "").strip(),
+                        str(row[10] or "").strip(),
+                    )
+                    if value
+                ),
+                _regulatory_record_search_text(row[1:]),
+            )
+            for row in rows
+        ),
+    )
+    return len(rows)
+
+
+def rebuild_regulatory_search_index(database_path: Path) -> int:
+    """Reconstruye el FTS derivado sin alterar fichas, fragmentos ni IDs."""
+
+    if not database_path.exists():
+        return 0
+    with connect(database_path) as connection:
+        return _rebuild_regulatory_search_index_connection(connection)
+
+
 def migrate_database_schema(database_path: Path) -> bool:
-    """Aplica migraciones aditivas v2-v5→v6 sobre una copia verificada."""
+    """Aplica migraciones aditivas v2-v6→v7 sobre una copia verificada."""
     version = database_schema_version(database_path)
     if version == DATABASE_SCHEMA_VERSION:
         return False
@@ -453,10 +579,10 @@ def migrate_database_schema(database_path: Path) -> bool:
             f"La base usa el esquema {version}, superior al soportado "
             f"({DATABASE_SCHEMA_VERSION})"
         )
-    if version not in {2, 3, 4, 5}:
+    if version not in {2, 3, 4, 5, 6}:
         return False
 
-    temporary_path = database_path.with_suffix(".schema-v6.db")
+    temporary_path = database_path.with_suffix(".schema-v7.db")
     temporary_path.unlink(missing_ok=True)
     shutil.copy2(database_path, temporary_path)
     tables_to_verify = ("documents", "pages", "chunks", "chunks_fts")
@@ -579,6 +705,7 @@ def migrate_database_schema(database_path: Path) -> bool:
                     "UPDATE documents SET page_inventory_complete = 0"
                 )
             connection.executescript(FEATURE_SCHEMA)
+            _rebuild_regulatory_search_index_connection(connection)
             connection.execute(
                 "INSERT OR REPLACE INTO app_metadata (key, value) VALUES (?, ?)",
                 ("schema_version", str(DATABASE_SCHEMA_VERSION)),
@@ -601,6 +728,15 @@ def migrate_database_schema(database_path: Path) -> bool:
                         "SELECT COUNT(*) FROM regulatory_records"
                     ).fetchone()[0]
                 )
+                indexed_records = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM regulatory_records_fts"
+                    ).fetchone()[0]
+                )
+                if indexed_records != after["regulatory_records"]:
+                    raise RuntimeError(
+                        "El índice de campos regulatorios quedó incompleto"
+                    )
             if integrity.lower() != "ok" or foreign_key_errors or before != after:
                 raise RuntimeError(
                     "La verificación de la migración aditiva no fue satisfactoria"
@@ -614,6 +750,15 @@ def migrate_database_schema(database_path: Path) -> bool:
 
 def clear_database(database_path: Path) -> None:
     with connect(database_path) as connection:
+        has_regulatory_fts = connection.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='regulatory_records_fts'"
+        ).fetchone()
+        if has_regulatory_fts:
+            connection.execute(
+                "INSERT INTO regulatory_records_fts(regulatory_records_fts) "
+                "VALUES('delete-all')"
+            )
         fts_sql_row = connection.execute(
             "SELECT sql FROM sqlite_master WHERE name = 'chunks_fts'"
         ).fetchone()
@@ -1370,6 +1515,8 @@ def sync_regulatory_extractions(
                         datetime.now(timezone.utc).isoformat(),
                     ),
                 )
+        if summary["documents_processed"]:
+            _rebuild_regulatory_search_index_connection(connection)
     return summary
 
 
@@ -2198,6 +2345,14 @@ def optimize_database(database_path: Path) -> None:
         return
     with connect(database_path) as connection:
         connection.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('optimize')")
+        if connection.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='regulatory_records_fts'"
+        ).fetchone():
+            connection.execute(
+                "INSERT INTO regulatory_records_fts(regulatory_records_fts) "
+                "VALUES('optimize')"
+            )
         connection.execute("PRAGMA optimize")
         connection.commit()
         connection.execute("VACUUM")
@@ -2726,6 +2881,502 @@ def _filter_sql(filters: dict[str, list] | None) -> tuple[str, list]:
     return (" AND " + " AND ".join(clauses) if clauses else "", parameters)
 
 
+def _regulatory_filter_sql(
+    filters: dict[str, list] | None,
+) -> tuple[str, list]:
+    """Traduce los filtros contra la ficha seleccionada, no contra otra vecina."""
+
+    filters = filters or {}
+    clauses: list[str] = []
+    parameters: list = []
+    document_mapping = {
+        "years": "d.year",
+        "sections": "d.section",
+        "parts": "d.part",
+        "acta_numbers": "d.acta_number",
+    }
+    for key, column in document_mapping.items():
+        values = [value for value in filters.get(key, []) if value not in (None, "")]
+        if values:
+            placeholders = ",".join("?" for _ in values)
+            clauses.append(f"{column} IN ({placeholders})")
+            parameters.extend(values)
+
+    direct_mapping = {
+        "outcomes": "rr.outcome_code",
+        "request_types": "rr.request_type_code",
+    }
+    for key, column in direct_mapping.items():
+        values = [value for value in filters.get(key, []) if value not in (None, "")]
+        if values:
+            placeholders = ",".join("?" for _ in values)
+            clauses.append(f"{column} IN ({placeholders})")
+            parameters.extend(values)
+
+    text_mapping = {
+        "products": "rr.normalized_product_name",
+        "active_ingredients": "rr.normalized_active_ingredient",
+        "interested_parties": "rr.normalized_interested_party",
+    }
+    for key, column in text_mapping.items():
+        values = [normalize_text(str(value)) for value in filters.get(key, []) if value]
+        if values:
+            clauses.append(f"{column} LIKE ?")
+            parameters.append(f"%{values[0]}%")
+
+    identifiers = [value for value in filters.get("identifiers", []) if value]
+    if identifiers:
+        normalized = _normalized_identifier(str(identifiers[0]))
+        clauses.append(
+            "(rr.normalized_expediente LIKE ? OR rr.normalized_radicado LIKE ?)"
+        )
+        parameters.extend((f"%{normalized}%", f"%{normalized}%"))
+    return (" AND " + " AND ".join(clauses) if clauses else "", parameters)
+
+
+_REGULATORY_RECORD_TEXT_SQL = """
+TRIM(
+    COALESCE(rr.numeral, '') || CHAR(10) ||
+    COALESCE(rr.numeral_title, '') || CHAR(10) ||
+    COALESCE(rr.product_name, '') || CHAR(10) ||
+    COALESCE(rr.active_ingredient, '') || CHAR(10) ||
+    COALESCE(rr.interested_party, '') || CHAR(10) ||
+    COALESCE(rr.expediente, '') || CHAR(10) ||
+    COALESCE(rr.radicado, '') || CHAR(10) ||
+    COALESCE(rr.request_type_code, '') || CHAR(10) ||
+    COALESCE(rr.request_text, '') || CHAR(10) ||
+    COALESCE(rr.concept_text, '') || CHAR(10) ||
+    COALESCE(rr.outcome_code, '')
+)
+""".strip()
+
+_REGULATORY_FIELD_TEXT_SQL = {
+    "request": "COALESCE(rr.request_text, '')",
+    "concept": "COALESCE(rr.concept_text, '')",
+    "product": "COALESCE(rr.product_name, '')",
+    "active_ingredient": "COALESCE(rr.active_ingredient, '')",
+    "interested_party": "COALESCE(rr.interested_party, '')",
+    "expediente": "COALESCE(rr.expediente, '')",
+    "radicado": "COALESCE(rr.radicado, '')",
+    "record": _REGULATORY_RECORD_TEXT_SQL,
+    "outcome": (
+        "TRIM(COALESCE(rr.outcome_code, '') || CHAR(10) || "
+        "COALESCE(rr.concept_text, ''))"
+    ),
+}
+
+_REGULATORY_EVIDENCE_FIELDS = {
+    "request": "solicitud",
+    "concept": "concepto",
+    "product": "producto",
+    "active_ingredient": "principio_activo",
+    "interested_party": "interesado",
+    "expediente": "expediente",
+    "radicado": "radicado",
+    "record": "rango_paginas",
+    "outcome": "resultado_normalizado",
+}
+
+
+def _fts_query_terms(query: str, *, exact_phrase: bool) -> tuple[str, str]:
+    normalized_phrase = normalize_phrase(query)
+    if not normalized_phrase:
+        return "", ""
+    if exact_phrase:
+        terms = list(dict.fromkeys(normalized_phrase.split()))
+        operator = " AND "
+    else:
+        terms = list(
+            dict.fromkeys(
+                atom
+                for term in tokenize_query(query)
+                for atom in re.findall(r"[^\W_]+", term, flags=re.UNICODE)
+            )
+        )
+        if not terms:
+            terms = list(dict.fromkeys(normalized_phrase.split()))
+        operator = " OR "
+    escaped = [term.replace('"', "") for term in terms if term.replace('"', "")]
+    return operator.join(f'"{term}"' for term in escaped), normalized_phrase
+
+
+def search_regulatory_fields(
+    database_path: Path,
+    query: str,
+    *,
+    scope: str,
+    top_k: int = 10,
+    filters: dict[str, list] | None = None,
+    exact_phrase: bool = False,
+    max_records_per_document: int = 5,
+) -> list[SearchResult]:
+    """Busca texto real dentro de campos regulatorios ya persistidos.
+
+    ``record`` concatena los valores visibles de la ficha. ``outcome`` combina
+    el código normalizado con el concepto del cual se derivó. Los resultados
+    siempre se anclan a un fragmento existente para conservar la navegación y
+    la compatibilidad con selecciones, comparaciones e índices semánticos.
+    """
+
+    if scope not in REGULATORY_SEARCH_SCOPES:
+        raise ValueError(f"Campo regulatorio desconocido: {scope}")
+    if top_k < 1:
+        raise ValueError("top_k debe ser mayor que cero")
+    if max_records_per_document < 1:
+        raise ValueError("max_records_per_document debe ser mayor que cero")
+    query = query.strip()
+    if not query or not database_path.exists():
+        return []
+    fts_terms, normalized_phrase = _fts_query_terms(
+        query, exact_phrase=exact_phrase
+    )
+    if not fts_terms:
+        return []
+
+    fts_column = _REGULATORY_FTS_COLUMNS[scope]
+    field_text_sql = _REGULATORY_FIELD_TEXT_SQL[scope]
+    evidence_field = _REGULATORY_EVIDENCE_FIELDS[scope]
+    filter_clause, filter_parameters = _regulatory_filter_sql(filters)
+    exact_clause = ""
+    exact_parameters: list[str] = []
+    if exact_phrase:
+        exact_clause = f" AND normalized_phrase_contains({field_text_sql}, ?) = 1"
+        exact_parameters.append(normalized_phrase)
+
+    sql = f"""
+        WITH evidence AS (
+            SELECT record_id, MIN(page_number) AS page_number,
+                   MAX(end_page_number) AS end_page_number
+            FROM regulatory_field_evidence
+            WHERE field_name = ?
+            GROUP BY record_id
+        ), candidates AS MATERIALIZED (
+            SELECT rr.id AS record_id, rr.document_id,
+                   {field_text_sql} AS text,
+                   COALESCE(e.page_number, rr.page_number) AS page_number,
+                   COALESCE(e.end_page_number, rr.end_page_number) AS end_page_number,
+                   d.title, d.url, d.year, d.acta_number, d.section, d.part,
+                   d.source_type,
+                   bm25(regulatory_records_fts) AS lexical_rank
+            FROM regulatory_records_fts
+            JOIN regulatory_records rr
+              ON rr.id = regulatory_records_fts.rowid
+            JOIN documents d ON d.id = rr.document_id
+            LEFT JOIN evidence e ON e.record_id = rr.id
+            WHERE regulatory_records_fts MATCH ?
+              AND TRIM({field_text_sql}) != ''
+              {filter_clause} {exact_clause}
+        ), anchored AS (
+            SELECT candidates.*,
+                   (
+                       SELECT c.id
+                       FROM chunks c
+                       JOIN pages p ON p.id = c.page_id
+                       WHERE p.document_id = candidates.document_id
+                         AND p.page_number = candidates.page_number
+                       ORDER BY c.chunk_index, c.id
+                       LIMIT 1
+                   ) AS chunk_id
+            FROM candidates
+        ), ranked AS (
+            SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY document_id
+                ORDER BY lexical_rank, record_id
+            ) AS document_rank
+            FROM anchored
+            WHERE chunk_id IS NOT NULL
+        )
+        SELECT ranked.chunk_id, ranked.document_id, c.text,
+               ranked.text AS field_text, ranked.page_number, ranked.title,
+               ranked.url, ranked.year, ranked.acta_number, ranked.section,
+               ranked.part, ranked.source_type, ranked.lexical_rank
+        FROM ranked
+        JOIN chunks c ON c.id = ranked.chunk_id
+        WHERE document_rank <= ?
+        ORDER BY lexical_rank, record_id
+        LIMIT ?
+    """
+    with connect(database_path) as connection:
+        exists = connection.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='regulatory_records_fts'"
+        ).fetchone()
+        if not exists:
+            return []
+        if exact_phrase:
+            connection.create_function(
+                "normalized_phrase_contains",
+                2,
+                lambda value, phrase: int(
+                    bool(phrase)
+                    and str(phrase) in normalize_phrase(str(value or ""))
+                ),
+                deterministic=True,
+            )
+        rows = connection.execute(
+            sql,
+            [
+                evidence_field,
+                f"{fts_column} : ({fts_terms})",
+                *filter_parameters,
+                *exact_parameters,
+                max_records_per_document,
+                top_k,
+            ],
+        ).fetchall()
+    row_count = max(len(rows), 1)
+    results: list[SearchResult] = []
+    for position, row in enumerate(rows):
+        field_text = str(row["field_text"])
+        exact_bonus = (
+            2.0 if normalized_phrase in normalize_phrase(field_text) else 0.0
+        )
+        score = round(1.0 - (position / row_count) + exact_bonus, 3)
+        results.append(
+            SearchResult(
+                chunk_id=int(row["chunk_id"]),
+                title=str(row["title"]),
+                url=str(row["url"]),
+                page=int(row["page_number"]),
+                text=str(row["text"]),
+                year=row["year"],
+                acta_number=row["acta_number"],
+                section=row["section"],
+                part=row["part"],
+                source_type=str(row["source_type"]),
+                score=score,
+                lexical_score=score,
+                match_type=f"field:{scope}",
+                evidence_scope="regulatory_field",
+                matched_field=scope,
+                match_excerpt=field_text,
+                document_id=int(row["document_id"]),
+            )
+        )
+    results.sort(key=lambda result: (-result.score, result.chunk_id))
+    return results[:top_k]
+
+
+def _phrase_word_span(text: str, normalized_phrase: str) -> tuple[int, int] | None:
+    target = normalized_phrase.split()
+    if not target:
+        return None
+    words = list(re.finditer(r"[^\W_]+", text, flags=re.UNICODE))
+    normalized_words = [normalize_phrase(match.group(0)) for match in words]
+    width = len(target)
+    for position in range(0, len(words) - width + 1):
+        if normalized_words[position : position + width] == target:
+            return words[position].start(), words[position + width - 1].end()
+    return None
+
+
+def _page_phrase_excerpt(
+    text: str,
+    normalized_phrase: str,
+    *,
+    context_characters: int = 500,
+) -> str:
+    span = _phrase_word_span(text, normalized_phrase)
+    if span is None:
+        clean = re.sub(r"\s+", " ", text).strip()
+        return clean[:1200] + ("…" if len(clean) > 1200 else "")
+    start, end = span
+    excerpt_start = max(0, start - context_characters)
+    excerpt_end = min(len(text), end + context_characters)
+    excerpt = text[excerpt_start:excerpt_end]
+    # Los PDF suelen cortar una expresión al final de línea con guion. La
+    # consulta ya la normaliza como dos palabras; el fragmento visible debe
+    # reflejar esa misma lectura para que el usuario pueda reconocerla.
+    excerpt = re.sub(r"-\s+", " ", excerpt)
+    excerpt = re.sub(r"\s+", " ", excerpt).strip()
+    if excerpt_start:
+        excerpt = f"…{excerpt}"
+    if excerpt_end < len(text):
+        excerpt = f"{excerpt}…"
+    return excerpt
+
+
+def _page_text_and_anchor(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    normalized_phrase: str,
+) -> tuple[str, int, str] | None:
+    page_text: str | None = None
+    if row["raw_text_compressed"] is not None:
+        try:
+            page_text = decompress_page_text(
+                row["raw_text_compressed"], str(row["raw_text_codec"] or "")
+            )
+        except ValueError:
+            page_text = None
+    chunks = connection.execute(
+        "SELECT id, text FROM chunks WHERE page_id = ? ORDER BY chunk_index, id",
+        (int(row["page_id"]),),
+    ).fetchall()
+    if page_text is None:
+        page_text = _merge_overlapping_chunks(str(chunk["text"]) for chunk in chunks)
+    if not page_text or normalized_phrase not in normalize_phrase(page_text):
+        return None
+    if not chunks:
+        return None
+    target_terms = set(normalized_phrase.split())
+    anchor = max(
+        chunks,
+        key=lambda chunk: (
+            int(normalized_phrase in normalize_phrase(str(chunk["text"]))),
+            len(target_terms & set(normalize_phrase(str(chunk["text"])).split())),
+            -int(chunk["id"]),
+        ),
+    )
+    return page_text, int(anchor["id"]), str(anchor["text"])
+
+
+def search_pages_exact(
+    database_path: Path,
+    query: str,
+    *,
+    top_k: int = 10,
+    filters: dict[str, list] | None = None,
+    max_pages_per_document: int = 5,
+) -> list[SearchResult]:
+    """Encuentra una frase en una página aun si cruza dos fragmentos.
+
+    El FTS de fragmentos se usa solo para intersectar páginas candidatas. La
+    confirmación se hace contra el texto fuente completo y normalizado de cada
+    página antes de limitar resultados. No se permite que una coincidencia
+    atraviese dos páginas físicas.
+    """
+
+    if top_k < 1:
+        raise ValueError("top_k debe ser mayor que cero")
+    if max_pages_per_document < 1:
+        raise ValueError("max_pages_per_document debe ser mayor que cero")
+    query = query.strip()
+    if not query or not database_path.exists():
+        return []
+    normalized_phrase = normalize_phrase(query)
+    terms = list(dict.fromkeys(normalized_phrase.split()))
+    if not terms:
+        return []
+
+    # Un número extremo de palabras no debe superar el límite de SELECT
+    # compuestos de SQLite. La verificación posterior siempre usa la frase
+    # completa, por lo que reducir solo la sonda no crea falsos positivos.
+    probe_terms = terms[:64]
+    term_selects: list[str] = []
+    term_parameters: list[object] = []
+    for index, term in enumerate(probe_terms):
+        term_selects.append(
+            """
+            SELECT ? AS term_index, p.id AS page_id
+            FROM chunks_fts
+            JOIN chunks c ON c.id = chunks_fts.rowid
+            JOIN pages p ON p.id = c.page_id
+            WHERE chunks_fts MATCH ?
+            GROUP BY p.id
+            """
+        )
+        term_parameters.extend((index, f'text : "{term.replace(chr(34), "")}"'))
+    filter_clause, filter_parameters = _filter_sql(filters)
+    candidate_cte = " UNION ALL ".join(term_selects)
+    base_sql = f"""
+        WITH term_hits(term_index, page_id) AS (
+            {candidate_cte}
+        ), candidate_pages AS (
+            SELECT page_id
+            FROM term_hits
+            GROUP BY page_id
+            HAVING COUNT(DISTINCT term_index) = ?
+        )
+        SELECT p.id AS page_id, p.raw_text_compressed, p.raw_text_codec,
+               p.page_number, d.id AS document_id, d.title, d.url, d.year,
+               d.acta_number, d.section, d.part, d.source_type
+        FROM candidate_pages candidate
+        JOIN pages p ON p.id = candidate.page_id
+        JOIN documents d ON d.id = p.document_id
+        WHERE 1 = 1 {filter_clause}
+          AND (
+              p.raw_text_compressed IS NULL
+              OR compressed_page_phrase_contains(
+                  p.raw_text_compressed, p.raw_text_codec, ?
+              ) = 1
+          )
+        ORDER BY p.id
+    """
+    parameters = [
+        *term_parameters,
+        len(probe_terms),
+        *filter_parameters,
+        normalized_phrase,
+    ]
+
+    with connect(database_path) as connection:
+        def compressed_page_phrase_contains(
+            payload: bytes | None,
+            codec: str | None,
+            phrase: str,
+        ) -> int:
+            if payload is None:
+                return 1
+            try:
+                page_text = decompress_page_text(payload, str(codec or ""))
+            except ValueError:
+                # Una fuente heredada o dañada se valida luego reconstruyendo
+                # sus fragmentos; no se declara coincidencia desde este UDF.
+                return 1
+            return int(str(phrase) in normalize_phrase(page_text))
+
+        connection.create_function(
+            "compressed_page_phrase_contains",
+            3,
+            compressed_page_phrase_contains,
+            deterministic=True,
+        )
+        rows = connection.execute(base_sql, parameters).fetchall()
+        matches: list[tuple[sqlite3.Row, str, int, str]] = []
+        document_counts: dict[int, int] = {}
+        for row in rows:
+            document_id = int(row["document_id"])
+            if document_counts.get(document_id, 0) >= max_pages_per_document:
+                continue
+            resolved = _page_text_and_anchor(connection, row, normalized_phrase)
+            if resolved is None:
+                continue
+            page_text, chunk_id, chunk_text = resolved
+            matches.append((row, page_text, chunk_id, chunk_text))
+            document_counts[document_id] = document_counts.get(document_id, 0) + 1
+            if len(matches) == top_k:
+                break
+
+    result_count = max(len(matches), 1)
+    results: list[SearchResult] = []
+    for position, (row, page_text, chunk_id, chunk_text) in enumerate(matches):
+        score = round(3.0 + 1.0 - (position / result_count), 3)
+        excerpt = _page_phrase_excerpt(page_text, normalized_phrase)
+        results.append(
+            SearchResult(
+                chunk_id=chunk_id,
+                title=str(row["title"]),
+                url=str(row["url"]),
+                page=int(row["page_number"]),
+                text=chunk_text,
+                year=row["year"],
+                acta_number=row["acta_number"],
+                section=row["section"],
+                part=row["part"],
+                source_type=str(row["source_type"]),
+                score=score,
+                lexical_score=score,
+                match_type="page_exact",
+                evidence_scope="page",
+                matched_field=None,
+                match_excerpt=excerpt,
+                document_id=int(row["document_id"]),
+            )
+        )
+    return results
+
+
 def _rows_to_results(rows: list[sqlite3.Row], query: str) -> list[SearchResult]:
     normalized_query = normalize_phrase(query)
     ranked: list[SearchResult] = []
@@ -2752,6 +3403,11 @@ def _rows_to_results(rows: list[sqlite3.Row], query: str) -> list[SearchResult]:
                 score=score,
                 lexical_score=score,
                 match_type="textual",
+                document_id=(
+                    int(row["document_id"])
+                    if "document_id" in row.keys() and row["document_id"] is not None
+                    else None
+                ),
             )
         )
     ranked.sort(key=lambda item: item.score, reverse=True)
@@ -2799,7 +3455,7 @@ def get_chunks_by_ids(
             rows = connection.execute(
                 f"""
                 SELECT c.id AS chunk_id, c.text, p.page_number,
-                       d.title, d.normalized_title, d.url, d.year,
+                       d.id AS document_id, d.title, d.normalized_title, d.url, d.year,
                        d.acta_number, d.section, d.part, d.source_type
                 FROM chunks c
                 JOIN pages p ON p.id = c.page_id
@@ -2833,6 +3489,7 @@ def get_chunks_by_ids(
                 part=row["part"],
                 source_type=row["source_type"],
                 score=round(score, 6),
+                document_id=int(row["document_id"]),
             )
         )
     return results
@@ -2955,3 +3612,158 @@ def search_chunks(
             or normalized_phrase in normalize_phrase(result.text)
         ]
     return results[:top_k]
+
+
+def search_chunks_document_page(
+    database_path: Path,
+    query: str,
+    *,
+    page: int = 1,
+    page_size: int = 10,
+    order: str = "relevance",
+    filters: dict[str, list] | None = None,
+    fragments_per_document: int = 3,
+) -> tuple[list[SearchResult], int, int]:
+    """Pagina coincidencias textuales por acta con totales globales SQL.
+
+    A diferencia del antiguo ``top_k=360``, primero agrupa *todos* los
+    fragmentos coincidentes en SQLite y solo después aplica ``LIMIT/OFFSET`` a
+    los documentos. Devuelve los fragmentos visibles, el total de actas y el
+    total de fragmentos del universo filtrado.
+    """
+
+    if page < 1:
+        raise ValueError("page debe ser mayor que cero")
+    if page_size < 1 or page_size > 100:
+        raise ValueError("page_size debe estar entre 1 y 100")
+    if fragments_per_document < 1 or fragments_per_document > 10:
+        raise ValueError("fragments_per_document debe estar entre 1 y 10")
+    if order not in {"relevance", "newest", "oldest"}:
+        raise ValueError("Orden de resultados desconocido")
+    query = query.strip()
+    if not query or not database_path.exists():
+        return [], 0, 0
+    terms = list(
+        dict.fromkeys(
+            atom
+            for term in tokenize_query(query)
+            for atom in re.findall(r"[^\W_]+", term, flags=re.UNICODE)
+        )
+    )
+    if not terms:
+        terms = normalize_phrase(query).split()
+    if not terms:
+        return [], 0, 0
+    fts_query = " OR ".join(f'"{term.replace(chr(34), "")}"' for term in terms)
+    filter_clause, filter_parameters = _filter_sql(filters)
+    if order == "newest":
+        ordering = (
+            "(year IS NULL) ASC, year DESC, "
+            "COALESCE(publication_date, '') DESC, "
+            "COALESCE(acta_number, '') DESC, document_id ASC"
+        )
+    elif order == "oldest":
+        ordering = (
+            "(year IS NULL) ASC, year ASC, "
+            "COALESCE(publication_date, '') ASC, "
+            "COALESCE(acta_number, '') ASC, document_id ASC"
+        )
+    else:
+        ordering = "best_rank ASC, document_id ASC"
+    offset = (page - 1) * page_size
+    sql = f"""
+        WITH candidates AS MATERIALIZED (
+            SELECT c.id AS chunk_id, c.text, p.page_number,
+                   d.id AS document_id, d.title, d.url, d.year,
+                   d.acta_number, d.section, d.part, d.source_type,
+                   d.publication_date,
+                   bm25(chunks_fts, 3.0, 1.0) AS lexical_rank
+            FROM chunks_fts
+            JOIN chunks c ON c.id = chunks_fts.rowid
+            JOIN pages p ON p.id = c.page_id
+            JOIN documents d ON d.id = p.document_id
+            WHERE chunks_fts MATCH ? {filter_clause}
+        ), document_stats AS (
+            SELECT document_id, MIN(lexical_rank) AS best_rank,
+                   COUNT(*) AS match_count,
+                   MAX(title) AS title, MAX(url) AS url, MAX(year) AS year,
+                   MAX(acta_number) AS acta_number,
+                   MAX(section) AS section, MAX(part) AS part,
+                   MAX(source_type) AS source_type,
+                   MAX(publication_date) AS publication_date
+            FROM candidates
+            GROUP BY document_id
+        ), ordered_documents AS (
+            SELECT *,
+                   ROW_NUMBER() OVER (ORDER BY {ordering}) AS document_position,
+                   COUNT(*) OVER () AS total_documents,
+                   SUM(match_count) OVER () AS total_fragments
+            FROM document_stats
+        ), selected_documents AS MATERIALIZED (
+            SELECT * FROM ordered_documents
+            ORDER BY document_position
+            LIMIT ? OFFSET ?
+        ), ranked_chunks AS (
+            SELECT candidate.*,
+                   selected.document_position,
+                   selected.total_documents,
+                   selected.total_fragments,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY candidate.document_id
+                       ORDER BY candidate.lexical_rank, candidate.chunk_id
+                   ) AS fragment_position
+            FROM candidates AS candidate
+            JOIN selected_documents AS selected
+              ON selected.document_id = candidate.document_id
+        )
+        SELECT * FROM ranked_chunks
+        WHERE fragment_position <= ?
+        ORDER BY document_position, fragment_position
+    """
+    with connect(database_path) as connection:
+        rows = connection.execute(
+            sql,
+            [
+                fts_query,
+                *filter_parameters,
+                page_size,
+                offset,
+                fragments_per_document,
+            ],
+        ).fetchall()
+    if not rows:
+        return [], 0, 0
+    total_documents = int(rows[0]["total_documents"])
+    total_fragments = int(rows[0]["total_fragments"])
+    normalized_query = normalize_phrase(query)
+    results: list[SearchResult] = []
+    for row in rows:
+        phrase_in_text = normalized_query in normalize_phrase(str(row["text"]))
+        phrase_in_title = normalized_query in normalize_phrase(str(row["title"]))
+        # La puntuación solo se muestra en detalle técnico; el orden verdadero
+        # proviene de BM25 y del desempate global estable.
+        score = 1.0 / max(1, int(row["document_position"]))
+        if phrase_in_text or phrase_in_title:
+            score += 2.0
+        if phrase_in_title:
+            score += 0.75
+        results.append(
+            SearchResult(
+                chunk_id=int(row["chunk_id"]),
+                title=str(row["title"]),
+                url=str(row["url"]),
+                page=int(row["page_number"]),
+                text=str(row["text"]),
+                year=row["year"],
+                acta_number=row["acta_number"],
+                section=row["section"],
+                part=row["part"],
+                source_type=str(row["source_type"]),
+                score=round(score, 6),
+                lexical_score=round(score, 6),
+                match_type="textual",
+                evidence_scope="chunk",
+                document_id=int(row["document_id"]),
+            )
+        )
+    return results, total_documents, total_fragments

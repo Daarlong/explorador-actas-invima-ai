@@ -28,6 +28,10 @@ RAW_SEMANTIC_INDEX_PATH = Path(
     os.getenv("ACTAS_SEMANTIC_INDEX_PATH", DATA_DIR / "semantic.db")
 )
 SEMANTIC_INDEX_PATH = resolve_database_path(RAW_SEMANTIC_INDEX_PATH)
+RAW_ANN_INDEX_PATH = Path(
+    os.getenv("ACTAS_ANN_INDEX_PATH", DATA_DIR / "semantic-ann.db")
+)
+ANN_INDEX_PATH = resolve_database_path(RAW_ANN_INDEX_PATH)
 SEMANTIC_CHECKPOINT_PATH = Path(
     os.getenv(
         "ACTAS_SEMANTIC_CHECKPOINT_PATH",
@@ -112,6 +116,12 @@ SEMANTIC_NEURAL_BATCH_SIZE = max(
     1,
     int(os.getenv("ACTAS_SEMANTIC_NEURAL_BATCH_SIZE", "64")),
 )
+ANN_ENABLED = os.getenv("ACTAS_ANN_ENABLED", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
 SEMANTIC_MAX_UNIQUE = max(
     0,
     int(os.getenv("ACTAS_SEMANTIC_MAX_UNIQUE", "0")),

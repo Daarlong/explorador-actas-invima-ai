@@ -61,6 +61,14 @@ class SearchResult:
     lexical_score: float | None = None
     semantic_score: float | None = None
     match_type: str = "textual"
+    # Trazabilidad de la unidad que produjo la coincidencia. ``chunk_id``
+    # continúa siendo siempre un fragmento real para conservar compatibilidad
+    # con el visor y el analista; estos campos explican si la coincidencia se
+    # confirmó en la página completa o en una ficha estructurada.
+    evidence_scope: str = "chunk"
+    matched_field: str | None = None
+    match_excerpt: str | None = None
+    document_id: int | None = None
 
     @property
     def source_label(self) -> str:
@@ -73,3 +81,25 @@ class SearchResult:
     def from_dict(cls, value: dict[str, Any]) -> "SearchResult":
         allowed = {field.name for field in cls.__dataclass_fields__.values()}
         return cls(**{key: item for key, item in value.items() if key in allowed})
+
+
+@dataclass(frozen=True)
+class SearchDocument:
+    """Resultado agrupado por documento para una página de búsqueda."""
+
+    document_id: int | None
+    title: str
+    url: str
+    year: int | None
+    acta_number: str | None
+    section: str | None
+    part: str | None
+    source_type: str
+    score: float
+    match_count: int
+    fragments: tuple[SearchResult, ...]
+
+    def as_dict(self) -> dict[str, Any]:
+        value = asdict(self)
+        value["fragments"] = [item.as_dict() for item in self.fragments]
+        return value

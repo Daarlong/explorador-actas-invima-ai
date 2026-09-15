@@ -1514,7 +1514,9 @@ class DatabaseTests(unittest.TestCase):
                 for table in before
             }
         self.assertEqual(before, after)
-        self.assertEqual(database_schema_version(self.database_path), 6)
+        self.assertEqual(
+            database_schema_version(self.database_path), DATABASE_SCHEMA_VERSION
+        )
         self.assertTrue(table_exists(self.database_path, "regulatory_field_evidence"))
 
     def test_migrates_v3_records_to_page_ranges(self) -> None:

@@ -4,9 +4,11 @@ import json
 from pathlib import Path
 
 from config import (
+    ANN_ENABLED,
     INDEXING_REPORT_PATH,
     INTEGRITY_REPORT_PATH,
     RAW_DATABASE_PATH,
+    RAW_ANN_INDEX_PATH,
     RAW_SEMANTIC_INDEX_PATH,
     SEMANTIC_ENABLED,
     SEMANTIC_NEURAL_ENABLED,
@@ -61,6 +63,8 @@ def build_pending_status(
     database_path: Path,
     semantic_index_path: Path,
     *,
+    ann_index_path: Path | None = None,
+    require_ann: bool = False,
     semantic_enabled: bool,
     expected_semantic_method: str | None = None,
     expected_semantic_signature: str | None = None,
@@ -122,6 +126,11 @@ def build_pending_status(
         if not _package_available(semantic_index_path):
             reasons.append("semantic_package_missing_or_incomplete")
             pending_count += 1
+        if require_ann and (
+            ann_index_path is None or not _package_available(ann_index_path)
+        ):
+            reasons.append("ann_package_missing_or_incomplete")
+            pending_count += 1
 
     unique_reasons = list(dict.fromkeys(reasons))
     return {
@@ -144,6 +153,8 @@ if __name__ == "__main__":
         SEMANTIC_REPORT_PATH,
         RAW_DATABASE_PATH,
         RAW_SEMANTIC_INDEX_PATH,
+        ann_index_path=RAW_ANN_INDEX_PATH,
+        require_ann=ANN_ENABLED and SEMANTIC_NEURAL_ENABLED,
         semantic_enabled=SEMANTIC_ENABLED,
         expected_semantic_method=expected_method,
         expected_semantic_signature=expected_signature,

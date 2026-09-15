@@ -79,6 +79,35 @@ class BuildWorkflowTests(unittest.TestCase):
         self.assertIn("name: Conservar recuperación tras un fallo neuronal", self.workflow)
         self.assertIn("steps.failed-checkpoint.outputs.ready == 'true'", self.workflow)
 
+    def test_ann_is_built_only_after_embeddings_are_complete(self) -> None:
+        ann_start = self.workflow.index("name: Construir índice ANN")
+        package_start = self.workflow.index(
+            "name: Comprimir, verificar y dividir los índices"
+        )
+        self.assertLess(ann_start, package_start)
+        ann_block = self.workflow[ann_start:package_start]
+        self.assertIn(
+            "if: ${{ steps.semantic-state.outputs.complete == 'true' }}",
+            ann_block,
+        )
+        self.assertIn("python build_ann.py", ann_block)
+        self.assertIn("--semantic data/semantic.db", ann_block)
+        self.assertIn("--output data/semantic-ann.db", ann_block)
+
+    def test_ann_package_is_verified_and_committed(self) -> None:
+        self.assertIn(
+            "python package_index.py create --database data/semantic-ann.db",
+            self.workflow,
+        )
+        self.assertIn(
+            "--database data/semantic-ann.db \\",
+            self.workflow,
+        )
+        self.assertIn("data/semantic-ann.db.package.json", self.workflow)
+        self.assertIn("data/semantic-ann.db.gz.part-*", self.workflow)
+        self.assertIn("'services/ann.py'", self.workflow)
+        self.assertIn("'build_ann.py'", self.workflow)
+
 
 if __name__ == "__main__":
     unittest.main()

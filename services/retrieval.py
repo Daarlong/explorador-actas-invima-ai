@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from config import SEMANTIC_INDEX_PATH
+from config import ANN_ENABLED, ANN_INDEX_PATH, SEMANTIC_INDEX_PATH
 from services.models import SearchResult
 from services.search import search_corpus
 
@@ -22,6 +22,7 @@ def retrieve_evidence(
         top_k=top_k,
         filters=filters,
         mode=mode,
+        ann_index_path=ANN_INDEX_PATH if ANN_ENABLED else None,
     ).results
 
 
