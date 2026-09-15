@@ -144,8 +144,8 @@
       "year": 2013
     }
   ],
-  "database_bytes": 1242017792,
-  "database_mib": 1184.5,
+  "database_bytes": 1257287680,
+  "database_mib": 1199.0,
   "documents_without_chunks": [],
   "documents_without_pages": [],
   "duplicate_document_hashes": [
@@ -175,7 +175,7 @@
       ]
     }
   ],
-  "expected_schema_version": 6,
+  "expected_schema_version": 7,
   "field_completeness": {
     "active_ingredient": {
       "available": true,
@@ -261,7 +261,7 @@
   "foreign_key_errors": 0,
   "fts_rowid_mismatches": 0,
   "fts_rows": 321246,
-  "generated_at": "2026-09-10T05:06:40.235986+00:00",
+  "generated_at": "2026-09-15T00:30:15.338611+00:00",
   "indexed_documents": 638,
   "inventory_coverage_percent": 100.0,
   "manifest_documents": 638,
@@ -658,7 +658,7 @@
     "status": "available"
   },
   "regulatory_records": 24935,
-  "schema_version": 6,
+  "schema_version": 7,
   "sqlite_integrity": "ok",
   "status": "ok",
   "text_page_coverage_percent": 100.0,

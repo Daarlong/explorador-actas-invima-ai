@@ -1,7 +1,7 @@
 {
   "alternate_links_used": null,
   "chunks_indexed": 0,
-  "database_size_bytes": 1242017792,
+  "database_size_bytes": 1257287680,
   "documents_existing": 638,
   "documents_failed": 0,
   "documents_indexed": 0,
@@ -10,13 +10,13 @@
   "documents_skipped": 638,
   "documents_total": 638,
   "errors": [],
-  "generated_at": "2026-09-10T05:06:40.220795+00:00",
-  "mode": "incremental",
+  "generated_at": "2026-09-15T00:30:15.324665+00:00",
+  "mode": "schema_migration",
   "ocr_pages_indexed": 0,
   "pages_indexed": 0,
   "possible_scanned_pages": 0,
   "regulatory_documents_processed": 0,
   "regulatory_records_extracted": 0,
   "semantic_documents_indexed": 321246,
-  "semantic_index_status": "built"
+  "semantic_index_status": "reused"
 }
