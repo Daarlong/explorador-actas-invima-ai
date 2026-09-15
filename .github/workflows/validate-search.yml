@@ -1,0 +1,98 @@
+name: Validar búsquedas publicadas
+
+on:
+  workflow_dispatch:
+    inputs:
+      config_path:
+        description: Archivo JSON de casos y contratos técnicos
+        required: true
+        default: search-validation-cases.json
+        type: string
+      manifest_path:
+        description: Manifiesto publicado que debe estar cubierto por actas.db
+        required: true
+        default: documents_manifest.csv
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validar-busquedas-publicadas
+  cancel-in-progress: true
+
+jobs:
+  validate-search:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      ACTAS_DISABLE_DATABASE_PACKAGE: "1"
+      ACTAS_DATABASE_PATH: data/actas.db
+      ACTAS_SEMANTIC_INDEX_PATH: data/semantic.db
+      ACTAS_ANN_INDEX_PATH: data/semantic-ann.db
+      ACTAS_SEMANTIC_MODEL_CACHE: local_cache/fastembed
+    steps:
+      - name: Descargar código
+        uses: actions/checkout@v7
+
+      - name: Configurar Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Restaurar modelo semántico multilingüe
+        uses: actions/cache@v6
+        with:
+          path: local_cache/fastembed
+          key: fastembed-0.8.0-paraphrase-multilingual-minilm-l12-v2
+
+      - name: Instalar dependencias
+        run: python -m pip install --requirement requirements.txt
+
+      - name: Restaurar paquetes publicados
+        run: |
+          python package_index.py restore --database data/actas.db
+          python package_index.py restore --database data/semantic.db
+          python package_index.py restore --database data/semantic-ann.db
+
+      - name: Ejecutar validación técnica
+        id: validation
+        continue-on-error: true
+        shell: bash
+        env:
+          VALIDATION_CONFIG_PATH: ${{ inputs.config_path }}
+          VALIDATION_MANIFEST_PATH: ${{ inputs.manifest_path }}
+        run: |
+          set +e
+          python validate_search.py \
+            --config "$VALIDATION_CONFIG_PATH" \
+            --config-root "$GITHUB_WORKSPACE" \
+            --manifest "$VALIDATION_MANIFEST_PATH" \
+            --manifest-root "$GITHUB_WORKSPACE" \
+            --report validation-output/search-validation-report.json \
+            --summary "$GITHUB_STEP_SUMMARY"
+          status=$?
+          set -e
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+      - name: Publicar informe técnico
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: search-validation-report-${{ github.run_id }}
+          path: validation-output/search-validation-report.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Concluir validación estructural
+        if: ${{ always() }}
+        env:
+          VALIDATION_EXIT_CODE: ${{ steps.validation.outputs.exit_code }}
+        run: |
+          if [ "${VALIDATION_EXIT_CODE:-1}" != "0" ]; then
+            echo "La validación encontró un bloqueo técnico. Revisa el Summary y el informe."
+            exit 1
+          fi
+          echo "La validación técnica terminó sin bloqueos."

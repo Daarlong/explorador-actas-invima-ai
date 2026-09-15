@@ -278,6 +278,38 @@ jobs:
             --output .package-smoke/semantic-ann.db \
             --status
 
+      - name: Validar búsquedas sobre la publicación candidata
+        if: ${{ steps.semantic-state.outputs.complete == 'true' }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          source = Path("search-validation-cases.json")
+          target = Path(".package-smoke/build-validation-cases.json")
+          config = json.loads(source.read_text(encoding="utf-8"))
+          # Los paquetes ya fueron verificados y restaurados en el paso
+          # anterior. Aquí se comprueba la base candidata exacta antes de
+          # publicarla, sin depender de paquetes que aún no se han confirmado.
+          config["packages"]["required"] = []
+          config["packages"]["verify_sha256"] = False
+          config["explicit_cases"] = []
+          target.write_text(
+              json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          python validate_search.py \
+            --database .package-smoke/actas.db \
+            --semantic .package-smoke/semantic.db \
+            --ann .package-smoke/semantic-ann.db \
+            --config .package-smoke/build-validation-cases.json \
+            --manifest documents_manifest.csv \
+            --manifest-root "$GITHUB_WORKSPACE" \
+            --report .package-smoke/search-validation-report.json \
+            --summary "$GITHUB_STEP_SUMMARY"
+
       - name: Guardar índice e informe en el repositorio privado
         if: ${{ steps.semantic-state.outputs.complete == 'true' }}
         shell: bash
