@@ -19,6 +19,7 @@ jobs:
       ACTAS_DISABLE_DATABASE_PACKAGE: "1"
       ACTAS_DATABASE_PATH: data/actas.db
       ACTAS_SEMANTIC_INDEX_PATH: data/semantic.db
+      ACTAS_ANN_INDEX_PATH: data/semantic-ann.db
       ACTAS_SEMANTIC_CHECKPOINT_PATH: data/semantic.checkpoint.db
       ACTAS_SEMANTIC_PROGRESS_PATH: data/semantic-progress.json
       ACTAS_SEMANTIC_BACKEND: neural
@@ -39,9 +40,9 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: .index-checkpoint
-          key: semantic-resume-v2-${{ runner.os }}-${{ github.ref_name }}-${{ hashFiles('documents_manifest.csv') }}-${{ hashFiles('data/actas.db.package.json') }}-${{ hashFiles('services/database.py', 'services/indexing.py', 'services/pdf_reader.py', 'services/regulatory.py', 'services/text_utils.py', 'config.py', 'requirements.txt') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: semantic-resume-v2-${{ runner.os }}-${{ github.ref_name }}-${{ hashFiles('documents_manifest.csv') }}-${{ hashFiles('data/actas.db.package.json') }}-${{ hashFiles('services/database.py', 'services/indexing.py', 'services/pdf_reader.py', 'services/regulatory.py', 'services/text_utils.py', 'services/semantic.py', 'services/ann.py', 'build_ann.py', 'config.py', 'requirements.txt') }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            semantic-resume-v2-${{ runner.os }}-${{ github.ref_name }}-${{ hashFiles('documents_manifest.csv') }}-${{ hashFiles('data/actas.db.package.json') }}-${{ hashFiles('services/database.py', 'services/indexing.py', 'services/pdf_reader.py', 'services/regulatory.py', 'services/text_utils.py', 'config.py', 'requirements.txt') }}-
+            semantic-resume-v2-${{ runner.os }}-${{ github.ref_name }}-${{ hashFiles('documents_manifest.csv') }}-${{ hashFiles('data/actas.db.package.json') }}-${{ hashFiles('services/database.py', 'services/indexing.py', 'services/pdf_reader.py', 'services/regulatory.py', 'services/text_utils.py', 'services/semantic.py', 'services/ann.py', 'build_ann.py', 'config.py', 'requirements.txt') }}-
 
       - name: Configurar Python
         uses: actions/setup-python@v7
@@ -178,7 +179,7 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: .index-checkpoint
-          key: semantic-resume-v2-${{ runner.os }}-${{ github.ref_name }}-${{ hashFiles('documents_manifest.csv') }}-${{ hashFiles('data/actas.db.package.json') }}-${{ hashFiles('services/database.py', 'services/indexing.py', 'services/pdf_reader.py', 'services/regulatory.py', 'services/text_utils.py', 'config.py', 'requirements.txt') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: semantic-resume-v2-${{ runner.os }}-${{ github.ref_name }}-${{ hashFiles('documents_manifest.csv') }}-${{ hashFiles('data/actas.db.package.json') }}-${{ hashFiles('services/database.py', 'services/indexing.py', 'services/pdf_reader.py', 'services/regulatory.py', 'services/text_utils.py', 'services/semantic.py', 'services/ann.py', 'build_ann.py', 'config.py', 'requirements.txt') }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Leer avance de embeddings
         id: semantic-state
@@ -243,12 +244,21 @@ jobs:
               )
           PY
 
+      - name: Construir índice ANN
+        if: ${{ steps.semantic-state.outputs.complete == 'true' }}
+        shell: bash
+        run: |
+          python build_ann.py \
+            --semantic data/semantic.db \
+            --output data/semantic-ann.db
+
       - name: Comprimir, verificar y dividir los índices
         if: ${{ steps.semantic-state.outputs.complete == 'true' }}
         shell: bash
         run: |
           python package_index.py create --database data/actas.db --part-size-mib 90 --delete-source
           python package_index.py create --database data/semantic.db --part-size-mib 90 --delete-source
+          python package_index.py create --database data/semantic-ann.db --part-size-mib 90 --delete-source
 
       - name: Restaurar y verificar los paquetes generados
         if: ${{ steps.semantic-state.outputs.complete == 'true' }}
@@ -260,6 +270,13 @@ jobs:
           python package_index.py verify \
             --database data/semantic.db \
             --target .package-smoke/semantic.db
+          python package_index.py verify \
+            --database data/semantic-ann.db \
+            --target .package-smoke/semantic-ann.db
+          python build_ann.py \
+            --semantic .package-smoke/semantic.db \
+            --output .package-smoke/semantic-ann.db \
+            --status
 
       - name: Guardar índice e informe en el repositorio privado
         if: ${{ steps.semantic-state.outputs.complete == 'true' }}
@@ -278,6 +295,8 @@ jobs:
           git add -f data/actas.db.gz.part-*
           git add data/semantic.db.package.json
           git add -f data/semantic.db.gz.part-*
+          git add data/semantic-ann.db.package.json
+          git add -f data/semantic-ann.db.gz.part-*
           if git diff --cached --quiet; then
             echo "El índice ya estaba actualizado."
           else
@@ -316,7 +335,7 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: .index-checkpoint
-          key: semantic-resume-v2-${{ runner.os }}-${{ github.ref_name }}-${{ hashFiles('documents_manifest.csv') }}-${{ hashFiles('data/actas.db.package.json') }}-${{ hashFiles('services/database.py', 'services/indexing.py', 'services/pdf_reader.py', 'services/regulatory.py', 'services/text_utils.py', 'config.py', 'requirements.txt') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: semantic-resume-v2-${{ runner.os }}-${{ github.ref_name }}-${{ hashFiles('documents_manifest.csv') }}-${{ hashFiles('data/actas.db.package.json') }}-${{ hashFiles('services/database.py', 'services/indexing.py', 'services/pdf_reader.py', 'services/regulatory.py', 'services/text_utils.py', 'services/semantic.py', 'services/ann.py', 'build_ann.py', 'config.py', 'requirements.txt') }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Validar continuación automática
         if: ${{ steps.semantic-state.outputs.complete != 'true' }}
@@ -356,4 +375,4 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: .index-checkpoint
-          key: semantic-resume-v2-${{ runner.os }}-${{ github.ref_name }}-${{ hashFiles('documents_manifest.csv') }}-${{ hashFiles('data/actas.db.package.json') }}-${{ hashFiles('services/database.py', 'services/indexing.py', 'services/pdf_reader.py', 'services/regulatory.py', 'services/text_utils.py', 'config.py', 'requirements.txt') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: semantic-resume-v2-${{ runner.os }}-${{ github.ref_name }}-${{ hashFiles('documents_manifest.csv') }}-${{ hashFiles('data/actas.db.package.json') }}-${{ hashFiles('services/database.py', 'services/indexing.py', 'services/pdf_reader.py', 'services/regulatory.py', 'services/text_utils.py', 'services/semantic.py', 'services/ann.py', 'build_ann.py', 'config.py', 'requirements.txt') }}-${{ github.run_id }}-${{ github.run_attempt }}
