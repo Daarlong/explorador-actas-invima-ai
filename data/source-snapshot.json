@@ -641,12 +641,13 @@
     "2026-sempb-07-primera-parte",
     "2026-sempb-07-segunda-parte",
     "2026-sempb-08-primera-parte",
-    "2026-sempb-08-segunda-parte"
+    "2026-sempb-08-segunda-parte",
+    "2026-sempb-09-primera-parte"
   ],
-  "discovered_records": 642,
-  "generated_at": "2026-09-19T01:20:06.269510+00:00",
-  "html_bytes": 664071,
-  "html_sha256": "e7e635eb56f0e65ada4aeba259a2ea61c927d94538167de38f02707667734f69",
+  "discovered_records": 643,
+  "generated_at": "2026-09-22T01:39:58.126621+00:00",
+  "html_bytes": 665172,
+  "html_sha256": "cef20a47bc52e3d79c7006f96eac2aa1585094b07136e8cafb8808bfdb0dc187",
   "parser_version": "2",
   "records_without_url": 3,
   "source_page_url": "https://www.invima.gov.co/productos-vigilados/medicamentos-y-productos-biologicos/sala-especializada-medicamentos-sintesis",
@@ -665,6 +666,6 @@
     "2023": 57,
     "2024": 57,
     "2025": 40,
-    "2026": 19
+    "2026": 20
   }
 }
