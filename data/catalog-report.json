@@ -1,10 +1,10 @@
 {
   "catalog_records": 646,
-  "content_status": "changed",
+  "content_status": "unchanged",
   "currently_listed": 643,
   "discovered_records": 643,
   "duplicate_page_occurrences": 111,
-  "generated_at": "2026-09-22T01:39:58.007355+00:00",
+  "generated_at": "2026-09-23T01:34:52.524872+00:00",
   "manifest_documents": 639,
   "possible_number_gaps": [
     {
