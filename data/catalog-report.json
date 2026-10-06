@@ -1,11 +1,11 @@
 {
-  "catalog_records": 646,
-  "content_status": "unchanged",
-  "currently_listed": 643,
-  "discovered_records": 643,
+  "catalog_records": 647,
+  "content_status": "changed",
+  "currently_listed": 644,
+  "discovered_records": 644,
   "duplicate_page_occurrences": 111,
-  "generated_at": "2026-10-03T02:07:56.094860+00:00",
-  "manifest_documents": 639,
+  "generated_at": "2026-10-06T03:09:33.522042+00:00",
+  "manifest_documents": 640,
   "possible_number_gaps": [
     {
       "acta_numbers": [
@@ -29,7 +29,7 @@
     "CONJUNTA SEMNNIMB-SEM": 1,
     "SEM": 207,
     "SEMNNIMB": 181,
-    "SEMPB": 251
+    "SEMPB": 252
   },
   "shared_url_conflicts": [
     {
@@ -80,6 +80,6 @@
     "2023": 57,
     "2024": 58,
     "2025": 40,
-    "2026": 20
+    "2026": 21
   }
 }
