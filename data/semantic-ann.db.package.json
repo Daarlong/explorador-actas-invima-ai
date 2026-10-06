@@ -1,15 +1,15 @@
 {
-  "compressed_bytes": 6816017,
-  "database_bytes": 11591680,
+  "compressed_bytes": 6823048,
+  "database_bytes": 11595776,
   "database_file": "semantic-ann.db",
-  "database_sha256": "94273f795e84e93ce4ebf1528960f613f906c3e92f0c224b106675b2ff134af8",
+  "database_sha256": "7f332554f276bdc71b460fb914abc2e30661b59d958873ccda4382156b6cded3",
   "format_version": 1,
   "part_size_bytes": 94371840,
   "parts": [
     {
-      "bytes": 6816017,
+      "bytes": 6823048,
       "name": "semantic-ann.db.gz.part-000",
-      "sha256": "8829a1759318cfd50c656bfee806c4b5636418a73b6aeee390cea7ed81ef10dd"
+      "sha256": "5c8fa954043daeef8e3fcf53ee755114842f2ed9912e9a8f8efa52ea27e49530"
     }
   ]
 }

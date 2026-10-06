@@ -1,15 +1,15 @@
 {
-  "after": 322215,
-  "before": 321249,
+  "after": 322570,
+  "before": 322215,
   "build_signature": "tokenizer-v1-random-indexing-v1-int8-source-fingerprint-v2-content-hash-v1|dense-int8-v1|exact-utf8-v1|fastembed-0.8.0-mean-pooling|sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2@fastembed-0.8.0-registry",
   "checkpoint_reused": false,
   "complete": true,
-  "generated_at": "2026-09-22T01:47:55.246272+00:00",
+  "generated_at": "2026-10-06T03:16:30.983080+00:00",
   "progress_made": true,
   "remaining": 0,
   "segments_completed": 1,
-  "source_fingerprint": "5d2d00095e0ca8459e9a502721de8bc4a6b56398d50ca24350ccf72a6dbccb30",
-  "unique_after": 308276,
-  "unique_before": 307310,
+  "source_fingerprint": "fc1d52d569a3342b531a551b843a478e619592e521031d817502d5c9c2ac6244",
+  "unique_after": 308626,
+  "unique_before": 308276,
   "unique_remaining": 0
 }
