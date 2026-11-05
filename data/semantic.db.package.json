@@ -1,20 +1,20 @@
 {
-  "compressed_bytes": 172131714,
-  "database_bytes": 252473344,
+  "compressed_bytes": 172722842,
+  "database_bytes": 253284352,
   "database_file": "semantic.db",
-  "database_sha256": "5df6e1d4895e2f0f634404860b120f4a76be8fc3aaa7e79ae716abb5f989443a",
+  "database_sha256": "95ae1d4360299f55af4b611a2911cab59c72c466ab1df6f99ad370d8170aa24b",
   "format_version": 1,
   "part_size_bytes": 94371840,
   "parts": [
     {
       "bytes": 94371840,
       "name": "semantic.db.gz.part-000",
-      "sha256": "738c2b1d7f23c538a16fdef59e2021695e16a2d37a8007ea874e10fe71c7d588"
+      "sha256": "d24be46a346c887f8b879c4d2b9249a60653e2d6ab5aeb6fa0c88e62fd87f207"
     },
     {
-      "bytes": 77759874,
+      "bytes": 78351002,
       "name": "semantic.db.gz.part-001",
-      "sha256": "263715a9201214aa7d93c9407679bab1eb41d9efc6ca98bd979552f1fb839901"
+      "sha256": "81b0155a7aa213c4ec297603cf062494fee3df02602a0b9c93e5eea95b8b8dbd"
     }
   ]
 }
