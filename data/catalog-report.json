@@ -1,11 +1,11 @@
 {
-  "catalog_records": 649,
-  "content_status": "unchanged",
-  "currently_listed": 646,
-  "discovered_records": 646,
+  "catalog_records": 650,
+  "content_status": "changed",
+  "currently_listed": 647,
+  "discovered_records": 647,
   "duplicate_page_occurrences": 111,
-  "generated_at": "2026-11-04T03:04:20.609685+00:00",
-  "manifest_documents": 642,
+  "generated_at": "2026-11-05T03:34:45.819172+00:00",
+  "manifest_documents": 643,
   "possible_number_gaps": [
     {
       "acta_numbers": [
@@ -20,13 +20,6 @@
       ],
       "section": "SEM",
       "year": 2024
-    },
-    {
-      "acta_numbers": [
-        10
-      ],
-      "section": "SEMPB",
-      "year": 2026
     }
   ],
   "records_without_url": 3,
@@ -36,7 +29,7 @@
     "CONJUNTA SEMNNIMB-SEM": 1,
     "SEM": 207,
     "SEMNNIMB": 181,
-    "SEMPB": 254
+    "SEMPB": 255
   },
   "shared_url_conflicts": [
     {
@@ -87,6 +80,6 @@
     "2023": 57,
     "2024": 58,
     "2025": 40,
-    "2026": 23
+    "2026": 24
   }
 }
