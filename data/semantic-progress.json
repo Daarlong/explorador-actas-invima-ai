@@ -1,15 +1,11 @@
 {
   "after": 324938,
-  "before": 323873,
+  "before": 324938,
   "build_signature": "tokenizer-v1-random-indexing-v1-int8-source-fingerprint-v2-content-hash-v1|dense-int8-v1|exact-utf8-v1|fastembed-0.8.0-mean-pooling|sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2@fastembed-0.8.0-registry",
-  "checkpoint_reused": false,
   "complete": true,
-  "generated_at": "2026-11-05T03:40:51.579031+00:00",
-  "progress_made": true,
+  "generated_at": "2026-11-06T03:30:53.488038+00:00",
+  "progress_made": false,
   "remaining": 0,
-  "segments_completed": 1,
-  "source_fingerprint": "5bc60b2ec48f82aa5aec1a78687f80452a82b40d28ed62b2ac131ff1977e130b",
-  "unique_after": 310917,
-  "unique_before": 309852,
-  "unique_remaining": 0
+  "segments_completed": 0,
+  "source_fingerprint": "5bc60b2ec48f82aa5aec1a78687f80452a82b40d28ed62b2ac131ff1977e130b"
 }
