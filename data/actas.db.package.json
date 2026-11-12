@@ -1,30 +1,30 @@
 {
-  "compressed_bytes": 335869970,
-  "database_bytes": 1263095808,
+  "compressed_bytes": 336024824,
+  "database_bytes": 1263128576,
   "database_file": "actas.db",
-  "database_sha256": "1cd17245f37a28339c158faa7837ab4f39013a4abd0c15162d954f55c2a860b3",
+  "database_sha256": "c30a137804409724c353795b7b09280ef9ba87161df2aed87b225b4b6fef20f4",
   "format_version": 1,
   "part_size_bytes": 94371840,
   "parts": [
     {
       "bytes": 94371840,
       "name": "actas.db.gz.part-000",
-      "sha256": "7ad012d40fc5a850b229fe6a88598e44c5f8f16f00e50d3d5f6bba5c35fa05e2"
+      "sha256": "c192df0b494274de93f0d174b6dd478d31996dca71339a97ec24b3800a65ff7a"
     },
     {
       "bytes": 94371840,
       "name": "actas.db.gz.part-001",
-      "sha256": "2bf221f87012ef84df0206a813d13c0bc45561fca00fab11d77e931a15c4aeb5"
+      "sha256": "dad8dd3b35bc8b40d550347fa9d7c411851a599d288d619b45009ce7e1993095"
     },
     {
       "bytes": 94371840,
       "name": "actas.db.gz.part-002",
-      "sha256": "31f5efdd3ab2e0a2cdb673db5377aa4a3b4fdaffcf5f6048e9b6eb9252a24735"
+      "sha256": "f6bfb45698066d1340a450bf2e0125474fd1cde28084ef1baef4991ab66f1efa"
     },
     {
-      "bytes": 52754450,
+      "bytes": 52909304,
       "name": "actas.db.gz.part-003",
-      "sha256": "8c90668a3aa3e9e7da70553d2bfeab2db23079596e32c678425f4d7874538171"
+      "sha256": "fcc68bf511852a7d1f93ae020bd37cacbbe4c686560bf7e93d3dd5dc23e14e3b"
     }
   ]
 }
